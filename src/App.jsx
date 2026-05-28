@@ -1542,22 +1542,21 @@ export default function App() {
 
   const { user, login, logout } = useAuth()
 
-  // settings must be declared before any early return (Rules of Hooks)
   const [settings, setSettings] = useState(()=>{
     try { return {...DEFAULT_SETTINGS,...JSON.parse(localStorage.getItem("atoproof_settings"))||{}} }
     catch { return DEFAULT_SETTINGS }
   })
 
-  if (!user) return <LoginPage onLogin={login} />
-
-  function saveSettings(updates) {
-    const merged = {...settings,...updates}
-    setSettings(merged)
-    try { localStorage.setItem("atoproof_settings", JSON.stringify(merged)) } catch {}
-  }
-
-  // FIX: normalize API responses (snake_case → camelCase)
+  // All hooks must be declared before any early return (Rules of Hooks)
   useEffect(()=>{
+    // Reset state when user logs out
+    if (!user) {
+      setLoaded(false)
+      setProjects([])
+      setCustomers([])
+      return
+    }
+
     async function loadData() {
       try {
         const [rawProjects, rawCustomers] = await Promise.all([
@@ -1574,7 +1573,16 @@ export default function App() {
       setLoaded(true)
     }
     loadData()
-  },[])
+  },[user])
+
+  // Early return AFTER all hooks
+  if (!user) return <LoginPage onLogin={login} />
+
+  function saveSettings(updates) {
+    const merged = {...settings,...updates}
+    setSettings(merged)
+    try { localStorage.setItem("atoproof_settings", JSON.stringify(merged)) } catch {}
+  }
 
   const PAGE_TITLES = {
     dashboard:"Dashboard", pipeline:"Pipeline",
