@@ -2,7 +2,6 @@
 // Base URL resolution
 // ---------------------------------------------------------------------------
 const BASE_URL =
-  process.env.REACT_APP_API_URL ||
   `${window.location.protocol}//${window.location.hostname}:3001/api`;
 
 // ---------------------------------------------------------------------------
@@ -22,6 +21,9 @@ async function request(endpoint, options = {}) {
       signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
+        ...(localStorage.getItem("auth_token")
+          ? { Authorization: `Bearer ${localStorage.getItem("auth_token")}` }
+          : {}),
         ...fetchOptions.headers,
       },
       ...fetchOptions,

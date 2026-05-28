@@ -6,12 +6,14 @@ const customersRouter = require("./routes/customers");
 const projectsRouter  = require("./routes/projects");
 const estimatesRouter = require("./routes/estimates");
 const seedRouter      = require("./routes/seed");
+const authRouter = require("./routes/auth");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json({ limit: "5mb" }));
+app.use("/api/auth", authRouter);
 
 // ── Routes ──
 app.use("/api/customers",  customersRouter);

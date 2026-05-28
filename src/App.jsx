@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts"
 import { customersApi, projectsApi } from "./api"
+import { useAuth } from "./AuthContext"
+import LoginPage   from "./LoginPage"
 
 // ─────────────────────────── CONSTANTS ───────────────────────────
 const STATUSES = ["New Lead","Estimating","Quote Sent","Won","Lost"]
@@ -180,7 +182,7 @@ function FG({ label, children, half }) {
 }
 
 // ─────────────────────────── SIDEBAR ───────────────────────────
-function Sidebar({ view, onNav, projects }) {
+function Sidebar({ view, onNav, projects, user, onLogout }) {
   const won     = projects.filter(p=>p.status==="Won")
   const revenue = won.reduce((a,p)=>a+(p.estimate?.total||0),0)
   const pending = projects.filter(p=>p.status==="Quote Sent").length
@@ -220,17 +222,20 @@ function Sidebar({ view, onNav, projects }) {
           )
         )}
       </nav>
-      <div style={{padding:"12px 14px",borderTop:"1px solid rgba(255,255,255,0.08)"}}>
-        <div style={{fontSize:11,color:"#475569",marginBottom:6}}>Revenue (Won Jobs)</div>
-        <div style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800,color:"#f59e0b"}}>{fmt(revenue)}</div>
-        <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{won.length} jobs completed</div>
-        <div style={{display:"flex",alignItems:"center",gap:8,marginTop:12,padding:"8px 10px",borderRadius:8,cursor:"pointer"}}>
-          <div style={{width:28,height:28,borderRadius:"50%",background:"linear-gradient(135deg,#f59e0b,#f97316)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#000"}}>JM</div>
-          <div>
-            <div style={{fontSize:12,color:"#fff",fontWeight:500}}>James Mitchell</div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginTop:12,padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,0.04)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
+          <div style={{width:28,height:28,borderRadius:"50%",background:"linear-gradient(135deg,#f59e0b,#f97316)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#000",flexShrink:0}}>
+            {user?.name?.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}
+          </div>
+          <div style={{minWidth:0}}>
+            <div style={{fontSize:12,color:"#fff",fontWeight:500,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user?.name}</div>
             <div style={{fontSize:10,color:"#475569"}}>aTopRoof CRM</div>
           </div>
         </div>
+        <button onClick={onLogout} title="Sign out" style={{
+          background:"none", border:"none", cursor:"pointer",
+          color:"#475569", fontSize:16, padding:4, lineHeight:1, flexShrink:0,
+        }}>⏻</button>
       </div>
     </div>
   )
@@ -1535,11 +1540,15 @@ export default function App() {
   const [showWizard,      setShowWizard]     = useState(false)
   const [editingProject,  setEditingProject] = useState(null)
 
-  // FIX: settings are now real state, persisted to localStorage, used everywhere
+  const { user, login, logout } = useAuth()
+
+  // settings must be declared before any early return (Rules of Hooks)
   const [settings, setSettings] = useState(()=>{
     try { return {...DEFAULT_SETTINGS,...JSON.parse(localStorage.getItem("atoproof_settings"))||{}} }
     catch { return DEFAULT_SETTINGS }
   })
+
+  if (!user) return <LoginPage onLogin={login} />
 
   function saveSettings(updates) {
     const merged = {...settings,...updates}
@@ -1656,7 +1665,7 @@ export default function App() {
       `}</style>
 
       <div style={s.app}>
-        <Sidebar view={view} onNav={handleNav} projects={projects}/>
+        <Sidebar view={view} onNav={handleNav} projects={projects} user={user} onLogout={logout}/>
         <div style={s.main}>
           <div style={s.topbar}>
             <div style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800}}>
