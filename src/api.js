@@ -1,52 +1,127 @@
-// src/api.js — Central API service
-const BASE = "http://localhost:3001/api";
+// ---------------------------------------------------------------------------
+// Base URL resolution
+// ---------------------------------------------------------------------------
+const BASE_URL =
+  `${window.location.protocol}//${window.location.hostname}:3001/api`;
 
-async function request(url, options = {}) {
-  const res = await fetch(`${BASE}${url}`, {
-    headers: { "Content-Type": "application/json", ...options.headers },
-    ...options,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `Request failed: ${res.status}`);
+// ---------------------------------------------------------------------------
+// Core request helper
+// ---------------------------------------------------------------------------
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+async function request(endpoint, options = {}) {
+  const { timeout = DEFAULT_TIMEOUT_MS, ...fetchOptions } = options;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  let response;
+  try {
+    response = await fetch(`${BASE_URL}${endpoint}`, {
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...(localStorage.getItem("auth_token")
+          ? { Authorization: `Bearer ${localStorage.getItem("auth_token")}` }
+          : {}),
+        ...fetchOptions.headers,
+      },
+      ...fetchOptions,
+    });
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Request timed out after ${timeout / 1000}s: ${endpoint}`);
+    }
+    throw new Error(`Network error: ${err.message}`);
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const message = body?.error || body?.message || `HTTP ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.body = body;
+    throw error;
+  }
+
+  // 204 No Content — return null instead of trying to parse an empty body
+  if (response.status === 204) return null;
+
+  return response.json();
 }
 
-// ────────── Customers ──────────
+// Convenience wrappers
+const get    = (endpoint, opts)       => request(endpoint, { method: "GET", ...opts });
+const post   = (endpoint, data, opts) => request(endpoint, { method: "POST",  body: JSON.stringify(data), ...opts });
+const put    = (endpoint, data, opts) => request(endpoint, { method: "PUT",   body: JSON.stringify(data), ...opts });
+const patch  = (endpoint, data, opts) => request(endpoint, { method: "PATCH", body: JSON.stringify(data), ...opts });
+const del    = (endpoint, opts)       => request(endpoint, { method: "DELETE", ...opts });
+
+// ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
 export const customersApi = {
-  getAll:    ()              => request("/customers"),
-  getOne:    (id)            => request(`/customers/${id}`),
-  create:    (data)          => request("/customers", { method:"POST", body:JSON.stringify(data) }),
-  update:    (id, data)      => request(`/customers/${id}`, { method:"PUT", body:JSON.stringify(data) }),
-  delete:    (id)            => request(`/customers/${id}`, { method:"DELETE" }),
+  getAll:  ()             => get("/customers"),
+  getOne:  (id)           => get(`/customers/${id}`),
+  create:  (data)         => post("/customers", data),
+  update:  (id, data)     => put(`/customers/${id}`, data),
+  delete:  (id)           => del(`/customers/${id}`),
 };
 
-// ────────── Projects ──────────
+// ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
 export const projectsApi = {
-  getAll:       ()              => request("/projects"),
-  getOne:       (id)            => request(`/projects/${id}`),
-  create:       (data)          => request("/projects", { method:"POST", body:JSON.stringify(data) }),
-  update:       (id, data)      => request(`/projects/${id}`, { method:"PUT", body:JSON.stringify(data) }),
-  updateStatus: (id, status)    => request(`/projects/${id}/status`, { method:"PATCH", body:JSON.stringify({status}) }),
-  delete:       (id)            => request(`/projects/${id}`, { method:"DELETE" }),
+  getAll:       ()              => get("/projects"),
+  getOne:       (id)            => get(`/projects/${id}`),
+  create:       (data)          => post("/projects", data),
+  update:       (id, data)      => put(`/projects/${id}`, data),
+  updateStatus: (id, status)    => patch(`/projects/${id}/status`, { status }),
+  delete:       (id)            => del(`/projects/${id}`),
 };
 
-// ────────── Estimates ──────────
+// ---------------------------------------------------------------------------
+// Estimates
+// ---------------------------------------------------------------------------
 export const estimatesApi = {
-  getForProject:    (projectId) => request(`/estimates/${projectId}`),
-  saveForProject:   (projectId, data) => request(`/estimates/${projectId}`, { method:"POST", body:JSON.stringify(data) }),
-  getGeometry:      (projectId) => request(`/estimates/${projectId}/geometry`),
-  saveGeometry:     (projectId, data) => request(`/estimates/${projectId}/geometry`, { method:"POST", body:JSON.stringify(data) }),
+  getForProject:  (projectId)       => get(`/estimates/${projectId}`),
+  saveForProject: (projectId, data) => post(`/estimates/${projectId}`, data),
+  getGeometry:    (projectId)       => get(`/estimates/${projectId}/geometry`),
+  saveGeometry:   (projectId, data) => post(`/estimates/${projectId}/geometry`, data),
 };
 
-// ────────── Dashboard ──────────
+// ---------------------------------------------------------------------------
+// Dashboard
+// ---------------------------------------------------------------------------
 export const dashboardApi = {
-  getStats:   () => request("/dashboard"),
-  getPipeline:() => request("/pipeline"),
+  getStats:    () => get("/dashboard"),
+  getPipeline: () => get("/pipeline"),
 };
 
-// ────────── Seed ──────────
+// ---------------------------------------------------------------------------
+// Users  (admin user management)
+// ---------------------------------------------------------------------------
+export const usersApi = {
+  getAll:       ()              => get("/users"),
+  create:       (data)          => post("/users", data),
+  update:       (id, data)      => put(`/users/${id}`, data),
+  setActive:    (id, is_active) => patch(`/users/${id}/status`, { is_active }),
+};
+
+// ---------------------------------------------------------------------------
+// Seed (dev / staging only)
+// ---------------------------------------------------------------------------
 export const seedApi = {
-  seed: (data) => request("/seed", { method:"POST", body:JSON.stringify(data) }),
+  seed: (data) => post("/seed", data),
+};
+
+// ---------------------------------------------------------------------------
+// Settings  (currency preferences)
+// ---------------------------------------------------------------------------
+export const settingsApi = {
+  getCurrencies:   ()     => get("/settings/currencies"),
+  getUserCurrency: ()     => get("/settings/user-currency"),
+  setUserCurrency: (code) => put("/settings/user-currency", { code }),
 };

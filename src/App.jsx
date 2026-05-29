@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts"
-import { customersApi, projectsApi } from "./api"
+import { customersApi, projectsApi, usersApi } from "./api"
+import { useAuth } from "./AuthContext"
+import LoginPage   from "./LoginPage"
+import { CurrencyProvider, useCurrency } from "./CurrencyContext"
 
 // ─────────────────────────── CONSTANTS ───────────────────────────
 const STATUSES = ["New Lead","Estimating","Quote Sent","Won","Lost"]
@@ -26,11 +29,9 @@ const PITCHES = [
   { label:"Very Steep >45°",  factor:1.4  },
 ]
 
-// FIX: named constants instead of magic numbers
 const RATES = { flashings: 28, guttering: 45, downpipe: 35, underlayment: 8 }
 const GST_RATE = 0.15
 
-// FIX: default settings with fallback values
 const DEFAULT_SETTINGS = {
   companyName:"DK Roofing",
   companyAddress:"159 New Plymouth, New Zealand",
@@ -44,19 +45,18 @@ const DEFAULT_SETTINGS = {
 }
 
 // ─────────────────────────── HELPERS ───────────────────────────
-const uid    = () => Math.random().toString(36).slice(2,10)
-const fmt    = n  => "$"+Math.round(n).toLocaleString()
-// FIX: fmtD now handles both "2024-12-15" (date string) and full ISO timestamps from DB
-const fmtD   = d  => {
+const uid   = () => Math.random().toString(36).slice(2,10)
+// Module-level fmt is kept as a plain fallback (used in seed data only).
+// All UI components override it via useCurrency().formatMoney.
+const fmt   = n => "$"+Math.round(n).toLocaleString()
+const fmtD  = d => {
   if(!d) return "—"
   const str = String(d)
-  // If it's already a full ISO timestamp, use it directly; otherwise append noon to avoid TZ shift
   const iso = str.includes("T") ? str : str.slice(0,10)+"T12:00:00"
   return new Date(iso).toLocaleDateString("en-NZ",{day:"numeric",month:"short",year:"numeric"})
 }
-const today  = () => new Date().toISOString().slice(0,10)
+const today = () => new Date().toISOString().slice(0,10)
 
-// FIX: snake_case → camelCase normalizers for API responses
 const toCamel = str => str.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
 const normalizeKeys = obj => {
   if(!obj || typeof obj !== "object" || Array.isArray(obj)) return obj
@@ -69,19 +69,18 @@ const normalizeProject = raw => {
   return p
 }
 
-// FIX: use RATES and GST_RATE instead of magic numbers
 function calcEst(e) {
   if(!e) return null
-  const adjArea    = e.area * e.pitch * (1 + (e.waste||0)/100)
-  const matCost    = adjArea * e.materialRate
-  const flashCost  = (e.flashings||0) * RATES.flashings
-  const gutCost    = (e.guttering||0) * RATES.guttering
-  const labCost    = (e.dayRate||850) * (e.days||0)
-  const sub        = matCost + flashCost + gutCost + labCost
-  const marginAmt  = sub * ((e.margin||0)/100)
-  const sellPrice  = sub + marginAmt
-  const gst        = sellPrice * GST_RATE
-  const total      = sellPrice + gst
+  const adjArea   = e.area * e.pitch * (1 + (e.waste||0)/100)
+  const matCost   = adjArea * e.materialRate
+  const flashCost = (e.flashings||0) * RATES.flashings
+  const gutCost   = (e.guttering||0) * RATES.guttering
+  const labCost   = (e.dayRate||850) * (e.days||0)
+  const sub       = matCost + flashCost + gutCost + labCost
+  const marginAmt = sub * ((e.margin||0)/100)
+  const sellPrice = sub + marginAmt
+  const gst       = sellPrice * GST_RATE
+  const total     = sellPrice + gst
   return { ...e, adjArea, matCost, flashCost, gutCost, labCost, marginAmt, sellPrice, gst, total }
 }
 
@@ -90,28 +89,28 @@ function nextQuoteNum(projects) {
   return "QT-"+String((nums.length ? Math.max(...nums) : 40)+1).padStart(3,"0")
 }
 
-// ─────────────────────────── SEED DATA (fallback when backend is offline) ───────────────────────────
+// ─────────────────────────── SEED DATA ───────────────────────────
 const seed_customers = [
-  { id:"c1",name:"Sarah Thompson",   email:"sarah.t@gmail.com",      phone:"021 999 0011", address:"47 Ridgeline Ave, Titirangi, Auckland" },
-  { id:"c2",name:"Mike Thorn",       email:"m.thorn@hotmail.com",    phone:"021 444 2233", address:"14 Henderson Valley Rd, Henderson"     },
-  { id:"c3",name:"Raj Patel",        email:"rpatel@patel.co.nz",     phone:"09 555 7788",  address:"22 Remuera Rd, Remuera, Auckland"      },
-  { id:"c4",name:"James Clark",      email:"james@clark.net",        phone:"021 234 5678", address:"51 Clark St, Ponsonby, Auckland"       },
+  { id:"c1",name:"Sarah Thompson",    email:"sarah.t@gmail.com",     phone:"021 999 0011", address:"47 Ridgeline Ave, Titirangi, Auckland" },
+  { id:"c2",name:"Mike Thorn",        email:"m.thorn@hotmail.com",   phone:"021 444 2233", address:"14 Henderson Valley Rd, Henderson"     },
+  { id:"c3",name:"Raj Patel",         email:"rpatel@patel.co.nz",    phone:"09 555 7788",  address:"22 Remuera Rd, Remuera, Auckland"      },
+  { id:"c4",name:"James Clark",       email:"james@clark.net",       phone:"021 234 5678", address:"51 Clark St, Ponsonby, Auckland"       },
   { id:"c5",name:"Riverdale Builders",email:"info@riverdale.co.nz",  phone:"09 800 1100",  address:"5 Trade Lane, Mt Wellington, Auckland" },
 ]
-const e1 = calcEst({area:215,pitch:1.15,waste:10,materialRate:55,materialLabel:"Long Run Steel",flashings:24,guttering:32,dayRate:850,days:3.5,margin:20})
-const e2 = calcEst({area:165,pitch:1.1, waste:10,materialRate:55,materialLabel:"Long Run Steel",flashings:18,guttering:24,dayRate:850,days:2.5,margin:20})
-const e3 = calcEst({area:142,pitch:1.15,waste:12,materialRate:65,materialLabel:"Metal Tiles",   flashings:16,guttering:20,dayRate:850,days:2,  margin:25})
-const e4 = calcEst({area:187,pitch:1.25,waste:15,materialRate:55,materialLabel:"Long Run Steel",flashings:28,guttering:36,dayRate:850,days:4,  margin:20})
-const e6 = calcEst({area:198,pitch:1.15,waste:10,materialRate:65,materialLabel:"Metal Tiles",   flashings:22,guttering:28,dayRate:850,days:3,  margin:22})
-const e7 = calcEst({area:130,pitch:1.0, waste:10,materialRate:35,materialLabel:"Corrugated Iron",flashings:14,guttering:18,dayRate:850,days:2, margin:18})
+const e1 = calcEst({area:215,pitch:1.15,waste:10,materialRate:55,materialLabel:"Long Run Steel",   flashings:24,guttering:32,dayRate:850,days:3.5,margin:20})
+const e2 = calcEst({area:165,pitch:1.1, waste:10,materialRate:55,materialLabel:"Long Run Steel",   flashings:18,guttering:24,dayRate:850,days:2.5,margin:20})
+const e3 = calcEst({area:142,pitch:1.15,waste:12,materialRate:65,materialLabel:"Metal Tiles",      flashings:16,guttering:20,dayRate:850,days:2,  margin:25})
+const e4 = calcEst({area:187,pitch:1.25,waste:15,materialRate:55,materialLabel:"Long Run Steel",   flashings:28,guttering:36,dayRate:850,days:4,  margin:20})
+const e6 = calcEst({area:198,pitch:1.15,waste:10,materialRate:65,materialLabel:"Metal Tiles",      flashings:22,guttering:28,dayRate:850,days:3,  margin:22})
+const e7 = calcEst({area:130,pitch:1.0, waste:10,materialRate:35,materialLabel:"Corrugated Iron",  flashings:14,guttering:18,dayRate:850,days:2,  margin:18})
 const seed_projects = [
-  { id:"p1",customerId:"c1",address:"47 Ridgeline Ave, Titirangi, Auckland",status:"Quote Sent",area:215,roofType:"Long Run Steel",notes:"Remove existing iron. Access via side gate.",quoteNum:"QT-041",quoteDate:"2024-12-15",createdAt:"2024-12-14",estimate:e1 },
-  { id:"p2",customerId:"c2",address:"14 Henderson Valley Rd, Henderson",    status:"Won",       area:165,roofType:"Long Run Steel",notes:"Full reroof including underlayment.",         quoteNum:"QT-039",quoteDate:"2024-12-08",createdAt:"2024-12-06",estimate:e2 },
-  { id:"p3",customerId:"c3",address:"22 Remuera Rd, Remuera, Auckland",     status:"Quote Sent",area:142,roofType:"Metal Tiles",   notes:"Metal tiles to match character home.",        quoteNum:"QT-042",quoteDate:"2024-12-14",createdAt:"2024-12-12",estimate:e3 },
-  { id:"p4",customerId:"c4",address:"51 Clark St, Ponsonby, Auckland",      status:"Estimating",area:187,roofType:"Long Run Steel",notes:"Complex hip roof. Measure carefully.",         quoteNum:"",      quoteDate:"",          createdAt:"2024-12-13",estimate:e4 },
-  { id:"p5",customerId:"c5",address:"5 Trade Lane, Mt Wellington, Auckland",status:"New Lead",  area:0,  roofType:"",             notes:"Large commercial building. Needs site visit.", quoteNum:"",      quoteDate:"",          createdAt:"2024-12-13",estimate:null },
-  { id:"p6",customerId:"c2",address:"8 Second Ave, Remuera, Auckland",      status:"Won",       area:198,roofType:"Metal Tiles",   notes:"",                                            quoteNum:"QT-036",quoteDate:"2024-11-28",createdAt:"2024-11-25",estimate:e6 },
-  { id:"p7",customerId:"c1",address:"3 Beach Rd, Pt Chevalier, Auckland",   status:"Lost",      area:130,roofType:"Corrugated Iron",notes:"Client went with another contractor.",        quoteNum:"QT-037",quoteDate:"2024-12-01",createdAt:"2024-11-28",estimate:e7 },
+  { id:"p1",customerId:"c1",address:"47 Ridgeline Ave, Titirangi, Auckland",status:"Quote Sent",area:215,roofType:"Long Run Steel",  notes:"Remove existing iron. Access via side gate.",quoteNum:"QT-041",quoteDate:"2024-12-15",createdAt:"2024-12-14",estimate:e1 },
+  { id:"p2",customerId:"c2",address:"14 Henderson Valley Rd, Henderson",    status:"Won",       area:165,roofType:"Long Run Steel",  notes:"Full reroof including underlayment.",         quoteNum:"QT-039",quoteDate:"2024-12-08",createdAt:"2024-12-06",estimate:e2 },
+  { id:"p3",customerId:"c3",address:"22 Remuera Rd, Remuera, Auckland",     status:"Quote Sent",area:142,roofType:"Metal Tiles",     notes:"Metal tiles to match character home.",        quoteNum:"QT-042",quoteDate:"2024-12-14",createdAt:"2024-12-12",estimate:e3 },
+  { id:"p4",customerId:"c4",address:"51 Clark St, Ponsonby, Auckland",      status:"Estimating",area:187,roofType:"Long Run Steel",  notes:"Complex hip roof. Measure carefully.",         quoteNum:"",      quoteDate:"",          createdAt:"2024-12-13",estimate:e4 },
+  { id:"p5",customerId:"c5",address:"5 Trade Lane, Mt Wellington, Auckland",status:"New Lead",  area:0,  roofType:"",               notes:"Large commercial building. Needs site visit.", quoteNum:"",      quoteDate:"",          createdAt:"2024-12-13",estimate:null },
+  { id:"p6",customerId:"c2",address:"8 Second Ave, Remuera, Auckland",      status:"Won",       area:198,roofType:"Metal Tiles",     notes:"",                                            quoteNum:"QT-036",quoteDate:"2024-11-28",createdAt:"2024-11-25",estimate:e6 },
+  { id:"p7",customerId:"c1",address:"3 Beach Rd, Pt Chevalier, Auckland",   status:"Lost",      area:130,roofType:"Corrugated Iron", notes:"Client went with another contractor.",        quoteNum:"QT-037",quoteDate:"2024-12-01",createdAt:"2024-11-28",estimate:e7 },
 ]
 
 // ─────────────────────────── UI PRIMITIVES ───────────────────────────
@@ -164,12 +163,32 @@ function Modal({ title, onClose, children, width=560 }) {
   )
 }
 
-// FIX: added onDone to dependency array
 function Toast({ msg, onDone }) {
   useEffect(()=>{ const t = setTimeout(onDone, 3000); return ()=>clearTimeout(t) },[onDone])
   return <div style={{position:"fixed",bottom:24,right:24,background:"#0f172a",color:"#fff",padding:"12px 20px",borderRadius:10,fontSize:13,fontWeight:500,zIndex:9999,display:"flex",alignItems:"center",gap:8}}>
     <span style={{color:"#10b981",fontSize:16}}>✓</span> {msg}
   </div>
+}
+
+// ─── Currency selector rendered in the topbar ────────────────────────────────
+function CurrencySelector() {
+  const { currency, currencies, updateCurrency } = useCurrency()
+  return (
+    <select
+      value={currency.code}
+      onChange={e => updateCurrency(e.target.value)}
+      title="Change display currency"
+      style={{
+        padding:"5px 10px", border:"1px solid #e2e8f0", borderRadius:8,
+        fontSize:12, fontFamily:"inherit", background:"#fff",
+        cursor:"pointer", color:"#0f172a", fontWeight:500, outline:"none",
+      }}
+    >
+      {currencies.map(c => (
+        <option key={c.code} value={c.code}>{c.symbol} {c.code} — {c.name}</option>
+      ))}
+    </select>
+  )
 }
 
 function FG({ label, children, half }) {
@@ -180,9 +199,7 @@ function FG({ label, children, half }) {
 }
 
 // ─────────────────────────── SIDEBAR ───────────────────────────
-function Sidebar({ view, onNav, projects }) {
-  const won     = projects.filter(p=>p.status==="Won")
-  const revenue = won.reduce((a,p)=>a+(p.estimate?.total||0),0)
+function Sidebar({ view, onNav, projects, user, onLogout }) {
   const pending = projects.filter(p=>p.status==="Quote Sent").length
 
   const items = [
@@ -193,13 +210,14 @@ function Sidebar({ view, onNav, projects }) {
     { key:"projects",   label:"Projects",    icon:"📁" },
     { key:"customers",  label:"Customers",   icon:"👤" },
     null,
+    { key:"users",      label:"Users",       icon:"🔑" },
     { key:"settings",   label:"Settings",    icon:"⚙" },
   ]
 
   return (
     <div style={s.sidebar}>
       <div style={s.logo}>
-        <img src="/aTopRoof.png" alt="aTopRoof" style={{width:"100%",maxWidth:164,display:"block",filter:"brightness(1.05)"}}/>
+        <img src="/aTopRoof.png" alt="aTopRoof" style={{width:"100%",maxWidth:164,display:"block",background:"#ffffff",borderRadius:10,padding:"8px 12px",boxShadow:"0 1px 4px rgba(0,0,0,0.25)"}}/>
         <div style={{fontSize:10,color:"#f59e0b",letterSpacing:1,textTransform:"uppercase",marginTop:8,fontWeight:600}}>Elevate Your Roofing Business</div>
       </div>
       <nav style={s.nav}>
@@ -220,17 +238,17 @@ function Sidebar({ view, onNav, projects }) {
           )
         )}
       </nav>
-      <div style={{padding:"12px 14px",borderTop:"1px solid rgba(255,255,255,0.08)"}}>
-        <div style={{fontSize:11,color:"#475569",marginBottom:6}}>Revenue (Won Jobs)</div>
-        <div style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800,color:"#f59e0b"}}>{fmt(revenue)}</div>
-        <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{won.length} jobs completed</div>
-        <div style={{display:"flex",alignItems:"center",gap:8,marginTop:12,padding:"8px 10px",borderRadius:8,cursor:"pointer"}}>
-          <div style={{width:28,height:28,borderRadius:"50%",background:"linear-gradient(135deg,#f59e0b,#f97316)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#000"}}>JM</div>
-          <div>
-            <div style={{fontSize:12,color:"#fff",fontWeight:500}}>James Mitchell</div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginTop:12,padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,0.04)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
+          <div style={{width:28,height:28,borderRadius:"50%",background:"linear-gradient(135deg,#f59e0b,#f97316)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#000",flexShrink:0}}>
+            {user?.name?.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}
+          </div>
+          <div style={{minWidth:0}}>
+            <div style={{fontSize:12,color:"#fff",fontWeight:500,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user?.name}</div>
             <div style={{fontSize:10,color:"#475569"}}>aTopRoof CRM</div>
           </div>
         </div>
+        <button onClick={onLogout} title="Sign out" style={{background:"none",border:"none",cursor:"pointer",color:"#475569",fontSize:16,padding:4,lineHeight:1,flexShrink:0}}>⏻</button>
       </div>
     </div>
   )
@@ -238,12 +256,14 @@ function Sidebar({ view, onNav, projects }) {
 
 // ─────────────────────────── DASHBOARD ───────────────────────────
 function Dashboard({ projects, customers, setView, setSelectedProject, onNewProject }) {
+  const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
+
   const stats = useMemo(()=>{
-    const won    = projects.filter(p=>p.status==="Won")
-    const sent   = projects.filter(p=>p.status==="Quote Sent")
-    const leads  = projects.filter(p=>p.status==="New Lead")
-    const revenue = won.reduce((a,p)=>a+(p.estimate?.total||0),0)
-    const pipeline= sent.reduce((a,p)=>a+(p.estimate?.total||0),0)
+    const won      = projects.filter(p=>p.status==="Won")
+    const sent     = projects.filter(p=>p.status==="Quote Sent")
+    const leads    = projects.filter(p=>p.status==="New Lead")
+    const revenue  = won.reduce((a,p)=>a+(p.estimate?.total||0),0)
+    const pipeline = sent.reduce((a,p)=>a+(p.estimate?.total||0),0)
     return { leads:leads.length, sent:sent.length, won:won.length, revenue, pipeline, total:projects.length }
   },[projects])
 
@@ -260,10 +280,10 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
     <div>
       <div style={s.grid4}>
         {[
-          { label:"Total Projects",  val:stats.total,        sub:`${stats.leads} new leads`,                           bg:"#dbeafe", color:"#1e40af" },
-          { label:"Quotes Sent",     val:stats.sent,         sub:fmt(stats.pipeline)+" in pipeline",                   bg:"#fef3c7", color:"#92400e" },
-          { label:"Jobs Won",        val:stats.won,          sub:`${stats.total?Math.round(stats.won/stats.total*100):0}% conversion`, bg:"#d1fae5", color:"#065f46" },
-          { label:"Revenue (Won)",   val:fmt(stats.revenue), sub:"All time total",                                     bg:"#ede9fe", color:"#5b21b6" },
+          { label:"Total Projects", val:stats.total,        sub:`${stats.leads} new leads`,                                                 bg:"#dbeafe", color:"#1e40af" },
+          { label:"Quotes Sent",    val:stats.sent,         sub:fmt(stats.pipeline)+" in pipeline",                                         bg:"#fef3c7", color:"#92400e" },
+          { label:"Jobs Won",       val:stats.won,          sub:`${stats.total?Math.round(stats.won/stats.total*100):0}% conversion`,        bg:"#d1fae5", color:"#065f46" },
+          { label:"Revenue (Won)",  val:fmt(stats.revenue), sub:"All time total",                                                            bg:"#ede9fe", color:"#5b21b6" },
         ].map(c=>(
           <div key={c.label} style={s.card}>
             <div style={{fontSize:11,color:"#64748b",textTransform:"uppercase",letterSpacing:.5,marginBottom:8}}>{c.label}</div>
@@ -282,7 +302,7 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
             </div>
             {recent.map(p=>{
               const cust = customers.find(c=>c.id===p.customerId)
-              const st = STATUS_STYLE[p.status]
+              const st   = STATUS_STYLE[p.status]
               return (
                 <div key={p.id} onClick={()=>openProject(p)} style={{display:"flex",alignItems:"center",gap:14,padding:"11px 0",borderBottom:"1px solid #f1f5f9",cursor:"pointer"}}>
                   <div style={{width:8,height:8,borderRadius:"50%",background:st.dot,flexShrink:0}}/>
@@ -332,7 +352,6 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
           <div style={s.card}>
             <div style={{fontWeight:700,fontSize:14,marginBottom:12}}>Quick Actions</div>
             <div style={{display:"flex",flexDirection:"column",gap:8}}>
-              {/* FIX: open wizard instead of navigating to nonexistent "new" view */}
               <Btn primary full onClick={onNewProject}>📸 New Roof Job</Btn>
               <Btn full onClick={()=>setView("pipeline")}>▦ View Pipeline</Btn>
               <Btn full onClick={()=>setView("customers")}>👤 Manage Customers</Btn>
@@ -369,7 +388,6 @@ function linelenPx(pts) {
   return l
 }
 
-// FIX: renamed prop to onGeometryChange (was broken — component internally used onGeometryChange but caller passed onAreaChange)
 function MeasurementTool({ onGeometryChange }) {
   const canvasRef   = useRef(null)
   const imgRef      = useRef(null)
@@ -423,7 +441,6 @@ function MeasurementTool({ onGeometryChange }) {
     }
   },[sections,lineItems,ptItems,asbestos,mPerPx])
 
-  // FIX: added onGeometryChange to deps
   useEffect(()=>{ onGeometryChange?.(geometry) },[geometry, onGeometryChange])
 
   const drawCanvas = useCallback(()=>{
@@ -563,12 +580,10 @@ function MeasurementTool({ onGeometryChange }) {
       }
       setDrawPts(prev=>[...prev,pt])
     }
-    else if(activeTool==="flashing"||activeTool==="gutter"){
-      setDrawPts(prev=>[...prev,pt])
-    }
-    else if(activeTool==="downpipe")   { setPtItems(prev=>[...prev,{id:uid(),type:"downpipe",  x:pt.x,y:pt.y}]) }
-    else if(activeTool==="drain")      { setPtItems(prev=>[...prev,{id:uid(),type:"drain",     x:pt.x,y:pt.y}]) }
-    else if(activeTool==="penetration"){ setPtItems(prev=>[...prev,{id:uid(),type:"penetration",subtype:penSub,x:pt.x,y:pt.y}]) }
+    else if(activeTool==="flashing"||activeTool==="gutter"){ setDrawPts(prev=>[...prev,pt]) }
+    else if(activeTool==="downpipe")    { setPtItems(prev=>[...prev,{id:uid(),type:"downpipe",   x:pt.x,y:pt.y}]) }
+    else if(activeTool==="drain")       { setPtItems(prev=>[...prev,{id:uid(),type:"drain",      x:pt.x,y:pt.y}]) }
+    else if(activeTool==="penetration") { setPtItems(prev=>[...prev,{id:uid(),type:"penetration",subtype:penSub,x:pt.x,y:pt.y}]) }
     else if(activeTool==="scale"){
       if(!scaleLine?.p1)       setScaleLine({p1:pt,p2:null,knownM})
       else if(!scaleLine?.p2){ setScaleLine(prev=>({...prev,p2:pt})); setActiveTool("section") }
@@ -596,13 +611,13 @@ function MeasurementTool({ onGeometryChange }) {
   }
 
   const TOOLS=[
-    {key:"section",    label:"Roof Section", icon:"▲", color:"#3b82f6", hint:"Click to add points · click first point (⭕) to close polygon"},
-    {key:"flashing",   label:"Flashing",     icon:"⚡", color:"#f59e0b", hint:"Click points to trace flashing lines · press Done ✓ to finish"},
-    {key:"gutter",     label:"Gutter",       icon:"〰", color:"#06b6d4", hint:"Click points to trace gutters · press Done ✓ to finish"},
-    {key:"downpipe",   label:"Downpipe",     icon:"⬇", color:"#0ea5e9", hint:"Click canvas to place a downpipe (DP) marker"},
-    {key:"drain",      label:"Roof Drain",   icon:"⊙", color:"#6366f1", hint:"Click canvas to place a roof drain (DR) marker"},
-    {key:"penetration",label:"Penetration",  icon:"◇", color:"#8b5cf6", hint:"Click to place — select type below"},
-    {key:"scale",      label:"Set Scale",    icon:"📏", color:"#10b981", hint:"Click two points over a known dimension, then enter the real length"},
+    {key:"section",    label:"Roof Section",icon:"▲",color:"#3b82f6",hint:"Click to add points · click first point (⭕) to close polygon"},
+    {key:"flashing",   label:"Flashing",    icon:"⚡",color:"#f59e0b",hint:"Click points to trace flashing lines · press Done ✓ to finish"},
+    {key:"gutter",     label:"Gutter",      icon:"〰",color:"#06b6d4",hint:"Click points to trace gutters · press Done ✓ to finish"},
+    {key:"downpipe",   label:"Downpipe",    icon:"⬇",color:"#0ea5e9",hint:"Click canvas to place a downpipe (DP) marker"},
+    {key:"drain",      label:"Roof Drain",  icon:"⊙",color:"#6366f1",hint:"Click canvas to place a roof drain (DR) marker"},
+    {key:"penetration",label:"Penetration", icon:"◇",color:"#8b5cf6",hint:"Click to place — select type below"},
+    {key:"scale",      label:"Set Scale",   icon:"📏",color:"#10b981",hint:"Click two points over a known dimension, then enter the real length"},
   ]
   const tip=TOOLS.find(t=>t.key===activeTool)?.hint||""
 
@@ -772,6 +787,8 @@ function MeasurementTool({ onGeometryChange }) {
 
 // ─────────────────────────── ESTIMATE ENGINE ───────────────────────────
 function EstimateEngine({ initialArea, onEstimateChange }) {
+  const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
+
   const [e, setE] = useState({
     area:initialArea||0, pitch:1.15, waste:10,
     materialRate:55, materialLabel:"Long Run Steel",
@@ -779,7 +796,6 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
   })
 
   const result = useMemo(()=>calcEst(e),[e])
-  // FIX: added onEstimateChange to deps
   useEffect(()=>{ onEstimateChange?.(result) },[result, onEstimateChange])
 
   const upd = k => v => setE(prev=>({...prev,[k]:typeof v==="number"?v:parseFloat(v)||0}))
@@ -865,8 +881,9 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
 }
 
 // ─────────────────────────── QUOTE VIEW ───────────────────────────
-// FIX: accepts company from settings instead of reading dead COMPANY constant
 function QuoteView({ project, customer, company }) {
+  const { currency, formatMoney: fmt } = useCurrency()   // ← currency-aware fmt + name
+
   if(!project||!customer) return <div style={{color:"#64748b",padding:20}}>No project selected.</div>
   const e = project.estimate
   if(!e) return <div style={{color:"#64748b",padding:20}}>No estimate available. Complete the estimate step first.</div>
@@ -875,12 +892,11 @@ function QuoteView({ project, customer, company }) {
   const qd  = project.quoteDate || today()
   const exp = new Date(new Date(qd.slice(0,10)+"T12:00:00").getTime()+30*86400000).toISOString().slice(0,10)
 
-  // FIX: use RATES constant instead of magic numbers
   const quoteLines = [
-    { desc:`${e.materialLabel} roofing — supply & install`, qty:`${e.adjArea?.toFixed(1)} m²`,     unit:`$${e.materialRate}`,       total:e.matCost   },
-    { desc:"Flashings — ridge/hip/valley",                  qty:`${e.flashings}m`,                  unit:`$${RATES.flashings}/m`,    total:e.flashCost },
-    { desc:"Guttering & downpipes",                         qty:`${e.guttering}m`,                  unit:`$${RATES.guttering}/m`,    total:e.gutCost   },
-    { desc:`Labour — installation (${e.days} days)`,        qty:"—",                                unit:"—",                        total:e.labCost   },
+    { desc:`${e.materialLabel} roofing — supply & install`, qty:`${e.adjArea?.toFixed(1)} m²`, unit:`$${e.materialRate}`,    total:e.matCost   },
+    { desc:"Flashings — ridge/hip/valley",                  qty:`${e.flashings}m`,              unit:`$${RATES.flashings}/m`, total:e.flashCost },
+    { desc:"Guttering & downpipes",                         qty:`${e.guttering}m`,              unit:`$${RATES.guttering}/m`, total:e.gutCost   },
+    { desc:`Labour — installation (${e.days} days)`,        qty:"—",                            unit:"—",                     total:e.labCost   },
   ].filter(l=>l.total>0)
 
   return (
@@ -945,7 +961,8 @@ function QuoteView({ project, customer, company }) {
             <span style={{fontWeight:700,fontSize:15}}>Total inc. GST</span>
             <div style={{textAlign:"right"}}>
               <div style={{fontFamily:"'Syne',sans-serif",fontSize:26,fontWeight:800}}>{fmt(e.total)}</div>
-              <div style={{fontSize:11,color:"#64748b"}}>New Zealand Dollars</div>
+              {/* ← shows active currency name instead of hardcoded "New Zealand Dollars" */}
+              <div style={{fontSize:11,color:"#64748b"}}>{currency.name}</div>
             </div>
           </div>
         </div>
@@ -964,17 +981,19 @@ function QuoteView({ project, customer, company }) {
 
 // ─────────────────────────── NEW PROJECT WIZARD ───────────────────────────
 function NewProjectWizard({ customers, projects, onSave, onCancel, existingProject, company }) {
+  const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
+
   const [step,    setStep]    = useState(0)
   const [saving,  setSaving]  = useState(false)
   const [form,    setForm]    = useState(existingProject || {
     customerId:"", address:"", roofType:"Long Run Steel", status:"New Lead", notes:"",
   })
-  const [newCust, setNewCust] = useState({ name:"", email:"", phone:"", address:"" })
+  const [newCust,   setNewCust]   = useState({ name:"", email:"", phone:"", address:"" })
   const [isNewCust, setIsNewCust] = useState(false)
-  const [area,     setArea]     = useState(existingProject?.area||null)
-  const [estimate, setEstimate] = useState(existingProject?.estimate||null)
+  const [area,      setArea]      = useState(existingProject?.area||null)
+  const [estimate,  setEstimate]  = useState(existingProject?.estimate||null)
 
-  const STEPS = ["Customer","Measure","Estimate","Quote & Save"]
+  const STEPS  = ["Customer","Measure","Estimate","Quote & Save"]
   const isEdit = !!existingProject
 
   async function save() {
@@ -983,7 +1002,7 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
     let pendingNewCust = null
     if(isNewCust && newCust.name) {
       pendingNewCust = newCust
-      cid = uid() // temporary; real ID comes from API in handleSaveProject
+      cid = uid()
     }
     const project = {
       ...form,
@@ -1040,10 +1059,10 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
             </FG>
           ):(
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-              <FG label="Full Name"><input style={s.input} value={newCust.name} onChange={e=>setNewCust(p=>({...p,name:e.target.value}))} placeholder="Sarah Thompson"/></FG>
-              <FG label="Phone"><input style={s.input} value={newCust.phone} onChange={e=>setNewCust(p=>({...p,phone:e.target.value}))} placeholder="021 999 0000"/></FG>
-              <FG label="Email"><input style={s.input} value={newCust.email} onChange={e=>setNewCust(p=>({...p,email:e.target.value}))} placeholder="sarah@email.com"/></FG>
-              <FG label="Address"><input style={s.input} value={newCust.address} onChange={e=>setNewCust(p=>({...p,address:e.target.value}))} placeholder="123 Main St, Auckland"/></FG>
+              <FG label="Full Name"><input style={s.input} value={newCust.name}    onChange={e=>setNewCust(p=>({...p,name:e.target.value}))}    placeholder="Sarah Thompson"/></FG>
+              <FG label="Phone">   <input style={s.input} value={newCust.phone}   onChange={e=>setNewCust(p=>({...p,phone:e.target.value}))}   placeholder="021 999 0000"/></FG>
+              <FG label="Email">   <input style={s.input} value={newCust.email}   onChange={e=>setNewCust(p=>({...p,email:e.target.value}))}   placeholder="sarah@email.com"/></FG>
+              <FG label="Address"> <input style={s.input} value={newCust.address} onChange={e=>setNewCust(p=>({...p,address:e.target.value}))} placeholder="123 Main St, Auckland"/></FG>
             </div>
           )}
           <div style={{height:1,background:"#e2e8f0",margin:"18px 0"}}/>
@@ -1064,9 +1083,7 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
         </div>
       )}
 
-      {/* FIX: pass onGeometryChange (was broken: passed onAreaChange which component never read) */}
       {step===1 && <MeasurementTool onGeometryChange={g=>setArea(g.total_surface_m2)}/>}
-
       {step===2 && <EstimateEngine initialArea={area||0} onEstimateChange={setEstimate}/>}
 
       {step===3 && (
@@ -1098,9 +1115,7 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
         <Btn onClick={step===0?onCancel:stepBack}>{step===0?"Cancel":"← Back"}</Btn>
         <div style={{display:"flex",gap:10}}>
           {step<STEPS.length-1 && (
-            <Btn onClick={stepNext} style={{opacity:canNext[step]?1:.5,pointerEvents:canNext[step]?"auto":"none"}}>
-              Skip →
-            </Btn>
+            <Btn onClick={stepNext} style={{opacity:canNext[step]?1:.5,pointerEvents:canNext[step]?"auto":"none"}}>Skip →</Btn>
           )}
           {step<STEPS.length-1
             ? <Btn primary onClick={()=>canNext[step]&&stepNext()}>Next →</Btn>
@@ -1114,69 +1129,131 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
 
 // ─────────────────────────── PIPELINE ───────────────────────────
 function Pipeline({ projects, customers, setProjects, setView, setSelectedProject }) {
+  const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
+
   const getCustomer = id => customers.find(c=>c.id===id)
+  const [draggingId,  setDraggingId]  = useState(null)
+  const [dragOverCol, setDragOverCol] = useState(null)
 
   async function moveStatus(project, newStatus) {
+    if(project.status === newStatus) return
+    setProjects(prev=>prev.map(p=>p.id===project.id?{...p,status:newStatus}:p))
     try {
       await projectsApi.updateStatus(project.id, newStatus)
-      setProjects(prev=>prev.map(p=>p.id===project.id?{...p,status:newStatus}:p))
     } catch(err) {
       console.error("Failed to update status:", err)
+      setProjects(prev=>prev.map(p=>p.id===project.id?{...p,status:project.status}:p))
     }
   }
 
+  function onDragStart(e, project) {
+    setDraggingId(project.id)
+    e.dataTransfer.effectAllowed = "move"
+    e.dataTransfer.setData("projectId", project.id)
+    const ghost = document.createElement("div")
+    ghost.style.cssText = ["position:fixed","top:-999px","left:-999px","background:#0f172a","color:#fff","font:600 12px/1 'DM Sans',sans-serif","padding:6px 12px","border-radius:8px","white-space:nowrap","pointer-events:none","z-index:9999","box-shadow:0 4px 12px rgba(0,0,0,0.3)"].join(";")
+    const cust = customers.find(c=>c.id===project.customerId)
+    ghost.textContent = "↔  Moving: " + (cust?.name || project.address || "project")
+    document.body.appendChild(ghost)
+    e.dataTransfer.setDragImage(ghost, -12, -12)
+    requestAnimationFrame(() => ghost.remove())
+  }
+  function onDragEnd() { setDraggingId(null); setDragOverCol(null) }
+
+  function onColumnDragOver(e, status) { e.preventDefault(); e.dataTransfer.dropEffect="move"; setDragOverCol(status) }
+  function onColumnDragLeave(e) { if(!e.currentTarget.contains(e.relatedTarget)) setDragOverCol(null) }
+  function onColumnDrop(e, status) {
+    e.preventDefault()
+    const project = projects.find(p=>p.id===e.dataTransfer.getData("projectId"))
+    if(project && project.status !== status) moveStatus(project, status)
+    setDraggingId(null); setDragOverCol(null)
+  }
+
+  const draggingProject = projects.find(p=>p.id===draggingId)
+
   return (
-    <div style={{overflowX:"auto",paddingBottom:12}}>
-      <div style={{display:"flex",gap:14,minWidth:"max-content"}}>
-        {STATUSES.map(status=>{
-          const cols  = projects.filter(p=>p.status===status)
-          const st    = STATUS_STYLE[status]
-          const colVal= cols.reduce((a,p)=>a+(p.estimate?.total||0),0)
-          return (
-            <div key={status} style={{width:220}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderRadius:"10px 10px 0 0",background:st.bg,color:st.color}}>
-                <span style={{fontWeight:700,fontSize:12}}>{status}</span>
-                <div style={{textAlign:"right"}}>
-                  <div style={{fontSize:11,fontWeight:700}}>{cols.length}</div>
-                  {colVal>0&&<div style={{fontSize:10,opacity:.8}}>{fmt(colVal)}</div>}
+    <>
+      <style>{`
+        .pipeline-card { transition: box-shadow .15s, opacity .15s, transform .15s; }
+        .pipeline-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.10); }
+        .pipeline-card[draggable="true"] { cursor: grab; }
+        .pipeline-card[draggable="true"]:active { cursor: grabbing; }
+        .pipeline-card.is-dragging { opacity: 0.42; transform: scale(0.97); box-shadow: none; }
+        .pipeline-is-dragging, .pipeline-is-dragging * { cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 20 20'%3E%3Ccircle cx='10' cy='10' r='9' fill='%23111827' opacity='.85'/%3E%3Ctext x='10' y='14' text-anchor='middle' font-size='11' fill='white'%3E✥%3C/text%3E%3C/svg%3E") 10 10, grabbing !important; }
+        .pipeline-col-drop { transition: background .15s, box-shadow .15s; }
+        .pipeline-col-drop.drag-over { background: #f0f9ff !important; box-shadow: inset 0 0 0 2px #3b82f6; border-radius: 0 0 10px 10px; }
+        .pipeline-drop-hint { display:none; text-align:center; padding:10px 8px; border:2px dashed #93c5fd; border-radius:8px; margin-bottom:8px; color:#3b82f6; font-size:11px; font-weight:600; background:rgba(59,130,246,0.04); pointer-events:none; }
+        .pipeline-col-drop.drag-over .pipeline-drop-hint { display: block; }
+      `}</style>
+
+      <div className={draggingId ? "pipeline-is-dragging" : ""} style={{overflowX:"auto",paddingBottom:12}}>
+        {draggingId && (
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,padding:"8px 14px",background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,fontSize:12,color:"#92400e",fontWeight:500}}>
+            <span style={{fontSize:15}}>↔</span>
+            Drag <strong>{getCustomer(draggingProject?.customerId)?.name||"project"}</strong> to a column to move it
+          </div>
+        )}
+        <div style={{display:"flex",gap:14,minWidth:"max-content"}}>
+          {STATUSES.map(status=>{
+            const cols   = projects.filter(p=>p.status===status)
+            const st     = STATUS_STYLE[status]
+            const colVal = cols.reduce((a,p)=>a+(p.estimate?.total||0),0)
+            const isOver = dragOverCol===status
+            return (
+              <div key={status} style={{width:220}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderRadius:"10px 10px 0 0",background:isOver?STATUS_STYLE[status].dot:st.bg,color:isOver?"#fff":st.color,transition:"background .15s, color .15s"}}>
+                  <span style={{fontWeight:700,fontSize:12}}>{status}</span>
+                  <div style={{textAlign:"right"}}>
+                    <div style={{fontSize:11,fontWeight:700}}>{cols.length}</div>
+                    {colVal>0&&<div style={{fontSize:10,opacity:.8}}>{fmt(colVal)}</div>}
+                  </div>
+                </div>
+                <div className={"pipeline-col-drop"+(isOver?" drag-over":"")}
+                  style={{border:"1px solid #e2e8f0",borderTop:"none",borderRadius:"0 0 10px 10px",padding:8,minHeight:240,background:"#f8fafc"}}
+                  onDragOver={e=>onColumnDragOver(e,status)} onDragLeave={onColumnDragLeave} onDrop={e=>onColumnDrop(e,status)}>
+                  <div className="pipeline-drop-hint">Drop here → {status}</div>
+                  {cols.map(p=>{
+                    const cust = getCustomer(p.customerId)
+                    const isDragging = draggingId===p.id
+                    return (
+                      <div key={p.id}
+                        className={"pipeline-card"+(isDragging?" is-dragging":"")}
+                        draggable onDragStart={e=>onDragStart(e,p)} onDragEnd={onDragEnd}
+                        style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,padding:12,marginBottom:8,userSelect:"none"}}
+                        onClick={()=>{ if(!draggingId){ setSelectedProject(p); setView("project") } }}>
+                        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:2}}>
+                          <div style={{fontWeight:600,fontSize:13,flex:1}}>{cust?.name||"—"}</div>
+                          <span title="Drag to move" style={{fontSize:12,color:"#cbd5e1",marginLeft:4,flexShrink:0,cursor:"grab"}}>⠿</span>
+                        </div>
+                        <div style={{fontSize:11,color:"#64748b",marginBottom:6,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{p.address}</div>
+                        {p.estimate && <div style={{fontWeight:700,fontSize:13,color:"#b45309"}}>{fmt(p.estimate.total)}</div>}
+                        {!p.estimate && p.area>0 && <div style={{fontSize:11,color:"#64748b"}}>{p.area} m²</div>}
+                        <div style={{marginTop:8}}>
+                          <select value={status} onChange={e=>{e.stopPropagation();moveStatus(p,e.target.value)}}
+                            onClick={e=>e.stopPropagation()}
+                            style={{fontSize:10,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:6,background:"#f8fafc",cursor:"pointer",width:"100%"}}>
+                            {STATUSES.map(st=><option key={st}>{st}</option>)}
+                          </select>
+                        </div>
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
-              <div style={{border:"1px solid #e2e8f0",borderTop:"none",borderRadius:"0 0 10px 10px",padding:8,minHeight:240,background:"#f8fafc"}}>
-                {cols.map(p=>{
-                  const cust=getCustomer(p.customerId)
-                  return (
-                    <div key={p.id} style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,padding:12,marginBottom:8,cursor:"pointer",transition:"box-shadow .15s"}}
-                      onClick={()=>{ setSelectedProject(p); setView("project") }}>
-                      <div style={{fontWeight:600,fontSize:13,marginBottom:2}}>{cust?.name||"—"}</div>
-                      <div style={{fontSize:11,color:"#64748b",marginBottom:6,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{p.address}</div>
-                      {p.estimate && <div style={{fontWeight:700,fontSize:13,color:"#b45309"}}>{fmt(p.estimate.total)}</div>}
-                      {!p.estimate && p.area>0 && <div style={{fontSize:11,color:"#64748b"}}>{p.area} m²</div>}
-                      <div style={{marginTop:8}}>
-                        <select value={status} onChange={e=>{e.stopPropagation();moveStatus(p,e.target.value)}}
-                          onClick={e=>e.stopPropagation()}
-                          style={{fontSize:10,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:6,background:"#f8fafc",cursor:"pointer",width:"100%"}}>
-                          {STATUSES.map(st=><option key={st}>{st}</option>)}
-                        </select>
-                      </div>
-                    </div>
-                  )
-                })}
-                <div style={{textAlign:"center",padding:"8px 0",cursor:"pointer",color:"#94a3b8",fontSize:12}}
-                  onClick={()=>setView("new")}>+ Add</div>
-              </div>
-            </div>
-          )
-        })}
+            )
+          })}
+        </div>
       </div>
-    </div>
+    </>
   )
 }
 
 // ─────────────────────────── PROJECTS LIST ───────────────────────────
 function ProjectsList({ projects, customers, setView, setSelectedProject }) {
+  const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
+
   const [search,       setSearch]       = useState("")
   const [filterStatus, setFilterStatus] = useState("All")
-
   const getCustomer = id => customers.find(c=>c.id===id)
 
   const filtered = projects
@@ -1234,17 +1311,115 @@ function ProjectsList({ projects, customers, setView, setSelectedProject }) {
 
 // ─────────────────────────── PROJECT DETAIL ───────────────────────────
 function ProjectDetail({ project, customers, setProjects, setView, onEdit, company }) {
+  const { formatMoney } = useCurrency()   // ← currency-aware formatter
+
   if(!project) return null
   const cust = customers.find(c=>c.id===project.customerId)
-  const e = project.estimate
+  const e    = project.estimate
+  const [showEmailModal, setShowEmailModal] = useState(false)
+  const [copied,         setCopied]         = useState(false)
 
   async function updateStatus(newStatus) {
     try {
       await projectsApi.updateStatus(project.id, newStatus)
       setProjects(prev=>prev.map(p=>p.id===project.id?{...p,status:newStatus}:p))
-    } catch(err) {
-      console.error("updateStatus failed:", err)
-    }
+    } catch(err) { console.error("updateStatus failed:", err) }
+  }
+
+  function handlePrint() {
+    setView("quote_print")
+    setTimeout(() => window.print(), 400)
+  }
+
+  function buildEmailHTML() {
+    const co = company || {}
+    const e  = project.estimate
+    const qn = project.quoteNum || "DRAFT"
+    const qd = project.quoteDate || today()
+    const exp = new Date(new Date(qd.slice(0,10)+"T12:00:00").getTime()+30*86400000).toISOString().slice(0,10)
+    const fmtD_local = d => { if(!d) return "—"; const iso = String(d).includes("T") ? d : d.slice(0,10)+"T12:00:00"; return new Date(iso).toLocaleDateString("en-NZ",{day:"numeric",month:"short",year:"numeric"}) }
+    // ← use currency-aware formatter instead of hardcoded "$"
+    const fmt_local = formatMoney
+
+    const quoteLines = e ? [
+      { desc:`${e.materialLabel} roofing — supply & install`, qty:`${e.adjArea?.toFixed(1)} m²`, unit:`$${e.materialRate}/m²`, total:e.matCost  },
+      { desc:"Flashings — ridge/hip/valley",                  qty:`${e.flashings}m`,             unit:`$${RATES.flashings}/m`, total:e.flashCost },
+      { desc:"Guttering & downpipes",                         qty:`${e.guttering}m`,             unit:`$${RATES.guttering}/m`, total:e.gutCost   },
+      { desc:`Labour — installation (${e.days} days)`,        qty:"—",                           unit:"—",                     total:e.labCost   },
+    ].filter(l => l.total > 0) : []
+
+    const lineRowsHTML = quoteLines.map(li => `
+      <tr>
+        <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;">${li.desc}</td>
+        <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;">${li.qty}</td>
+        <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;">${li.unit}</td>
+        <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;font-weight:500;">${fmt_local(li.total)}</td>
+      </tr>`).join("")
+
+    return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"/></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:'Helvetica Neue',Arial,sans-serif;">
+<div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+  <div style="background:#0f172a;padding:28px 32px;display:flex;justify-content:space-between;align-items:flex-start;">
+    <div>
+      <div style="font-size:22px;font-weight:800;color:#ffffff;letter-spacing:-0.5px;">${co.companyName||"DK Roofing"}</div>
+      <div style="font-size:12px;color:#94a3b8;margin-top:6px;line-height:1.8;">
+        ${co.companyAddress||""}<br/>${co.companyEmail||""} &nbsp;·&nbsp; ${co.companyPhone||""}<br/>GST No: ${co.companyGst||""}
+      </div>
+    </div>
+    <div style="text-align:right;">
+      <div style="display:inline-block;background:#f59e0b;color:#000;font-size:10px;font-weight:700;padding:3px 12px;border-radius:20px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;">Quote</div>
+      <div style="font-size:15px;font-weight:700;color:#ffffff;">${qn}</div>
+      <div style="font-size:12px;color:#94a3b8;line-height:1.8;margin-top:4px;">Issued: ${fmtD_local(qd)}<br/>Expires: ${fmtD_local(exp)}</div>
+    </div>
+  </div>
+  <div style="padding:32px;">
+    <div style="margin-bottom:24px;">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:#94a3b8;margin-bottom:8px;">Prepared For</div>
+      <div style="font-size:15px;font-weight:700;color:#0f172a;">${cust?.name||"—"}</div>
+      <div style="font-size:13px;color:#64748b;line-height:1.8;margin-top:4px;">${cust?.address||""}<br/>${cust?.email||""} &nbsp;·&nbsp; ${cust?.phone||""}</div>
+    </div>
+    <div style="margin-bottom:24px;">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:#94a3b8;margin-bottom:8px;">Address / Scope</div>
+      <div style="font-size:13px;font-weight:600;color:#0f172a;">${project.address}</div>
+      ${project.notes?`<div style="font-size:12px;color:#64748b;margin-top:6px;line-height:1.7;padding:10px 14px;background:#f8fafc;border-radius:6px;border-left:3px solid #e2e8f0;">${project.notes}</div>`:""}
+    </div>
+    ${e?`
+    <div style="margin-bottom:24px;">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:#94a3b8;margin-bottom:10px;">Line Items</div>
+      <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
+        <thead><tr style="background:#f8fafc;">
+          <th style="text-align:left;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Description</th>
+          <th style="text-align:left;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Qty</th>
+          <th style="text-align:right;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Unit</th>
+          <th style="text-align:right;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Total</th>
+        </tr></thead>
+        <tbody>${lineRowsHTML}</tbody>
+      </table>
+    </div>
+    <div style="display:flex;justify-content:flex-end;margin-bottom:24px;">
+      <div style="min-width:260px;">
+        <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;"><span style="color:#64748b;">Subtotal (excl. GST)</span><span style="font-weight:500;">${fmt_local(e.sellPrice)}</span></div>
+        <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;"><span style="color:#64748b;">GST (${GST_RATE*100}%)</span><span style="font-weight:500;">${fmt_local(e.gst)}</span></div>
+        <div style="background:#0f172a;border-radius:8px;padding:14px 16px;margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
+          <span style="color:#fff;font-weight:700;font-size:14px;">Total inc. GST</span>
+          <span style="color:#f59e0b;font-size:24px;font-weight:800;">${fmt_local(e.total)}</span>
+        </div>
+      </div>
+    </div>`:`
+    <div style="padding:16px;background:#fef3c7;border-radius:8px;font-size:13px;color:#92400e;margin-bottom:24px;">⚠ Pricing to be confirmed — please contact us for a full estimate.</div>`}
+    <div style="border-top:1px solid #e2e8f0;padding-top:20px;">
+      <div style="font-size:11px;color:#94a3b8;line-height:2.1;">
+        <strong style="color:#64748b;">Terms:</strong> 50% deposit on acceptance. Balance on completion within 7 days of invoice.<br/>
+        <strong style="color:#64748b;">Payment:</strong> Bank transfer to ${co.companyName||"DK Roofing"} — ${co.companyBank||""}<br/>
+        <strong style="color:#64748b;">Validity:</strong> This quote is valid for 30 days from date of issue. Subject to site inspection.
+      </div>
+    </div>
+  </div>
+  <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 32px;text-align:center;">
+    <div style="font-size:11px;color:#94a3b8;">${co.companyName||"DK Roofing"} &nbsp;·&nbsp; ${co.companyPhone||""} &nbsp;·&nbsp; ${co.companyEmail||""}</div>
+  </div>
+</div></body></html>`
   }
 
   return (
@@ -1263,18 +1438,14 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
         <div>
           <div style={s.card}>
             <div style={{fontWeight:700,fontSize:15,marginBottom:4}}>{cust?.name||"—"}</div>
-            <div style={{fontSize:13,color:"#64748b",lineHeight:1.9}}>
-              {cust?.email}<br/>{cust?.phone}
-            </div>
+            <div style={{fontSize:13,color:"#64748b",lineHeight:1.9}}>{cust?.email}<br/>{cust?.phone}</div>
             <div style={{height:1,background:"#f1f5f9",margin:"14px 0"}}/>
             <div style={{fontSize:12,color:"#64748b",marginBottom:4}}>Job Address</div>
             <div style={{fontSize:13,fontWeight:500}}>{project.address}</div>
             {project.roofType&&<div style={{marginTop:8}}><span style={{fontSize:11,color:"#64748b"}}>Roof Type: </span><span style={{fontSize:12,fontWeight:500}}>{project.roofType}</span></div>}
             {project.area>0&&<div><span style={{fontSize:11,color:"#64748b"}}>Area: </span><span style={{fontSize:12,fontWeight:500}}>{project.area} m²</span></div>}
             {project.notes&&(
-              <div style={{marginTop:14,padding:12,background:"#f8fafc",borderRadius:8,fontSize:12,color:"#64748b",lineHeight:1.7}}>
-                📋 {project.notes}
-              </div>
+              <div style={{marginTop:14,padding:12,background:"#f8fafc",borderRadius:8,fontSize:12,color:"#64748b",lineHeight:1.7}}>📋 {project.notes}</div>
             )}
           </div>
 
@@ -1283,11 +1454,11 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
               <div style={{fontWeight:700,marginBottom:14}}>Estimate Breakdown</div>
               {[
                 ["Adjusted Area",               `${e.adjArea?.toFixed(1)} m²`],
-                [`Material (${e.materialLabel})`, fmt(e.matCost)],
-                ["Flashings",                   fmt(e.flashCost)],
-                ["Guttering",                   fmt(e.gutCost)],
-                ["Labour",                      fmt(e.labCost)],
-                [`Margin (${e.margin}%)`,        fmt(e.marginAmt)],
+                [`Material (${e.materialLabel})`, formatMoney(e.matCost)],
+                ["Flashings",                    formatMoney(e.flashCost)],
+                ["Guttering",                    formatMoney(e.gutCost)],
+                ["Labour",                       formatMoney(e.labCost)],
+                [`Margin (${e.margin}%)`,         formatMoney(e.marginAmt)],
               ].map(([l,v])=>(
                 <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid #f1f5f9",fontSize:13}}>
                   <span style={{color:"#64748b"}}>{l}</span>
@@ -1296,7 +1467,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
               ))}
               <div style={{display:"flex",justifyContent:"space-between",paddingTop:14,alignItems:"center"}}>
                 <span style={{fontWeight:700}}>Total inc. GST</span>
-                <span style={{fontFamily:"'Syne',sans-serif",fontSize:22,fontWeight:800,color:"#f59e0b"}}>{fmt(e.total)}</span>
+                <span style={{fontFamily:"'Syne',sans-serif",fontSize:22,fontWeight:800,color:"#f59e0b"}}>{formatMoney(e.total)}</span>
               </div>
             </div>
           )}
@@ -1311,12 +1482,12 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
               </div>
               <div style={{fontSize:12,color:"#64748b",lineHeight:2,marginBottom:14}}>
                 Issued: {fmtD(project.quoteDate)}<br/>
-                Amount: <strong style={{color:"#0f172a"}}>{e?fmt(e.total):"—"}</strong>
+                Amount: <strong style={{color:"#0f172a"}}>{e?formatMoney(e.total):"—"}</strong>
               </div>
               <div style={{display:"flex",flexDirection:"column",gap:8}}>
                 <Btn full primary onClick={()=>setView("quote_print")}>📄 View Full Quote</Btn>
-                <Btn full>📧 Email to Client</Btn>
-                <Btn full>🖨 Print</Btn>
+                <Btn full onClick={()=>setShowEmailModal(true)}>📧 Email to Client</Btn>
+                <Btn full onClick={handlePrint}>🖨 Print</Btn>
               </div>
             </div>
           ):(
@@ -1329,10 +1500,10 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
           <div style={s.card}>
             <div style={{fontWeight:700,marginBottom:14}}>Timeline</div>
             {[
-              { label:"Project Created",     date:project.createdAt,                            color:"#94a3b8" },
-              { label:"Estimate Completed",  date:e?project.createdAt:null,                     color:"#8b5cf6" },
-              { label:"Quote Sent",          date:project.quoteDate||null,                      color:"#f59e0b" },
-              { label:"Won",                 date:project.status==="Won"?project.quoteDate:null, color:"#10b981" },
+              { label:"Project Created",    date:project.createdAt,                             color:"#94a3b8" },
+              { label:"Estimate Completed", date:e?project.createdAt:null,                      color:"#8b5cf6" },
+              { label:"Quote Sent",         date:project.quoteDate||null,                       color:"#f59e0b" },
+              { label:"Won",                date:project.status==="Won"?project.quoteDate:null, color:"#10b981" },
             ].map(({ label,date,color })=>(
               <div key={label} style={{display:"flex",alignItems:"flex-start",gap:12,marginBottom:12,opacity:date?1:.4}}>
                 <div style={{width:8,height:8,borderRadius:"50%",background:color,marginTop:4,flexShrink:0}}/>
@@ -1345,12 +1516,102 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
           </div>
         </div>
       </div>
+
+      {showEmailModal && (
+        <Modal title="Email Quote to Client" onClose={()=>{ setShowEmailModal(false); setCopied(false) }} width={460}>
+          <div>
+            {cust?.email ? (
+              <div style={{marginBottom:16,padding:"10px 14px",background:"#f8fafc",borderRadius:8,fontSize:13,color:"#475569"}}>
+                To: <strong style={{color:"#0f172a"}}>{cust.email}</strong>
+              </div>
+            ) : (
+              <div style={{marginBottom:16,padding:"10px 14px",background:"#fef3c7",borderRadius:8,fontSize:12,color:"#92400e"}}>
+                ⚠ No email on file. You can still copy the quote and paste it manually.
+              </div>
+            )}
+            <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:16,marginBottom:12}}>
+              <div style={{display:"flex",alignItems:"flex-start",gap:12}}>
+                <div style={{width:28,height:28,borderRadius:"50%",background:"#0f172a",color:"#f59e0b",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:700,flexShrink:0}}>1</div>
+                <div style={{flex:1}}>
+                  <div style={{fontWeight:600,fontSize:13,marginBottom:4}}>Copy the styled quote</div>
+                  <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
+                    Copies the full quote as rich HTML — tables, colours, totals. Paste it directly into Gmail or Outlook and it will look like the printed version.
+                  </div>
+                  <button
+                    onClick={async ()=>{
+                      const html = buildEmailHTML()
+                      try {
+                        await navigator.clipboard.write([
+                          new ClipboardItem({
+                            "text/html":  new Blob([html], {type:"text/html"}),
+                            // ← use formatMoney for currency-aware plain-text summary
+                            "text/plain": new Blob([`Quote ${project.quoteNum||""} for ${cust?.name||"client"} — Total: ${project.estimate ? formatMoney(project.estimate.total) : "TBC"}`], {type:"text/plain"})
+                          })
+                        ])
+                        setCopied(true)
+                      } catch {
+                        const ta = document.createElement("textarea"); ta.value = html
+                        document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta)
+                        setCopied(true)
+                      }
+                    }}
+                    style={{width:"100%",padding:"10px 16px",borderRadius:8,border:"none",background:copied?"#10b981":"#f59e0b",color:copied?"#fff":"#000",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"all .2s"}}
+                  >
+                    {copied ? "✓ Copied! Now open your email app →" : "📋 Copy Styled Quote to Clipboard"}
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:16,marginBottom:12,opacity:copied?1:0.5,transition:"opacity .3s"}}>
+              <div style={{display:"flex",alignItems:"flex-start",gap:12}}>
+                <div style={{width:28,height:28,borderRadius:"50%",background:copied?"#0f172a":"#e2e8f0",color:copied?"#f59e0b":"#94a3b8",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:700,flexShrink:0,transition:"all .2s"}}>2</div>
+                <div style={{flex:1}}>
+                  <div style={{fontWeight:600,fontSize:13,marginBottom:4}}>Open your email app & paste</div>
+                  <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
+                    Open a compose window, paste (<strong>Ctrl+V</strong> / <strong>⌘V</strong>) into the body — the full formatted quote will appear.
+                  </div>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    {[
+                      { id:"gmail",   label:"Gmail",     icon:"https://www.google.com/favicon.ico",  color:"#EA4335" },
+                      { id:"outlook", label:"Outlook",   icon:"https://outlook.live.com/favicon.ico", color:"#0078D4" },
+                      { id:"yahoo",   label:"Yahoo Mail",icon:"https://www.yahoo.com/favicon.ico",    color:"#6001D2" },
+                    ].map(p=>{
+                      const to      = encodeURIComponent(cust?.email||"")
+                      const subject = encodeURIComponent(`Roofing Quote ${project.quoteNum||""} — ${project.address}`)
+                      const urls    = {
+                        gmail:   `https://mail.google.com/mail/?view=cm&to=${to}&su=${subject}`,
+                        outlook: `https://outlook.live.com/mail/0/deeplink/compose?to=${to}&subject=${subject}`,
+                        yahoo:   `https://compose.mail.yahoo.com/?to=${to}&subject=${subject}`,
+                      }
+                      return (
+                        <button key={p.id} onClick={()=>window.open(urls[p.id],"_blank")}
+                          style={{flex:1,minWidth:80,display:"flex",alignItems:"center",justifyContent:"center",gap:6,padding:"8px 12px",border:"1px solid #e2e8f0",borderRadius:8,background:"#fff",cursor:"pointer",fontSize:12,fontWeight:500,color:"#0f172a",fontFamily:"inherit",transition:"all .15s"}}
+                          onMouseEnter={e=>{e.currentTarget.style.borderColor=p.color;e.currentTarget.style.background="#f8fafc"}}
+                          onMouseLeave={e=>{e.currentTarget.style.borderColor="#e2e8f0";e.currentTarget.style.background="#fff"}}
+                        >
+                          <img src={p.icon} width={14} height={14} style={{borderRadius:2}} onError={e=>e.target.style.display="none"} alt=""/>
+                          {p.label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div style={{fontSize:11,color:"#94a3b8",lineHeight:1.6,textAlign:"center"}}>
+              💡 Gmail tip: make sure <strong>Rich formatting</strong> is enabled in compose (not plain text mode)
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   )
 }
 
 // ─────────────────────────── CUSTOMERS ───────────────────────────
 function Customers({ customers, setCustomers, projects }) {
+  const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
+
   const [search,   setSearch]   = useState("")
   const [editCust, setEditCust] = useState(null)
   const [showNew,  setShowNew]  = useState(false)
@@ -1372,12 +1633,10 @@ function Customers({ customers, setCustomers, projects }) {
     setSaving(true)
     try {
       if(editCust) {
-        // FIX: use API response (normalized) instead of local form
         const raw     = await customersApi.update(editCust.id, form)
         const updated = normalizeKeys(raw)
         setCustomers(prev=>prev.map(c=>c.id===editCust.id?{...c,...updated}:c))
       } else {
-        // FIX: use API response for real backend-generated ID
         const raw     = await customersApi.create(form)
         const created = normalizeKeys(raw)
         setCustomers(prev=>[...prev,created])
@@ -1395,9 +1654,7 @@ function Customers({ customers, setCustomers, projects }) {
     try {
       await customersApi.delete(id)
       setCustomers(prev=>prev.filter(c=>c.id!==id))
-    } catch(err) {
-      console.error("Failed to delete customer:", err)
-    }
+    } catch(err) { console.error("Failed to delete customer:", err) }
   }
 
   return (
@@ -1447,10 +1704,10 @@ function Customers({ customers, setCustomers, projects }) {
       {showNew&&(
         <Modal title={editCust?"Edit Customer":"New Customer"} onClose={closeModal}>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-            <FG label="Full Name *"><input style={s.input} value={form.name} onChange={e=>upd("name")(e.target.value)} placeholder="Sarah Thompson"/></FG>
-            <FG label="Phone *"><input style={s.input} value={form.phone} onChange={e=>upd("phone")(e.target.value)} placeholder="021 999 0011"/></FG>
-            <FG label="Email"><input style={s.input} value={form.email} onChange={e=>upd("email")(e.target.value)} placeholder="sarah@email.com"/></FG>
-            <FG label="Address"><input style={s.input} value={form.address} onChange={e=>upd("address")(e.target.value)} placeholder="47 Main St, Auckland"/></FG>
+            <FG label="Full Name *"><input style={s.input} value={form.name}    onChange={e=>upd("name")(e.target.value)}    placeholder="Sarah Thompson"/></FG>
+            <FG label="Phone *">   <input style={s.input} value={form.phone}   onChange={e=>upd("phone")(e.target.value)}   placeholder="021 999 0011"/></FG>
+            <FG label="Email">     <input style={s.input} value={form.email}   onChange={e=>upd("email")(e.target.value)}   placeholder="sarah@email.com"/></FG>
+            <FG label="Address">   <input style={s.input} value={form.address} onChange={e=>upd("address")(e.target.value)} placeholder="47 Main St, Auckland"/></FG>
           </div>
           <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:20}}>
             <Btn onClick={closeModal}>Cancel</Btn>
@@ -1464,13 +1721,159 @@ function Customers({ customers, setCustomers, projects }) {
   )
 }
 
-// ─────────────────────────── SETTINGS ───────────────────────────
-// FIX: fully controlled component that reads/writes localStorage; "Save Changes" actually works
-function Settings({ settings, onSave }) {
-  const [form, setForm] = useState(settings)
-  const [saved, setSaved] = useState(false)
+// ─────────────────────────── USERS ───────────────────────────
+function Users({ currentUser }) {
+  const [users,      setUsers]      = useState([])
+  const [loading,    setLoading]    = useState(true)
+  const [showModal,  setShowModal]  = useState(false)
+  const [editUser,   setEditUser]   = useState(null)
+  const [saving,     setSaving]     = useState(false)
+  const [togglingId, setTogglingId] = useState(null)
+  const [form,       setForm]       = useState({ name:"", email:"", password:"" })
+  const [formErr,    setFormErr]    = useState("")
+
+  useEffect(()=>{ loadUsers() },[])
+
+  async function loadUsers() {
+    setLoading(true)
+    try {
+      const raw = await usersApi.getAll()
+      setUsers(raw.map(normalizeKeys))
+    } catch(err) { console.error("Failed to load users:", err) }
+    finally      { setLoading(false) }
+  }
+
+  function openNew()  { setForm({name:"",email:"",password:""}); setFormErr(""); setEditUser(null); setShowModal(true) }
+  function openEdit(u){ setForm({name:u.name,email:u.email,password:""}); setFormErr(""); setEditUser(u); setShowModal(true) }
+  function closeModal(){ setShowModal(false); setEditUser(null); setFormErr("") }
+
+  async function save() {
+    if (!form.name.trim() || !form.email.trim()) { setFormErr("Name and email are required."); return }
+    if (!editUser && !form.password.trim())       { setFormErr("Password is required for new users."); return }
+    setSaving(true); setFormErr("")
+    try {
+      if (editUser) {
+        const raw = await usersApi.update(editUser.id, form)
+        setUsers(prev => prev.map(u => u.id===editUser.id ? normalizeKeys(raw) : u))
+      } else {
+        const raw = await usersApi.create(form)
+        setUsers(prev => [...prev, normalizeKeys(raw)])
+      }
+      closeModal()
+    } catch(err) { setFormErr(err.message || "Save failed.") }
+    finally      { setSaving(false) }
+  }
+
+  async function toggleActive(u) {
+    if (u.id === currentUser?.id) return
+    setTogglingId(u.id)
+    try {
+      const raw = await usersApi.setActive(u.id, !u.isActive)
+      setUsers(prev => prev.map(x => x.id===u.id ? normalizeKeys(raw) : x))
+    } catch(err) { console.error("Toggle failed:", err) }
+    finally      { setTogglingId(null) }
+  }
 
   const upd = k => e => setForm(prev=>({...prev,[k]:e.target.value}))
+
+  return (
+    <div style={{width:"100%"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+        <div style={{fontSize:13,color:"#64748b"}}>Manage who has access to aTopRoof CRM.</div>
+        <Btn primary onClick={openNew}>+ Add User</Btn>
+      </div>
+
+      <div style={{...s.card,padding:0,overflow:"hidden"}}>
+        {loading ? (
+          <div style={{padding:40,textAlign:"center",color:"#94a3b8",fontSize:13}}>Loading users…</div>
+        ) : (
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead>
+              <tr>{["User","Email","Status","Joined",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
+            </thead>
+            <tbody>
+              {users.map(u => {
+                const isMe   = u.id === currentUser?.id
+                const active = u.isActive !== false
+                return (
+                  <tr key={u.id}>
+                    <td style={s.td}>
+                      <div style={{display:"flex",alignItems:"center",gap:10}}>
+                        <div style={{width:34,height:34,borderRadius:"50%",flexShrink:0,background:active?"linear-gradient(135deg,#f59e0b,#f97316)":"#e2e8f0",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:active?"#000":"#94a3b8"}}>
+                          {u.name?.split(" ").map(w=>w[0]).slice(0,2).join("").toUpperCase()}
+                        </div>
+                        <div>
+                          <div style={{fontWeight:600,fontSize:13}}>
+                            {u.name}
+                            {isMe && <span style={{marginLeft:6,fontSize:10,background:"#dbeafe",color:"#1e40af",padding:"1px 7px",borderRadius:10,fontWeight:600}}>You</span>}
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                    <td style={{...s.td,color:"#3b82f6",fontSize:12}}>{u.email}</td>
+                    <td style={s.td}>
+                      <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,background:active?"#d1fae5":"#fee2e2",color:active?"#065f46":"#991b1b"}}>
+                        <span style={{width:6,height:6,borderRadius:"50%",background:active?"#10b981":"#ef4444"}}/>
+                        {active ? "Active" : "Disabled"}
+                      </span>
+                    </td>
+                    <td style={{...s.td,fontSize:12,color:"#64748b"}}>{fmtD(u.createdAt)}</td>
+                    <td style={s.td}>
+                      <div style={{display:"flex",gap:6,justifyContent:"flex-end"}}>
+                        <Btn sm onClick={()=>openEdit(u)}>Edit</Btn>
+                        {!isMe && (
+                          <button onClick={()=>toggleActive(u)} disabled={togglingId===u.id}
+                            style={{padding:"6px 12px",borderRadius:8,fontSize:12,fontWeight:500,cursor:togglingId===u.id?"not-allowed":"pointer",border:"1px solid",fontFamily:"inherit",transition:"all .15s",opacity:togglingId===u.id?0.6:1,background:active?"#fee2e2":"#d1fae5",color:active?"#b91c1c":"#065f46",borderColor:active?"#fca5a5":"#6ee7b7"}}>
+                            {togglingId===u.id ? "…" : active ? "Disable" : "Enable"}
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+              {users.length===0&&<tr><td colSpan={5} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No users found</td></tr>}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div style={{...s.card,marginTop:14,background:"#fffbeb",border:"1px solid #fde68a"}}>
+        <div style={{fontSize:12,color:"#92400e",lineHeight:1.8}}>
+          <strong>Note:</strong> You cannot disable your own account. Disabled users cannot log in but their data is preserved. Password changes take effect on next login.
+        </div>
+      </div>
+
+      {showModal && (
+        <Modal title={editUser ? "Edit User" : "Add New User"} onClose={closeModal} width={440}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <FG label="Full Name *"><input style={s.input} value={form.name}  onChange={upd("name")}  placeholder="Jane Smith"/></FG>
+            <FG label="Email *">    <input style={s.input} type="email" value={form.email} onChange={upd("email")} placeholder="jane@company.com"/></FG>
+          </div>
+          <FG label={editUser ? "New Password (leave blank to keep current)" : "Password *"}>
+            <input style={s.input} type="password" value={form.password} onChange={upd("password")} placeholder={editUser?"••••••••  (unchanged)":"Min 6 characters"}/>
+          </FG>
+          {formErr && (
+            <div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#b91c1c",marginBottom:4}}>{formErr}</div>
+          )}
+          <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:20}}>
+            <Btn onClick={closeModal}>Cancel</Btn>
+            <Btn primary onClick={save} style={{opacity:saving?0.6:1}}>
+              {saving ? "Saving…" : editUser ? "Save Changes" : "Create User"}
+            </Btn>
+          </div>
+        </Modal>
+      )}
+    </div>
+  )
+}
+
+// ─────────────────────────── SETTINGS ───────────────────────────
+function Settings({ settings, onSave }) {
+  const [form,  setForm]  = useState(settings)
+  const [saved, setSaved] = useState(false)
+
+  const upd    = k => e => setForm(prev=>({...prev,[k]:e.target.value}))
   const updNum = k => e => setForm(prev=>({...prev,[k]:parseFloat(e.target.value)||0}))
 
   function save() {
@@ -1484,22 +1887,21 @@ function Settings({ settings, onSave }) {
       <div style={{...s.card,marginBottom:16}}>
         <div style={{fontWeight:700,marginBottom:16}}>Company Profile</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-          <FG label="Company Name"><input style={s.input} value={form.companyName} onChange={upd("companyName")}/></FG>
-          <FG label="GST Number"><input style={s.input} value={form.companyGst} onChange={upd("companyGst")}/></FG>
-          <FG label="Phone"><input style={s.input} value={form.companyPhone} onChange={upd("companyPhone")}/></FG>
-          <FG label="Email"><input style={s.input} value={form.companyEmail} onChange={upd("companyEmail")}/></FG>
-          <FG label="Address"><input style={s.input} value={form.companyAddress} onChange={upd("companyAddress")}/></FG>
-          <FG label="Bank Account"><input style={s.input} value={form.companyBank} onChange={upd("companyBank")}/></FG>
+          <FG label="Company Name">  <input style={s.input} value={form.companyName}    onChange={upd("companyName")}/></FG>
+          <FG label="GST Number">    <input style={s.input} value={form.companyGst}     onChange={upd("companyGst")}/></FG>
+          <FG label="Phone">         <input style={s.input} value={form.companyPhone}   onChange={upd("companyPhone")}/></FG>
+          <FG label="Email">         <input style={s.input} value={form.companyEmail}   onChange={upd("companyEmail")}/></FG>
+          <FG label="Address">       <input style={s.input} value={form.companyAddress} onChange={upd("companyAddress")}/></FG>
+          <FG label="Bank Account">  <input style={s.input} value={form.companyBank}    onChange={upd("companyBank")}/></FG>
         </div>
       </div>
       <div style={{...s.card,marginBottom:16}}>
         <div style={{fontWeight:700,marginBottom:16}}>Default Pricing</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-          <FG label="Default Day Rate ($)"><input style={s.input} type="number" value={form.dayRate} onChange={updNum("dayRate")}/></FG>
-          <FG label="Default Margin %"><input style={s.input} type="number" value={form.margin} onChange={updNum("margin")}/></FG>
-          {/* FIX: removed duplicate style prop; GST is read-only display */}
-          <FG label="GST Rate %"><input style={{...s.input,background:"#f8fafc",color:"#64748b"}} type="number" value={GST_RATE*100} readOnly/></FG>
-          <FG label="Default Wastage %"><input style={s.input} type="number" value={form.wastage} onChange={updNum("wastage")}/></FG>
+          <FG label="Default Day Rate ($)"><input style={s.input} type="number" value={form.dayRate}  onChange={updNum("dayRate")}/></FG>
+          <FG label="Default Margin %">   <input style={s.input} type="number" value={form.margin}   onChange={updNum("margin")}/></FG>
+          <FG label="GST Rate %">         <input style={{...s.input,background:"#f8fafc",color:"#64748b"}} type="number" value={GST_RATE*100} readOnly/></FG>
+          <FG label="Default Wastage %">  <input style={s.input} type="number" value={form.wastage}  onChange={updNum("wastage")}/></FG>
         </div>
       </div>
       <div style={{...s.card,marginBottom:16}}>
@@ -1535,20 +1937,20 @@ export default function App() {
   const [showWizard,      setShowWizard]     = useState(false)
   const [editingProject,  setEditingProject] = useState(null)
 
-  // FIX: settings are now real state, persisted to localStorage, used everywhere
+  const { user, login, logout } = useAuth()
+
   const [settings, setSettings] = useState(()=>{
     try { return {...DEFAULT_SETTINGS,...JSON.parse(localStorage.getItem("atoproof_settings"))||{}} }
     catch { return DEFAULT_SETTINGS }
   })
 
-  function saveSettings(updates) {
-    const merged = {...settings,...updates}
-    setSettings(merged)
-    try { localStorage.setItem("atoproof_settings", JSON.stringify(merged)) } catch {}
-  }
-
-  // FIX: normalize API responses (snake_case → camelCase)
   useEffect(()=>{
+    if (!user) {
+      setLoaded(false)
+      setProjects([])
+      setCustomers([])
+      return
+    }
     async function loadData() {
       try {
         const [rawProjects, rawCustomers] = await Promise.all([
@@ -1565,49 +1967,49 @@ export default function App() {
       setLoaded(true)
     }
     loadData()
-  },[])
+  },[user])
+
+  // Early returns AFTER all hooks
+  if (!user) return <LoginPage onLogin={login} />
+
+  function saveSettings(updates) {
+    const merged = {...settings,...updates}
+    setSettings(merged)
+    try { localStorage.setItem("atoproof_settings", JSON.stringify(merged)) } catch {}
+  }
 
   const PAGE_TITLES = {
     dashboard:"Dashboard", pipeline:"Pipeline",
-    projects:"Projects", project:"Project Detail",
-    customers:"Customers", quote_print:"Quote", settings:"Settings",
+    projects:"Projects",   project:"Project Detail",
+    customers:"Customers", quote_print:"Quote",
+    users:"Users",         settings:"Settings",
   }
 
-  // FIX: intercept "new" nav key → open wizard instead of navigating to blank view
   function handleNav(key) {
-    if(key==="new") {
-      setEditingProject(null)
-      setShowWizard(true)
-      return
-    }
+    if(key==="new") { setEditingProject(null); setShowWizard(true); return }
     setView(key)
     if(key!=="project") setSelectedProject(null)
   }
 
-  // FIX: use API response for correct backend IDs; normalize; handle new customer properly
   async function handleSaveProject(project, pendingNewCust) {
     try {
       const isEdit = projects.some(p=>p.id===project.id)
       let savedProject
 
       if(isEdit) {
-        const raw = await projectsApi.update(project.id, project)
-        // Merge API response (for updated_at etc.) but keep local estimate which isn't in the projects table response
+        const raw    = await projectsApi.update(project.id, project)
         savedProject = { ...project, ...normalizeProject(raw), estimate: project.estimate }
         setProjects(prev=>prev.map(p=>p.id===savedProject.id?savedProject:p))
       } else {
-        const raw = await projectsApi.create(project)
-        // Use backend-generated ID; preserve local estimate
+        const raw    = await projectsApi.create(project)
         savedProject = { ...project, ...normalizeProject(raw), estimate: project.estimate }
         setProjects(prev=>[...prev,savedProject])
       }
 
-      // FIX: create new customer via API and use real backend ID
       if(pendingNewCust) {
-        const rawCust  = await customersApi.create(pendingNewCust)
-        const newCust  = normalizeKeys(rawCust)
-        // Update the project's customerId to the real backend ID if it was a temp uid
-        savedProject   = { ...savedProject, customerId: newCust.id }
+        const rawCust = await customersApi.create(pendingNewCust)
+        const newCust = normalizeKeys(rawCust)
+        savedProject  = { ...savedProject, customerId: newCust.id }
         setProjects(prev=>prev.map(p=>p.id===savedProject.id?savedProject:p))
         setCustomers(prev=>[...prev, newCust])
       }
@@ -1623,10 +2025,7 @@ export default function App() {
     }
   }
 
-  function openEdit(project) {
-    setEditingProject(project)
-    setShowWizard(true)
-  }
+  function openEdit(project) { setEditingProject(project); setShowWizard(true) }
 
   const currentProject = selectedProject
     ? (projects.find(p=>p.id===selectedProject.id) || selectedProject)
@@ -1641,8 +2040,10 @@ export default function App() {
     </div>
   )
 
+  // ─── Everything below is wrapped in CurrencyProvider so all child
+  //     components can call useCurrency() safely. ───────────────────
   return (
-    <>
+    <CurrencyProvider user={user}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=Syne:wght@700;800&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1653,12 +2054,26 @@ export default function App() {
         ::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 3px; }
         tr:hover td { background: #f8fafc; }
         button { font-family: 'DM Sans', sans-serif; }
+
+        @media print {
+          [data-sidebar], [data-topbar] { display: none !important; }
+          .print-hide { display: none !important; }
+          body, html { height:auto!important; width:100%!important; overflow:visible!important; background:#fff!important; margin:0!important; padding:0!important; }
+          div[style*="display:flex"][style*="height:100vh"],
+          div[style*="display: flex"][style*="height: 100vh"] { display:block!important; height:auto!important; overflow:visible!important; }
+          [data-main-content], [data-main-content] > * { display:block!important; overflow:visible!important; height:auto!important; width:100%!important; max-width:100%!important; padding:0!important; margin:0!important; flex:none!important; }
+          [data-quote-content] { display:block!important; width:100%!important; max-width:100%!important; padding:0!important; margin:0!important; }
+          [data-quote-content] > div { max-width:100%!important; width:100%!important; border:none!important; border-radius:0!important; box-shadow:none!important; padding:0!important; }
+          @page { size: A4; margin: 12mm 14mm; }
+        }
       `}</style>
 
       <div style={s.app}>
-        <Sidebar view={view} onNav={handleNav} projects={projects}/>
+        <div data-sidebar>
+          <Sidebar view={view} onNav={handleNav} projects={projects} user={user} onLogout={logout}/>
+        </div>
         <div style={s.main}>
-          <div style={s.topbar}>
+          <div data-topbar style={s.topbar}>
             <div style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800}}>
               {view==="project"&&currentProject
                 ? (customers.find(c=>c.id===currentProject.customerId)?.name||"Project Detail")
@@ -1667,13 +2082,15 @@ export default function App() {
             <div style={{display:"flex",gap:10,alignItems:"center"}}>
               {view==="project"&&currentProject&&<StatusBadge status={currentProject.status}/>}
               {view==="projects"&&<span style={{fontSize:13,color:"#64748b"}}>{projects.length} total</span>}
+              {/* ← Currency selector lives here, always visible in the topbar */}
+              <CurrencySelector />
               <Btn onClick={()=>{ setEditingProject(null); setShowWizard(true) }} primary>
                 📸 New Project
               </Btn>
             </div>
           </div>
 
-          <div style={s.content}>
+          <div data-main-content style={s.content}>
             {view==="dashboard"&&(
               <Dashboard
                 projects={projects} customers={customers}
@@ -1691,8 +2108,8 @@ export default function App() {
               />
             )}
             {view==="quote_print"&&currentProject&&(
-              <div>
-                <div style={{display:"flex",gap:10,marginBottom:20}}>
+              <div data-quote-content>
+                <div className="print-hide" style={{display:"flex",gap:10,marginBottom:20}}>
                   <Btn onClick={()=>setView("project")}>← Back to Project</Btn>
                   <Btn primary onClick={()=>window.print()}>🖨 Print / Save PDF</Btn>
                 </div>
@@ -1705,6 +2122,7 @@ export default function App() {
             )}
             {view==="pipeline"&&<Pipeline projects={projects} customers={customers} setProjects={setProjects} setView={setView} setSelectedProject={setSelectedProject}/>}
             {view==="customers"&&<Customers customers={customers} setCustomers={setCustomers} projects={projects}/>}
+            {view==="users"&&<Users currentUser={user}/>}
             {view==="settings"&&<Settings settings={settings} onSave={saveSettings}/>}
           </div>
         </div>
@@ -1723,6 +2141,6 @@ export default function App() {
       )}
 
       {toast&&<Toast msg={toast} onDone={()=>setToast(null)}/>}
-    </>
+    </CurrencyProvider>
   )
 }
