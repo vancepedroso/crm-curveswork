@@ -8,6 +8,7 @@ const estimatesRouter = require("./routes/estimates");
 const seedRouter      = require("./routes/seed");
 const authRouter      = require("./routes/auth");
 const usersRouter     = require("./routes/users");
+const settingsRouter = require("./routes/settings");  
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -24,7 +25,8 @@ app.use("/api/customers", customersRouter);
 app.use("/api/projects",  projectsRouter);
 app.use("/api/estimates", estimatesRouter);
 app.use("/api/seed",      seedRouter);
-app.use("/api/users",     usersRouter);   // ← single registration, no duplicate
+app.use("/api/users",     usersRouter);
+app.use("/api/settings", settingsRouter);   
 
 // ── Dashboard stats ──
 app.get("/api/dashboard", async (req, res) => {

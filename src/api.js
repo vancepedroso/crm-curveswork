@@ -116,3 +116,12 @@ export const usersApi = {
 export const seedApi = {
   seed: (data) => post("/seed", data),
 };
+
+// ---------------------------------------------------------------------------
+// Settings  (currency preferences)
+// ---------------------------------------------------------------------------
+export const settingsApi = {
+  getCurrencies:   ()     => get("/settings/currencies"),
+  getUserCurrency: ()     => get("/settings/user-currency"),
+  setUserCurrency: (code) => put("/settings/user-currency", { code }),
+};
