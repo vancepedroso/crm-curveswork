@@ -39,7 +39,7 @@ export default function LoginPage({ onLogin }) {
         width:"100%", maxWidth:380, boxShadow:"0 24px 80px rgba(0,0,0,0.5)",
       }}>
         <img src="/aTopRoof.png" alt="aTopRoof"
-          style={{width:160, display:"block", margin:"0 auto 28px"}}/>
+  style={{width:160, display:"block", margin:"0 auto 28px", background:"#ffffff", borderRadius:10, padding:"8px 12px", boxShadow:"0 1px 4px rgba(0,0,0,0.25)"}}/>
 
         <h2 style={{
           fontFamily:"'Syne',sans-serif", fontSize:22, fontWeight:800,

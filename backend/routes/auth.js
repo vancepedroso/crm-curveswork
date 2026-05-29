@@ -23,6 +23,10 @@ router.post("/login", async (req, res) => {
     if (!match)
       return res.status(401).json({ error: "Invalid email or password" });
 
+    // Block disabled accounts
+    if (rows[0].is_active === false)
+      return res.status(403).json({ error: "This account has been disabled. Contact your administrator." });
+
     const user  = { id: rows[0].id, name: rows[0].name, email: rows[0].email };
     const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
     res.json({ token, user });

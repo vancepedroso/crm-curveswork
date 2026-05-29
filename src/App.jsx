@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts"
-import { customersApi, projectsApi } from "./api"
+import { customersApi, projectsApi, usersApi } from "./api"
 import { useAuth } from "./AuthContext"
 import LoginPage   from "./LoginPage"
 
@@ -195,13 +195,14 @@ function Sidebar({ view, onNav, projects, user, onLogout }) {
     { key:"projects",   label:"Projects",    icon:"📁" },
     { key:"customers",  label:"Customers",   icon:"👤" },
     null,
+    { key:"users",      label:"Users",       icon:"🔑" },
     { key:"settings",   label:"Settings",    icon:"⚙" },
   ]
 
   return (
     <div style={s.sidebar}>
       <div style={s.logo}>
-        <img src="/aTopRoof.png" alt="aTopRoof" style={{width:"100%",maxWidth:164,display:"block",filter:"brightness(1.05)"}}/>
+        <img src="/aTopRoof.png" alt="aTopRoof" style={{width:"100%",maxWidth:164,display:"block",background:"#ffffff",borderRadius:10,padding:"8px 12px",boxShadow:"0 1px 4px rgba(0,0,0,0.25)"}}/>
         <div style={{fontSize:10,color:"#f59e0b",letterSpacing:1,textTransform:"uppercase",marginTop:8,fontWeight:600}}>Elevate Your Roofing Business</div>
       </div>
       <nav style={s.nav}>
@@ -1121,59 +1122,204 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
 function Pipeline({ projects, customers, setProjects, setView, setSelectedProject }) {
   const getCustomer = id => customers.find(c=>c.id===id)
 
+  // drag state: which project is being dragged, which column is being hovered
+  const [draggingId,  setDraggingId]  = useState(null)
+  const [dragOverCol, setDragOverCol] = useState(null)
+
   async function moveStatus(project, newStatus) {
+    if(project.status === newStatus) return
+    // Optimistic update first so the card snaps immediately
+    setProjects(prev=>prev.map(p=>p.id===project.id?{...p,status:newStatus}:p))
     try {
       await projectsApi.updateStatus(project.id, newStatus)
-      setProjects(prev=>prev.map(p=>p.id===project.id?{...p,status:newStatus}:p))
     } catch(err) {
       console.error("Failed to update status:", err)
+      // Roll back on failure
+      setProjects(prev=>prev.map(p=>p.id===project.id?{...p,status:project.status}:p))
     }
   }
 
+  // ── drag handlers on each card ──
+  function onDragStart(e, project) {
+    setDraggingId(project.id)
+    e.dataTransfer.effectAllowed = "move"
+    e.dataTransfer.setData("projectId", project.id)
+
+    // Fix: browser default drag ghost swallows the cursor — replace it with
+    // a small custom image offset well away from the hotspot so the arrow stays visible.
+    const ghost = document.createElement("div")
+    ghost.style.cssText = [
+      "position:fixed","top:-999px","left:-999px",
+      "background:#0f172a","color:#fff",
+      "font:600 12px/1 'DM Sans',sans-serif",
+      "padding:6px 12px","border-radius:8px",
+      "white-space:nowrap","pointer-events:none","z-index:9999",
+      "box-shadow:0 4px 12px rgba(0,0,0,0.3)",
+    ].join(";")
+    const cust = customers.find(c=>c.id===project.customerId)
+    ghost.textContent = "↔  Moving: " + (cust?.name || project.address || "project")
+    document.body.appendChild(ghost)
+    e.dataTransfer.setDragImage(ghost, -12, -12)
+    // Clean up the ghost node after the browser has captured it
+    requestAnimationFrame(() => ghost.remove())
+  }
+  function onDragEnd() {
+    setDraggingId(null)
+    setDragOverCol(null)
+  }
+
+  // ── drag handlers on each column drop zone ──
+  function onColumnDragOver(e, status) {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = "move"
+    setDragOverCol(status)
+  }
+  function onColumnDragLeave(e) {
+    // Only clear if we're truly leaving the column (not entering a child)
+    if(!e.currentTarget.contains(e.relatedTarget)) {
+      setDragOverCol(null)
+    }
+  }
+  function onColumnDrop(e, status) {
+    e.preventDefault()
+    const projectId = e.dataTransfer.getData("projectId")
+    const project   = projects.find(p=>p.id===projectId)
+    if(project && project.status !== status) {
+      moveStatus(project, status)
+    }
+    setDraggingId(null)
+    setDragOverCol(null)
+  }
+
+  const draggingProject = projects.find(p=>p.id===draggingId)
+
   return (
-    <div style={{overflowX:"auto",paddingBottom:12}}>
-      <div style={{display:"flex",gap:14,minWidth:"max-content"}}>
-        {STATUSES.map(status=>{
-          const cols  = projects.filter(p=>p.status===status)
-          const st    = STATUS_STYLE[status]
-          const colVal= cols.reduce((a,p)=>a+(p.estimate?.total||0),0)
-          return (
-            <div key={status} style={{width:220}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderRadius:"10px 10px 0 0",background:st.bg,color:st.color}}>
-                <span style={{fontWeight:700,fontSize:12}}>{status}</span>
-                <div style={{textAlign:"right"}}>
-                  <div style={{fontSize:11,fontWeight:700}}>{cols.length}</div>
-                  {colVal>0&&<div style={{fontSize:10,opacity:.8}}>{fmt(colVal)}</div>}
+    <>
+      {/* Inject drag-and-drop styles without touching existing CSS */}
+      <style>{`
+        .pipeline-card { transition: box-shadow .15s, opacity .15s, transform .15s; }
+        .pipeline-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.10); }
+        .pipeline-card[draggable="true"] { cursor: grab; }
+        .pipeline-card[draggable="true"]:active { cursor: grabbing; }
+        .pipeline-card.is-dragging { opacity: 0.42; transform: scale(0.97); box-shadow: none; }
+        /* Dark closed-fist cursor while dragging so it stays visible on white */
+        .pipeline-is-dragging,
+        .pipeline-is-dragging * {
+          cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 20 20'%3E%3Ccircle cx='10' cy='10' r='9' fill='%23111827' opacity='.85'/%3E%3Ctext x='10' y='14' text-anchor='middle' font-size='11' fill='white'%3E✥%3C/text%3E%3C/svg%3E") 10 10, grabbing !important;
+        }
+        .pipeline-col-drop { transition: background .15s, box-shadow .15s; }
+        .pipeline-col-drop.drag-over {
+          background: #f0f9ff !important;
+          box-shadow: inset 0 0 0 2px #3b82f6;
+          border-radius: 0 0 10px 10px;
+        }
+        .pipeline-drop-hint {
+          display: none;
+          text-align: center;
+          padding: 10px 8px;
+          border: 2px dashed #93c5fd;
+          border-radius: 8px;
+          margin-bottom: 8px;
+          color: #3b82f6;
+          font-size: 11px;
+          font-weight: 600;
+          background: rgba(59,130,246,0.04);
+          pointer-events: none;
+        }
+        .pipeline-col-drop.drag-over .pipeline-drop-hint { display: block; }
+      `}</style>
+
+      <div className={draggingId ? "pipeline-is-dragging" : ""} style={{overflowX:"auto",paddingBottom:12}}>
+        {/* Helper bar shown only while dragging */}
+        {draggingId && (
+          <div style={{
+            display:"flex",alignItems:"center",gap:8,
+            marginBottom:10,padding:"8px 14px",
+            background:"#fffbeb",border:"1px solid #fde68a",
+            borderRadius:8,fontSize:12,color:"#92400e",fontWeight:500,
+          }}>
+            <span style={{fontSize:15}}>↔</span>
+            Drag <strong>{getCustomer(draggingProject?.customerId)?.name||"project"}</strong> to a column to move it
+          </div>
+        )}
+
+        <div style={{display:"flex",gap:14,minWidth:"max-content"}}>
+          {STATUSES.map(status=>{
+            const cols   = projects.filter(p=>p.status===status)
+            const st     = STATUS_STYLE[status]
+            const colVal = cols.reduce((a,p)=>a+(p.estimate?.total||0),0)
+            const isOver = dragOverCol===status
+
+            return (
+              <div key={status} style={{width:220}}>
+                {/* Column header */}
+                <div style={{
+                  display:"flex",alignItems:"center",justifyContent:"space-between",
+                  padding:"10px 14px",borderRadius:"10px 10px 0 0",
+                  background: isOver ? STATUS_STYLE[status].dot : st.bg,
+                  color: isOver ? "#fff" : st.color,
+                  transition:"background .15s, color .15s",
+                }}>
+                  <span style={{fontWeight:700,fontSize:12}}>{status}</span>
+                  <div style={{textAlign:"right"}}>
+                    <div style={{fontSize:11,fontWeight:700}}>{cols.length}</div>
+                    {colVal>0&&<div style={{fontSize:10,opacity:.8}}>{fmt(colVal)}</div>}
+                  </div>
+                </div>
+
+                {/* Drop zone */}
+                <div
+                  className={"pipeline-col-drop" + (isOver?" drag-over":"")}
+                  style={{border:"1px solid #e2e8f0",borderTop:"none",borderRadius:"0 0 10px 10px",padding:8,minHeight:240,background:"#f8fafc"}}
+                  onDragOver={e=>onColumnDragOver(e,status)}
+                  onDragLeave={onColumnDragLeave}
+                  onDrop={e=>onColumnDrop(e,status)}
+                >
+                  {/* Drop hint — shown via CSS when drag-over */}
+                  <div className="pipeline-drop-hint">
+                    Drop here → {status}
+                  </div>
+
+                  {cols.map(p=>{
+                    const cust = getCustomer(p.customerId)
+                    const isDragging = draggingId===p.id
+                    return (
+                      <div
+                        key={p.id}
+                        className={"pipeline-card" + (isDragging?" is-dragging":"")}
+                        draggable
+                        onDragStart={e=>onDragStart(e,p)}
+                        onDragEnd={onDragEnd}
+                        style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,padding:12,marginBottom:8,userSelect:"none"}}
+                        onClick={()=>{ if(!draggingId){ setSelectedProject(p); setView("project") } }}
+                      >
+                        {/* Drag handle hint */}
+                        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:2}}>
+                          <div style={{fontWeight:600,fontSize:13,flex:1}}>{cust?.name||"—"}</div>
+                          <span title="Drag to move" style={{fontSize:12,color:"#cbd5e1",marginLeft:4,flexShrink:0,cursor:"grab"}}>⠿</span>
+                        </div>
+                        <div style={{fontSize:11,color:"#64748b",marginBottom:6,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{p.address}</div>
+                        {p.estimate && <div style={{fontWeight:700,fontSize:13,color:"#b45309"}}>{fmt(p.estimate.total)}</div>}
+                        {!p.estimate && p.area>0 && <div style={{fontSize:11,color:"#64748b"}}>{p.area} m²</div>}
+                        {/* Dropdown — completely unchanged */}
+                        <div style={{marginTop:8}}>
+                          <select value={status} onChange={e=>{e.stopPropagation();moveStatus(p,e.target.value)}}
+                            onClick={e=>e.stopPropagation()}
+                            style={{fontSize:10,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:6,background:"#f8fafc",cursor:"pointer",width:"100%"}}>
+                            {STATUSES.map(st=><option key={st}>{st}</option>)}
+                          </select>
+                        </div>
+                      </div>
+                    )
+                  })}
+
                 </div>
               </div>
-              <div style={{border:"1px solid #e2e8f0",borderTop:"none",borderRadius:"0 0 10px 10px",padding:8,minHeight:240,background:"#f8fafc"}}>
-                {cols.map(p=>{
-                  const cust=getCustomer(p.customerId)
-                  return (
-                    <div key={p.id} style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,padding:12,marginBottom:8,cursor:"pointer",transition:"box-shadow .15s"}}
-                      onClick={()=>{ setSelectedProject(p); setView("project") }}>
-                      <div style={{fontWeight:600,fontSize:13,marginBottom:2}}>{cust?.name||"—"}</div>
-                      <div style={{fontSize:11,color:"#64748b",marginBottom:6,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{p.address}</div>
-                      {p.estimate && <div style={{fontWeight:700,fontSize:13,color:"#b45309"}}>{fmt(p.estimate.total)}</div>}
-                      {!p.estimate && p.area>0 && <div style={{fontSize:11,color:"#64748b"}}>{p.area} m²</div>}
-                      <div style={{marginTop:8}}>
-                        <select value={status} onChange={e=>{e.stopPropagation();moveStatus(p,e.target.value)}}
-                          onClick={e=>e.stopPropagation()}
-                          style={{fontSize:10,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:6,background:"#f8fafc",cursor:"pointer",width:"100%"}}>
-                          {STATUSES.map(st=><option key={st}>{st}</option>)}
-                        </select>
-                      </div>
-                    </div>
-                  )
-                })}
-                <div style={{textAlign:"center",padding:"8px 0",cursor:"pointer",color:"#94a3b8",fontSize:12}}
-                  onClick={()=>setView("new")}>+ Add</div>
-              </div>
-            </div>
-          )
-        })}
+            )
+          })}
+        </div>
       </div>
-    </div>
+    </>
   )
 }
 
@@ -1242,6 +1388,8 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
   if(!project) return null
   const cust = customers.find(c=>c.id===project.customerId)
   const e = project.estimate
+  const [showEmailModal, setShowEmailModal] = useState(false)
+  const [copied, setCopied] = useState(false)
 
   async function updateStatus(newStatus) {
     try {
@@ -1251,6 +1399,146 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
       console.error("updateStatus failed:", err)
     }
   }
+
+  function handlePrint() {
+    setView("quote_print")
+    // Small delay so the print view renders before the dialog opens
+    setTimeout(() => window.print(), 400)
+  }
+
+  function buildEmailHTML() {
+      const co = company || {}
+      const e = project.estimate
+      const qn = project.quoteNum || "DRAFT"
+      const qd = project.quoteDate || today()
+      const exp = new Date(new Date(qd.slice(0,10)+"T12:00:00").getTime()+30*86400000).toISOString().slice(0,10)
+      const fmtD_local = d => { if(!d) return "—"; const iso = String(d).includes("T") ? d : d.slice(0,10)+"T12:00:00"; return new Date(iso).toLocaleDateString("en-NZ",{day:"numeric",month:"short",year:"numeric"}) }
+      const fmt_local = n => "$"+Math.round(n).toLocaleString()
+
+      const quoteLines = e ? [
+        { desc:`${e.materialLabel} roofing — supply & install`, qty:`${e.adjArea?.toFixed(1)} m²`, unit:`$${e.materialRate}/m²`, total:e.matCost },
+        { desc:"Flashings — ridge/hip/valley", qty:`${e.flashings}m`, unit:`$${RATES.flashings}/m`, total:e.flashCost },
+        { desc:"Guttering & downpipes", qty:`${e.guttering}m`, unit:`$${RATES.guttering}/m`, total:e.gutCost },
+        { desc:`Labour — installation (${e.days} days)`, qty:"—", unit:"—", total:e.labCost },
+      ].filter(l => l.total > 0) : []
+
+      const lineRowsHTML = quoteLines.map(li => `
+        <tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;">${li.desc}</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;">${li.qty}</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;">${li.unit}</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;font-weight:500;">${fmt_local(li.total)}</td>
+        </tr>`).join("")
+
+      return `
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"/></head>
+    <body style="margin:0;padding:0;background:#f8fafc;font-family:'Helvetica Neue',Arial,sans-serif;">
+    <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+
+      <!-- Header -->
+      <div style="background:#0f172a;padding:28px 32px;display:flex;justify-content:space-between;align-items:flex-start;">
+        <div>
+          <div style="font-size:22px;font-weight:800;color:#ffffff;letter-spacing:-0.5px;">${co.companyName || "DK Roofing"}</div>
+          <div style="font-size:12px;color:#94a3b8;margin-top:6px;line-height:1.8;">
+            ${co.companyAddress || ""}<br/>
+            ${co.companyEmail || ""} &nbsp;·&nbsp; ${co.companyPhone || ""}<br/>
+            GST No: ${co.companyGst || ""}
+          </div>
+        </div>
+        <div style="text-align:right;">
+          <div style="display:inline-block;background:#f59e0b;color:#000;font-size:10px;font-weight:700;padding:3px 12px;border-radius:20px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;">Quote</div>
+          <div style="font-size:15px;font-weight:700;color:#ffffff;">${qn}</div>
+          <div style="font-size:12px;color:#94a3b8;line-height:1.8;margin-top:4px;">
+            Issued: ${fmtD_local(qd)}<br/>
+            Expires: ${fmtD_local(exp)}
+          </div>
+        </div>
+      </div>
+
+      <!-- Body -->
+      <div style="padding:32px;">
+
+        <!-- Prepared for -->
+        <div style="margin-bottom:24px;">
+          <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:#94a3b8;margin-bottom:8px;">Prepared For</div>
+          <div style="font-size:15px;font-weight:700;color:#0f172a;">${cust?.name || "—"}</div>
+          <div style="font-size:13px;color:#64748b;line-height:1.8;margin-top:4px;">
+            ${cust?.address || ""}<br/>
+            ${cust?.email || ""} &nbsp;·&nbsp; ${cust?.phone || ""}
+          </div>
+        </div>
+
+        <!-- Address / Scope -->
+        <div style="margin-bottom:24px;">
+          <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:#94a3b8;margin-bottom:8px;">Address / Scope</div>
+          <div style="font-size:13px;font-weight:600;color:#0f172a;">${project.address}</div>
+          ${project.notes ? `<div style="font-size:12px;color:#64748b;margin-top:6px;line-height:1.7;padding:10px 14px;background:#f8fafc;border-radius:6px;border-left:3px solid #e2e8f0;">${project.notes}</div>` : ""}
+        </div>
+
+        <!-- Line Items -->
+        ${e ? `
+        <div style="margin-bottom:24px;">
+          <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:#94a3b8;margin-bottom:10px;">Line Items</div>
+          <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
+            <thead>
+              <tr style="background:#f8fafc;">
+                <th style="text-align:left;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Description</th>
+                <th style="text-align:left;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Qty</th>
+                <th style="text-align:right;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Unit</th>
+                <th style="text-align:right;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Total</th>
+              </tr>
+            </thead>
+            <tbody>${lineRowsHTML}</tbody>
+          </table>
+        </div>
+
+        <!-- Totals -->
+        <div style="display:flex;justify-content:flex-end;margin-bottom:24px;">
+          <div style="min-width:260px;">
+            <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;">
+              <span style="color:#64748b;">Subtotal (excl. GST)</span>
+              <span style="font-weight:500;">${fmt_local(e.sellPrice)}</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;">
+              <span style="color:#64748b;">GST (${GST_RATE*100}%)</span>
+              <span style="font-weight:500;">${fmt_local(e.gst)}</span>
+            </div>
+            <div style="background:#0f172a;border-radius:8px;padding:14px 16px;margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
+              <span style="color:#fff;font-weight:700;font-size:14px;">Total inc. GST</span>
+              <span style="color:#f59e0b;font-size:24px;font-weight:800;">${fmt_local(e.total)}</span>
+            </div>
+          </div>
+        </div>` : `
+        <div style="padding:16px;background:#fef3c7;border-radius:8px;font-size:13px;color:#92400e;margin-bottom:24px;">
+          ⚠ Pricing to be confirmed — please contact us for a full estimate.
+        </div>`}
+
+        <!-- Terms -->
+        <div style="border-top:1px solid #e2e8f0;padding-top:20px;">
+          <div style="font-size:11px;color:#94a3b8;line-height:2.1;">
+            <strong style="color:#64748b;">Terms:</strong> 50% deposit on acceptance. Balance on completion within 7 days of invoice.<br/>
+            <strong style="color:#64748b;">Payment:</strong> Bank transfer to ${co.companyName || "DK Roofing"} — ${co.companyBank || ""}<br/>
+            <strong style="color:#64748b;">Validity:</strong> This quote is valid for 30 days from date of issue. Subject to site inspection.
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Footer -->
+      <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 32px;text-align:center;">
+        <div style="font-size:11px;color:#94a3b8;">
+          ${co.companyName || "DK Roofing"} &nbsp;·&nbsp; ${co.companyPhone || ""} &nbsp;·&nbsp; ${co.companyEmail || ""}
+        </div>
+      </div>
+
+    </div>
+    </body>
+    </html>`
+    }
+
+  
 
   return (
     <div>
@@ -1320,8 +1608,8 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
               </div>
               <div style={{display:"flex",flexDirection:"column",gap:8}}>
                 <Btn full primary onClick={()=>setView("quote_print")}>📄 View Full Quote</Btn>
-                <Btn full>📧 Email to Client</Btn>
-                <Btn full>🖨 Print</Btn>
+                <Btn full onClick={()=>setShowEmailModal(true)}>📧 Email to Client</Btn>
+                <Btn full onClick={handlePrint}>🖨 Print</Btn>
               </div>
             </div>
           ):(
@@ -1350,6 +1638,102 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
           </div>
         </div>
       </div>
+
+      {/* ── Email Provider Modal ── */}
+      {showEmailModal && (
+          <Modal title="Email Quote to Client" onClose={()=>{ setShowEmailModal(false); setCopied(false) }} width={460}>
+            <div>
+              {cust?.email ? (
+                <div style={{marginBottom:16,padding:"10px 14px",background:"#f8fafc",borderRadius:8,fontSize:13,color:"#475569"}}>
+                  To: <strong style={{color:"#0f172a"}}>{cust.email}</strong>
+                </div>
+              ) : (
+                <div style={{marginBottom:16,padding:"10px 14px",background:"#fef3c7",borderRadius:8,fontSize:12,color:"#92400e"}}>
+                  ⚠ No email on file. You can still copy the quote and paste it manually.
+                </div>
+              )}
+
+              {/* Step 1 — Copy HTML */}
+              <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:16,marginBottom:12}}>
+                <div style={{display:"flex",alignItems:"flex-start",gap:12}}>
+                  <div style={{width:28,height:28,borderRadius:"50%",background:"#0f172a",color:"#f59e0b",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:700,flexShrink:0}}>1</div>
+                  <div style={{flex:1}}>
+                    <div style={{fontWeight:600,fontSize:13,marginBottom:4}}>Copy the styled quote</div>
+                    <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
+                      Copies the full quote as rich HTML — tables, colours, totals. Paste it directly into Gmail or Outlook and it will look like the printed version.
+                    </div>
+                    <button
+                      onClick={async ()=>{
+                        const html = buildEmailHTML()
+                        try {
+                          await navigator.clipboard.write([
+                            new ClipboardItem({ "text/html": new Blob([html], {type:"text/html"}), "text/plain": new Blob([`Quote ${project.quoteNum||""} for ${cust?.name||"client"} — Total: ${project.estimate ? "$"+Math.round(project.estimate.total).toLocaleString() : "TBC"}`], {type:"text/plain"}) })
+                          ])
+                          setCopied(true)
+                        } catch {
+                          // Fallback: copy as plain text
+                          const ta = document.createElement("textarea"); ta.value = html
+                          document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta)
+                          setCopied(true)
+                        }
+                      }}
+                      style={{width:"100%",padding:"10px 16px",borderRadius:8,border:"none",
+                        background:copied?"#10b981":"#f59e0b",color:copied?"#fff":"#000",
+                        fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"inherit",
+                        display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"all .2s"}}
+                    >
+                      {copied ? "✓ Copied! Now open your email app →" : "📋 Copy Styled Quote to Clipboard"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Step 2 — Open email */}
+              <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:16,marginBottom:12,opacity:copied?1:0.5,transition:"opacity .3s"}}>
+                <div style={{display:"flex",alignItems:"flex-start",gap:12}}>
+                  <div style={{width:28,height:28,borderRadius:"50%",background:copied?"#0f172a":"#e2e8f0",color:copied?"#f59e0b":"#94a3b8",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:700,flexShrink:0,transition:"all .2s"}}>2</div>
+                  <div style={{flex:1}}>
+                    <div style={{fontWeight:600,fontSize:13,marginBottom:4}}>Open your email app & paste</div>
+                    <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
+                      Open a compose window, paste (<strong>Ctrl+V</strong> / <strong>⌘V</strong>) into the body — the full formatted quote will appear.
+                    </div>
+                    <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                      {[
+                        { id:"gmail",   label:"Gmail",        icon:"https://www.google.com/favicon.ico",  color:"#EA4335" },
+                        { id:"outlook", label:"Outlook",      icon:"https://outlook.live.com/favicon.ico", color:"#0078D4" },
+                        { id:"yahoo",   label:"Yahoo Mail",   icon:"https://www.yahoo.com/favicon.ico",    color:"#6001D2" },
+                      ].map(p=>{
+                        const to      = encodeURIComponent(cust?.email||"")
+                        const subject = encodeURIComponent(`Roofing Quote ${project.quoteNum||""} — ${project.address}`)
+                        const urls    = {
+                          gmail:   `https://mail.google.com/mail/?view=cm&to=${to}&su=${subject}`,
+                          outlook: `https://outlook.live.com/mail/0/deeplink/compose?to=${to}&subject=${subject}`,
+                          yahoo:   `https://compose.mail.yahoo.com/?to=${to}&subject=${subject}`,
+                        }
+                        return (
+                          <button key={p.id} onClick={()=>window.open(urls[p.id],"_blank")}
+                            style={{flex:1,minWidth:80,display:"flex",alignItems:"center",justifyContent:"center",gap:6,
+                              padding:"8px 12px",border:"1px solid #e2e8f0",borderRadius:8,background:"#fff",
+                              cursor:"pointer",fontSize:12,fontWeight:500,color:"#0f172a",fontFamily:"inherit",transition:"all .15s"}}
+                            onMouseEnter={e=>{e.currentTarget.style.borderColor=p.color;e.currentTarget.style.background="#f8fafc"}}
+                            onMouseLeave={e=>{e.currentTarget.style.borderColor="#e2e8f0";e.currentTarget.style.background="#fff"}}
+                          >
+                            <img src={p.icon} width={14} height={14} style={{borderRadius:2}} onError={e=>e.target.style.display="none"} alt=""/>
+                            {p.label}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{fontSize:11,color:"#94a3b8",lineHeight:1.6,textAlign:"center"}}>
+                💡 Gmail tip: make sure <strong>Rich formatting</strong> is enabled in compose (not plain text mode)
+              </div>
+            </div>
+          </Modal>
+        )}
     </div>
   )
 }
@@ -1461,6 +1845,219 @@ function Customers({ customers, setCustomers, projects }) {
             <Btn onClick={closeModal}>Cancel</Btn>
             <Btn primary onClick={save} style={{opacity:form.name.trim()?1:.5}}>
               {saving?"Saving…":editCust?"Save Changes":"Create Customer"}
+            </Btn>
+          </div>
+        </Modal>
+      )}
+    </div>
+  )
+}
+
+// ─────────────────────────── USERS ───────────────────────────
+function Users({ currentUser }) {
+  const [users,    setUsers]    = useState([])
+  const [loading,  setLoading]  = useState(true)
+  const [showModal,setShowModal]= useState(false)
+  const [editUser, setEditUser] = useState(null)
+  const [saving,   setSaving]   = useState(false)
+  const [togglingId, setTogglingId] = useState(null)
+  const [form,     setForm]     = useState({ name:"", email:"", password:"" })
+  const [formErr,  setFormErr]  = useState("")
+
+  useEffect(()=>{
+    loadUsers()
+  },[])
+
+  async function loadUsers() {
+    setLoading(true)
+    try {
+      const raw = await usersApi.getAll()
+      setUsers(raw.map(normalizeKeys))
+    } catch(err) {
+      console.error("Failed to load users:", err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function openNew() {
+    setForm({ name:"", email:"", password:"" })
+    setFormErr("")
+    setEditUser(null)
+    setShowModal(true)
+  }
+
+  function openEdit(u) {
+    setForm({ name:u.name, email:u.email, password:"" })
+    setFormErr("")
+    setEditUser(u)
+    setShowModal(true)
+  }
+
+  function closeModal() {
+    setShowModal(false)
+    setEditUser(null)
+    setFormErr("")
+  }
+
+  async function save() {
+    if (!form.name.trim() || !form.email.trim()) { setFormErr("Name and email are required."); return }
+    if (!editUser && !form.password.trim())       { setFormErr("Password is required for new users."); return }
+    setSaving(true); setFormErr("")
+    try {
+      if (editUser) {
+        const raw = await usersApi.update(editUser.id, form)
+        setUsers(prev => prev.map(u => u.id===editUser.id ? normalizeKeys(raw) : u))
+      } else {
+        const raw = await usersApi.create(form)
+        setUsers(prev => [...prev, normalizeKeys(raw)])
+      }
+      closeModal()
+    } catch(err) {
+      setFormErr(err.message || "Save failed.")
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function toggleActive(u) {
+    // Prevent disabling yourself
+    if (u.id === currentUser?.id) return
+    setTogglingId(u.id)
+    try {
+      const raw = await usersApi.setActive(u.id, !u.isActive)
+      setUsers(prev => prev.map(x => x.id===u.id ? normalizeKeys(raw) : x))
+    } catch(err) {
+      console.error("Toggle failed:", err)
+    } finally {
+      setTogglingId(null)
+    }
+  }
+
+  const upd = k => e => setForm(prev=>({...prev,[k]:e.target.value}))
+
+  return (
+    <div style={{width:"100%"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+        <div>
+          <div style={{fontSize:13,color:"#64748b"}}>Manage who has access to aTopRoof CRM.</div>
+        </div>
+        <Btn primary onClick={openNew}>+ Add User</Btn>
+      </div>
+
+      <div style={{...s.card,padding:0,overflow:"hidden"}}>
+        {loading ? (
+          <div style={{padding:40,textAlign:"center",color:"#94a3b8",fontSize:13}}>Loading users…</div>
+        ) : (
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead>
+              <tr>
+                {["User","Email","Status","Joined",""].map(h=>(
+                  <th key={h} style={s.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {users.map(u => {
+                const isMe = u.id === currentUser?.id
+                const active = u.isActive !== false  // default true if field missing
+                return (
+                  <tr key={u.id}>
+                    <td style={s.td}>
+                      <div style={{display:"flex",alignItems:"center",gap:10}}>
+                        <div style={{
+                          width:34,height:34,borderRadius:"50%",flexShrink:0,
+                          background: active
+                            ? "linear-gradient(135deg,#f59e0b,#f97316)"
+                            : "#e2e8f0",
+                          display:"flex",alignItems:"center",justifyContent:"center",
+                          fontSize:12,fontWeight:700,
+                          color: active ? "#000" : "#94a3b8",
+                        }}>
+                          {u.name?.split(" ").map(w=>w[0]).slice(0,2).join("").toUpperCase()}
+                        </div>
+                        <div>
+                          <div style={{fontWeight:600,fontSize:13}}>
+                            {u.name}
+                            {isMe && <span style={{marginLeft:6,fontSize:10,background:"#dbeafe",color:"#1e40af",padding:"1px 7px",borderRadius:10,fontWeight:600}}>You</span>}
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                    <td style={{...s.td,color:"#3b82f6",fontSize:12}}>{u.email}</td>
+                    <td style={s.td}>
+                      <span style={{
+                        display:"inline-flex",alignItems:"center",gap:4,
+                        padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,
+                        background: active ? "#d1fae5" : "#fee2e2",
+                        color:      active ? "#065f46" : "#991b1b",
+                      }}>
+                        <span style={{width:6,height:6,borderRadius:"50%",background: active?"#10b981":"#ef4444"}}/>
+                        {active ? "Active" : "Disabled"}
+                      </span>
+                    </td>
+                    <td style={{...s.td,fontSize:12,color:"#64748b"}}>{fmtD(u.createdAt)}</td>
+                    <td style={s.td}>
+                      <div style={{display:"flex",gap:6,justifyContent:"flex-end"}}>
+                        <Btn sm onClick={()=>openEdit(u)}>Edit</Btn>
+                        {!isMe && (
+                          <button
+                            onClick={()=>toggleActive(u)}
+                            disabled={togglingId===u.id}
+                            style={{
+                              padding:"6px 12px",borderRadius:8,fontSize:12,fontWeight:500,
+                              cursor:togglingId===u.id?"not-allowed":"pointer",
+                              border:"1px solid",fontFamily:"inherit",transition:"all .15s",
+                              opacity:togglingId===u.id?0.6:1,
+                              background: active ? "#fee2e2" : "#d1fae5",
+                              color:      active ? "#b91c1c" : "#065f46",
+                              borderColor:active ? "#fca5a5" : "#6ee7b7",
+                            }}
+                          >
+                            {togglingId===u.id ? "…" : active ? "Disable" : "Enable"}
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+              {users.length===0&&(
+                <tr><td colSpan={5} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No users found</td></tr>
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div style={{...s.card,marginTop:14,background:"#fffbeb",border:"1px solid #fde68a"}}>
+        <div style={{fontSize:12,color:"#92400e",lineHeight:1.8}}>
+          <strong>Note:</strong> You cannot disable your own account. Disabled users cannot log in but their data is preserved. Password changes take effect on next login.
+        </div>
+      </div>
+
+      {showModal && (
+        <Modal title={editUser ? "Edit User" : "Add New User"} onClose={closeModal} width={440}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <FG label="Full Name *">
+              <input style={s.input} value={form.name} onChange={upd("name")} placeholder="Jane Smith"/>
+            </FG>
+            <FG label="Email *">
+              <input style={s.input} type="email" value={form.email} onChange={upd("email")} placeholder="jane@company.com"/>
+            </FG>
+          </div>
+          <FG label={editUser ? "New Password (leave blank to keep current)" : "Password *"}>
+            <input style={s.input} type="password" value={form.password} onChange={upd("password")} placeholder={editUser?"••••••••  (unchanged)":"Min 6 characters"}/>
+          </FG>
+          {formErr && (
+            <div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#b91c1c",marginBottom:4}}>
+              {formErr}
+            </div>
+          )}
+          <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:20}}>
+            <Btn onClick={closeModal}>Cancel</Btn>
+            <Btn primary onClick={save} style={{opacity:saving?0.6:1}}>
+              {saving ? "Saving…" : editUser ? "Save Changes" : "Create User"}
             </Btn>
           </div>
         </Modal>
@@ -1587,7 +2184,8 @@ export default function App() {
   const PAGE_TITLES = {
     dashboard:"Dashboard", pipeline:"Pipeline",
     projects:"Projects", project:"Project Detail",
-    customers:"Customers", quote_print:"Quote", settings:"Settings",
+    customers:"Customers", quote_print:"Quote",
+    users:"Users", settings:"Settings",
   }
 
   // FIX: intercept "new" nav key → open wizard instead of navigating to blank view
@@ -1670,12 +2268,73 @@ export default function App() {
         ::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 3px; }
         tr:hover td { background: #f8fafc; }
         button { font-family: 'DM Sans', sans-serif; }
+
+        @media print {
+          /* Hide everything except the quote */
+          [data-sidebar], [data-topbar] { display: none !important; }
+          .print-hide { display: none !important; }
+
+          /* Reset the entire page to a clean flow */
+          body, html {
+            height: auto !important;
+            width: 100% !important;
+            overflow: visible !important;
+            background: #fff !important;
+            margin: 0 !important;
+            padding: 0 !important;
+          }
+
+          /* Break the flex app shell — make main fill the viewport */
+          div[style*="display:flex"][style*="height:100vh"],
+          div[style*="display: flex"][style*="height: 100vh"] {
+            display: block !important;
+            height: auto !important;
+            overflow: visible !important;
+          }
+
+          /* Main column */
+          [data-main-content],
+          [data-main-content] > * {
+            display: block !important;
+            overflow: visible !important;
+            height: auto !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            flex: none !important;
+          }
+
+          /* The quote card itself — remove the 660px cap and fill the page */
+          [data-quote-content] {
+            display: block !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            padding: 0 !important;
+            margin: 0 !important;
+          }
+
+          [data-quote-content] > div {
+            max-width: 100% !important;
+            width: 100% !important;
+            border: none !important;
+            border-radius: 0 !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+          }
+
+          /* Page setup — A4, sensible margins */
+          @page {
+            size: A4;
+            margin: 12mm 14mm;
+          }
+        }
       `}</style>
 
       <div style={s.app}>
-        <Sidebar view={view} onNav={handleNav} projects={projects} user={user} onLogout={logout}/>
+        <div data-sidebar><Sidebar view={view} onNav={handleNav} projects={projects} user={user} onLogout={logout}/></div>
         <div style={s.main}>
-          <div style={s.topbar}>
+          <div data-topbar style={s.topbar}>
             <div style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800}}>
               {view==="project"&&currentProject
                 ? (customers.find(c=>c.id===currentProject.customerId)?.name||"Project Detail")
@@ -1690,7 +2349,7 @@ export default function App() {
             </div>
           </div>
 
-          <div style={s.content}>
+          <div data-main-content style={s.content}>
             {view==="dashboard"&&(
               <Dashboard
                 projects={projects} customers={customers}
@@ -1708,8 +2367,8 @@ export default function App() {
               />
             )}
             {view==="quote_print"&&currentProject&&(
-              <div>
-                <div style={{display:"flex",gap:10,marginBottom:20}}>
+              <div data-quote-content>
+                <div className="print-hide" style={{display:"flex",gap:10,marginBottom:20}}>
                   <Btn onClick={()=>setView("project")}>← Back to Project</Btn>
                   <Btn primary onClick={()=>window.print()}>🖨 Print / Save PDF</Btn>
                 </div>
@@ -1722,6 +2381,7 @@ export default function App() {
             )}
             {view==="pipeline"&&<Pipeline projects={projects} customers={customers} setProjects={setProjects} setView={setView} setSelectedProject={setSelectedProject}/>}
             {view==="customers"&&<Customers customers={customers} setCustomers={setCustomers} projects={projects}/>}
+            {view==="users"&&<Users currentUser={user}/>}
             {view==="settings"&&<Settings settings={settings} onSave={saveSettings}/>}
           </div>
         </div>

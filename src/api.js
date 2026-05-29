@@ -101,6 +101,16 @@ export const dashboardApi = {
 };
 
 // ---------------------------------------------------------------------------
+// Users  (admin user management)
+// ---------------------------------------------------------------------------
+export const usersApi = {
+  getAll:       ()              => get("/users"),
+  create:       (data)          => post("/users", data),
+  update:       (id, data)      => put(`/users/${id}`, data),
+  setActive:    (id, is_active) => patch(`/users/${id}/status`, { is_active }),
+};
+
+// ---------------------------------------------------------------------------
 // Seed (dev / staging only)
 // ---------------------------------------------------------------------------
 export const seedApi = {
