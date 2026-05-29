@@ -785,6 +785,7 @@ function MeasurementTool({ onGeometryChange }) {
   )
 }
 
+
 // ─────────────────────────── ESTIMATE ENGINE ───────────────────────────
 function EstimateEngine({ initialArea, onEstimateChange }) {
   const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
