@@ -149,15 +149,35 @@ function StatusBadge({ status }) {
   </span>
 }
 
-function Modal({ title, onClose, children, width=560 }) {
+// ─── Responsive Modal (Bootstrap-modal-xl-like): full-screen on mobile,
+//     large centered panel on tablet/desktop, internal scroll. ───────────
+function Modal({ title, onClose, children, width=560, height }) {
   return (
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",display:"flex",alignItems:"flex-start",justifyContent:"center",zIndex:1000,overflowY:"auto",padding:"40px 20px"}} onClick={e=>e.target===e.currentTarget&&onClose()}>
-      <div style={{background:"#fff",borderRadius:14,width:"100%",maxWidth:width,boxShadow:"0 20px 60px rgba(0,0,0,0.2)"}}>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"18px 22px",borderBottom:"1px solid #e2e8f0"}}>
+    <div
+      style={{
+        position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",
+        display:"flex",alignItems:"flex-start",justifyContent:"center",
+        zIndex:1000,overflowY:"auto",
+      }}
+      onClick={e=>e.target===e.currentTarget&&onClose()}
+    >
+      <div
+        className="responsive-modal"
+        style={{
+          background:"#fff",
+          width:"100%",
+          maxWidth:width,
+          maxHeight: height ? height : "90vh",
+          display:"flex",
+          flexDirection:"column",
+          boxShadow:"0 20px 60px rgba(0,0,0,0.2)",
+        }}
+      >
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"16px 20px",borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
           <span style={{fontWeight:700,fontSize:16}}>{title}</span>
-          <button onClick={onClose} style={{border:"none",background:"none",cursor:"pointer",fontSize:20,color:"#64748b",lineHeight:1}}>×</button>
+          <button onClick={onClose} style={{border:"none",background:"none",cursor:"pointer",fontSize:22,color:"#64748b",lineHeight:1,padding:4}}>×</button>
         </div>
-        <div style={{padding:22}}>{children}</div>
+        <div className="responsive-modal-body" style={{padding:20,overflowY:"auto",flex:1}}>{children}</div>
       </div>
     </div>
   )
@@ -278,7 +298,7 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
 
   return (
     <div>
-      <div style={s.grid4}>
+      <div style={s.grid4} className="grid4-responsive">
         {[
           { label:"Total Projects", val:stats.total,        sub:`${stats.leads} new leads`,                                                 bg:"#dbeafe", color:"#1e40af" },
           { label:"Quotes Sent",    val:stats.sent,         sub:fmt(stats.pipeline)+" in pipeline",                                         bg:"#fef3c7", color:"#92400e" },
@@ -293,7 +313,7 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
         ))}
       </div>
 
-      <div style={s.grid2r}>
+      <div style={s.grid2r} className="grid2r-responsive">
         <div>
           <div style={s.card}>
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
@@ -387,6 +407,14 @@ function linelenPx(pts) {
   for(let i=0;i<pts.length-1;i++) l+=Math.sqrt((pts[i+1].x-pts[i].x)**2+(pts[i+1].y-pts[i].y)**2)
   return l
 }
+
+// Fixed internal drawing resolution. The canvas element is scaled to 100%
+// of its container via CSS (see .mt-canvas-wrap), so on smaller screens it
+// shrinks visually while all click coordinates below are computed from
+// getBoundingClientRect() — which already accounts for that CSS scaling —
+// so hit-testing / point placement stays accurate at every screen size.
+const MT_CANVAS_W = 490
+const MT_CANVAS_H = 330
 
 function MeasurementTool({ onGeometryChange }) {
   const canvasRef   = useRef(null)
@@ -564,7 +592,17 @@ function MeasurementTool({ onGeometryChange }) {
 
   useEffect(()=>{ drawCanvas() },[drawCanvas])
 
-  const getPt = e=>{ const r=canvasRef.current.getBoundingClientRect(); return{x:e.clientX-r.left,y:e.clientY-r.top} }
+  // getBoundingClientRect() reflects the CSS-rendered size of the canvas
+  // (which is scaled to 100% of .mt-canvas-wrap), so we map the click's
+  // page position into that rendered box, then scale into the canvas's
+  // fixed internal coordinate space (MT_CANVAS_W × MT_CANVAS_H). This
+  // keeps section/line/point placement pixel-accurate at any screen size.
+  const getPt = e=>{
+    const r=canvasRef.current.getBoundingClientRect()
+    const scaleX = MT_CANVAS_W / r.width
+    const scaleY = MT_CANVAS_H / r.height
+    return { x:(e.clientX-r.left)*scaleX, y:(e.clientY-r.top)*scaleY }
+  }
   function handleMouseMove(e){ setHoverPt(getPt(e)) }
   function handleMouseLeave(){ setHoverPt(null) }
 
@@ -590,6 +628,27 @@ function MeasurementTool({ onGeometryChange }) {
     }
   }
 
+  function handleContextMenu(e) {
+    e.preventDefault() // stop the browser's right-click menu
+    if(activeTool==="section" && drawPts.length>0) {
+      // right-click cancels the in-progress section (not enough points to auto-close)
+      setDrawPts([])
+    }
+    else if((activeTool==="flashing"||activeTool==="gutter") && drawPts.length>=2) {
+      finishLine() // same as clicking "Done ✓"
+    }
+    else if((activeTool==="flashing"||activeTool==="gutter") && drawPts.length>0) {
+      // fewer than 2 points — not enough to save a line, just cancel it
+      setDrawPts([])
+    }
+    else if(activeTool==="scale" && scaleLine?.p1 && !scaleLine?.p2) {
+      // cancel an in-progress scale line
+      setScaleLine(null)
+    }
+  }
+
+
+
   function finishLine(){
     if(drawPts.length>=2) setLineItems(prev=>[...prev,{id:uid(),type:activeTool,pts:drawPts}])
     setDrawPts([])
@@ -609,21 +668,22 @@ function MeasurementTool({ onGeometryChange }) {
     }
     r.readAsDataURL(file)
   }
-
+  
   const TOOLS=[
-    {key:"section",    label:"Roof Section",icon:"▲",color:"#3b82f6",hint:"Click to add points · click first point (⭕) to close polygon"},
-    {key:"flashing",   label:"Flashing",    icon:"⚡",color:"#f59e0b",hint:"Click points to trace flashing lines · press Done ✓ to finish"},
-    {key:"gutter",     label:"Gutter",      icon:"〰",color:"#06b6d4",hint:"Click points to trace gutters · press Done ✓ to finish"},
+    {key:"section",    label:"Roof Section",icon:"▲",color:"#3b82f6",hint:"Click to add points · click first point (⭕) to close · right-click to cancel"},
+    {key:"flashing",   label:"Flashing",    icon:"⚡",color:"#f59e0b",hint:"Click points to trace · right-click or press Done ✓ to finish"},
+    {key:"gutter",     label:"Gutter",      icon:"〰",color:"#06b6d4",hint:"Click points to trace · right-click or press Done ✓ to finish"},
     {key:"downpipe",   label:"Downpipe",    icon:"⬇",color:"#0ea5e9",hint:"Click canvas to place a downpipe (DP) marker"},
     {key:"drain",      label:"Roof Drain",  icon:"⊙",color:"#6366f1",hint:"Click canvas to place a roof drain (DR) marker"},
     {key:"penetration",label:"Penetration", icon:"◇",color:"#8b5cf6",hint:"Click to place — select type below"},
-    {key:"scale",      label:"Set Scale",   icon:"📏",color:"#10b981",hint:"Click two points over a known dimension, then enter the real length"},
+    {key:"scale",      label:"Set Scale",   icon:"📏",color:"#10b981",hint:"Click two points over a known dimension · right-click to cancel"},
   ]
+
   const tip=TOOLS.find(t=>t.key===activeTool)?.hint||""
 
   return (
     <div>
-      <div style={{border:"2px dashed #e2e8f0",borderRadius:10,padding:"13px 18px",cursor:"pointer",marginBottom:12,background:"#f8fafc",display:"flex",alignItems:"center",justifyContent:"space-between"}}
+      <div style={{border:"2px dashed #e2e8f0",borderRadius:10,padding:"13px 18px",cursor:"pointer",marginBottom:12,background:"#f8fafc",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}
         onClick={()=>document.getElementById("mt-upload").click()}>
         <input id="mt-upload" type="file" accept="image/*" style={{display:"none"}} onChange={e=>e.target.files[0]&&loadImage(e.target.files[0])}/>
         <span style={{fontSize:13,color:"#64748b"}}>📷 Upload aerial or site photo <span style={{color:"#94a3b8",fontSize:11}}>(JPG / PNG / HEIC)</span></span>
@@ -632,9 +692,9 @@ function MeasurementTool({ onGeometryChange }) {
           : <span style={{fontSize:11,color:"#94a3b8"}}>or draw on blank canvas →</span>}
       </div>
 
-      <div style={{display:"grid",gridTemplateColumns:"1fr 250px",gap:12}}>
+      <div className="mt-grid">
         <div style={{border:"1px solid #334155",borderRadius:12,overflow:"hidden"}}>
-          <div style={{display:"flex",alignItems:"center",gap:5,padding:"8px 10px",background:"#1e293b",flexWrap:"wrap"}}>
+          <div className="mt-toolbar" style={{display:"flex",alignItems:"center",gap:5,padding:"8px 10px",background:"#1e293b",flexWrap:"wrap"}}>
             {TOOLS.map(t=>(
               <button key={t.key}
                 onClick={()=>{setActiveTool(t.key);setDrawPts([])}}
@@ -659,11 +719,11 @@ function MeasurementTool({ onGeometryChange }) {
             </div>
           </div>
 
-          <div style={{padding:"5px 12px",background:"#0f172a",fontSize:11,color:"#475569",display:"flex",alignItems:"center",justifyContent:"space-between",minHeight:28}}>
+          <div style={{padding:"5px 12px",background:"#0f172a",fontSize:11,color:"#475569",display:"flex",alignItems:"center",justifyContent:"space-between",minHeight:28,flexWrap:"wrap",gap:6}}>
             <span>{tip}</span>
             <div style={{display:"flex",alignItems:"center",gap:8}}>
               {activeTool==="penetration"&&(
-                <div style={{display:"flex",gap:4}}>
+                <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
                   {PEN_TYPES.map(t=>(
                     <button key={t} onClick={()=>setPenSub(t)}
                       style={{padding:"1px 7px",borderRadius:4,border:`1px solid ${penSub===t?PEN_COLORS[t]:"rgba(255,255,255,0.1)"}`,
@@ -685,9 +745,13 @@ function MeasurementTool({ onGeometryChange }) {
             </div>
           </div>
 
-          <canvas ref={canvasRef} width={490} height={330}
-            style={{display:"block",cursor:["section","flashing","gutter","scale"].includes(activeTool)?"crosshair":"cell"}}
-            onClick={handleClick} onMouseMove={handleMouseMove} onMouseLeave={handleMouseLeave}/>
+          <div className="mt-canvas-wrap">
+            <canvas ref={canvasRef} width={MT_CANVAS_W} height={MT_CANVAS_H}
+              style={{cursor:["section","flashing","gutter","scale"].includes(activeTool)?"crosshair":"cell"}}
+              onClick={handleClick}
+              onContextMenu={handleContextMenu}
+              onMouseMove={handleMouseMove} onMouseLeave={handleMouseLeave}/>
+          </div>
 
           <div style={{padding:"7px 12px",background:"#0f172a",display:"flex",gap:14,alignItems:"center",flexWrap:"wrap"}}>
             <div style={{fontSize:11}}>
@@ -704,7 +768,7 @@ function MeasurementTool({ onGeometryChange }) {
           </div>
         </div>
 
-        <div style={{display:"flex",flexDirection:"column",gap:10,overflowY:"auto",maxHeight:420}}>
+        <div className="mt-sidepanel" style={{display:"flex",flexDirection:"column",gap:10,overflowY:"auto",maxHeight:720}}>
           <div style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,padding:12}}>
             <div style={{fontSize:11,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:.5,marginBottom:10}}>Roof Sections</div>
             {sections.length===0&&<div style={{fontSize:11,color:"#94a3b8",textAlign:"center",padding:"8px 0"}}>No sections yet — use ▲ Section tool</div>}
@@ -809,7 +873,7 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
   )
 
   return (
-    <div style={s.grid2}>
+    <div style={s.grid2} className="grid2-responsive">
       <div>
         <div style={{...s.card,marginBottom:14}}>
           <div style={{fontWeight:700,marginBottom:14}}>Roof Dimensions</div>
@@ -901,8 +965,8 @@ function QuoteView({ project, customer, company }) {
   ].filter(l=>l.total>0)
 
   return (
-    <div style={{maxWidth:660,background:"#fff",border:"1px solid #e2e8f0",borderRadius:14,padding:32}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:28,paddingBottom:22,borderBottom:"2px solid #e2e8f0"}}>
+    <div style={{maxWidth:660,width:"100%",background:"#fff",border:"1px solid #e2e8f0",borderRadius:14,padding:32}} className="quote-view-responsive">
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:28,paddingBottom:22,borderBottom:"2px solid #e2e8f0",flexWrap:"wrap",gap:12}}>
         <div>
           <div style={{fontFamily:"'Syne',sans-serif",fontSize:24,fontWeight:800}}>{company.companyName}</div>
           <div style={{fontSize:12,color:"#64748b",marginTop:5,lineHeight:1.9}}>
@@ -928,9 +992,9 @@ function QuoteView({ project, customer, company }) {
         {project.notes && <div style={{fontSize:12,color:"#64748b",marginTop:6,lineHeight:1.7}}>{project.notes}</div>}
       </div>
 
-      <div style={{marginBottom:20}}>
+      <div style={{marginBottom:20,overflowX:"auto"}}>
         <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:.5,color:"#64748b",marginBottom:10}}>Line Items</div>
-        <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:420}}>
           <thead>
             <tr>
               {["Description","Qty","Unit","Total"].map(h=>(
@@ -952,7 +1016,7 @@ function QuoteView({ project, customer, company }) {
       </div>
 
       <div style={{display:"flex",justifyContent:"flex-end"}}>
-        <div style={{minWidth:240}}>
+        <div style={{minWidth:240,width:"100%",maxWidth:280}}>
           {[["Subtotal (excl. GST)", fmt(e.sellPrice)],[`GST (${GST_RATE*100}%)`, fmt(e.gst)]].map(([l,v])=>(
             <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid #f1f5f9",fontSize:13}}>
               <span style={{color:"#64748b"}}>{l}</span><span style={{fontWeight:500}}>{v}</span>
@@ -1031,23 +1095,23 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
 
   return (
     <div>
-      <div style={{display:"flex",alignItems:"center",gap:0,marginBottom:24}}>
+      <div className="wizard-steps-row" style={{display:"flex",alignItems:"center",gap:0,marginBottom:24}}>
         {STEPS.map((label,i)=>(
-          <div key={i} style={{display:"flex",alignItems:"center",flex:i<STEPS.length-1?1:"auto"}}>
+          <div key={i} style={{display:"flex",alignItems:"center",flex:i<STEPS.length-1?1:"auto",minWidth:i<STEPS.length-1?0:"auto"}}>
             <div style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}} onClick={()=>i<step&&setStep(i)}>
               <div style={{width:28,height:28,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,
                 background:i===step?"#f59e0b":i<step?"#10b981":"#f1f5f9",
-                color:i<=step?"#000":"#94a3b8",transition:"all .2s"}}>{i<step?"✓":i+1}</div>
-              <span style={{fontSize:12,fontWeight:i===step?600:400,color:i===step?"#0f172a":i<step?"#10b981":"#94a3b8"}}>{label}</span>
+                color:i<=step?"#000":"#94a3b8",transition:"all .2s",flexShrink:0}}>{i<step?"✓":i+1}</div>
+              <span className="wizard-step-label" style={{fontSize:12,fontWeight:i===step?600:400,color:i===step?"#0f172a":i<step?"#10b981":"#94a3b8",whiteSpace:"nowrap"}}>{label}</span>
             </div>
-            {i<STEPS.length-1&&<div style={{flex:1,height:1,background:i<step?"#10b981":"#e2e8f0",margin:"0 10px"}}/>}
+            {i<STEPS.length-1&&<div style={{flex:1,height:1,background:i<step?"#10b981":"#e2e8f0",margin:"0 10px",minWidth:12}}/>}
           </div>
         ))}
       </div>
 
       {step===0 && (
         <div>
-          <div style={{display:"flex",gap:10,marginBottom:16}}>
+          <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap"}}>
             <Btn onClick={()=>setIsNewCust(false)} style={{border:!isNewCust?"2px solid #f59e0b":"1px solid #e2e8f0",background:!isNewCust?"#fef3c7":""}}>Existing Customer</Btn>
             <Btn onClick={()=>setIsNewCust(true)}  style={{border:isNewCust?"2px solid #f59e0b":"1px solid #e2e8f0",background:isNewCust?"#fef3c7":""}}>+ New Customer</Btn>
           </div>
@@ -1059,7 +1123,7 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
               </select>
             </FG>
           ):(
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
               <FG label="Full Name"><input style={s.input} value={newCust.name}    onChange={e=>setNewCust(p=>({...p,name:e.target.value}))}    placeholder="Sarah Thompson"/></FG>
               <FG label="Phone">   <input style={s.input} value={newCust.phone}   onChange={e=>setNewCust(p=>({...p,phone:e.target.value}))}   placeholder="021 999 0000"/></FG>
               <FG label="Email">   <input style={s.input} value={newCust.email}   onChange={e=>setNewCust(p=>({...p,email:e.target.value}))}   placeholder="sarah@email.com"/></FG>
@@ -1068,7 +1132,7 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
           )}
           <div style={{height:1,background:"#e2e8f0",margin:"18px 0"}}/>
           <FG label="Job Address"><input style={s.input} value={form.address} onChange={e=>upd("address")(e.target.value)} placeholder="47 Ridgeline Ave, Titirangi, Auckland"/></FG>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
             <FG label="Roof Type">
               <select style={s.input} value={form.roofType} onChange={e=>upd("roofType")(e.target.value)}>
                 {MATERIALS.map(m=><option key={m.label}>{m.label}</option>)}
@@ -1088,15 +1152,15 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
       {step===2 && <EstimateEngine initialArea={area||0} onEstimateChange={setEstimate}/>}
 
       {step===3 && (
-        <div style={{display:"flex",gap:20,alignItems:"flex-start"}}>
-          <div style={{flex:1,overflowY:"auto",maxHeight:"55vh"}}>
+        <div className="wizard-review-grid">
+          <div style={{flex:1,overflowY:"auto",maxHeight:"55vh",width:"100%"}}>
             <QuoteView
               project={{...form,area,estimate,quoteNum:nextQuoteNum(projects),quoteDate:today()}}
               customer={isNewCust ? newCust : customers.find(c=>c.id===form.customerId)}
               company={company}
             />
           </div>
-          <div style={{width:180,flexShrink:0}}>
+          <div className="wizard-review-sidebar" style={{width:180,flexShrink:0}}>
             <div style={s.card}>
               <div style={{fontWeight:600,marginBottom:10}}>Review</div>
               {estimate && (
@@ -1112,9 +1176,9 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
         </div>
       )}
 
-      <div style={{display:"flex",justifyContent:"space-between",marginTop:24,paddingTop:18,borderTop:"1px solid #e2e8f0"}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginTop:24,paddingTop:18,borderTop:"1px solid #e2e8f0",flexWrap:"wrap",gap:10}}>
         <Btn onClick={step===0?onCancel:stepBack}>{step===0?"Cancel":"← Back"}</Btn>
-        <div style={{display:"flex",gap:10}}>
+        <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
           {step<STEPS.length-1 && (
             <Btn onClick={stepNext} style={{opacity:canNext[step]?1:.5,pointerEvents:canNext[step]?"auto":"none"}}>Skip →</Btn>
           )}
@@ -1283,28 +1347,30 @@ function ProjectsList({ projects, customers, setView, setSelectedProject }) {
         <span style={{marginLeft:"auto",fontSize:13,color:"#64748b"}}>{filtered.length} projects</span>
       </div>
       <div style={{...s.card,padding:0,overflow:"hidden"}}>
-        <table style={{width:"100%",borderCollapse:"collapse"}}>
-          <thead>
-            <tr>{["Customer","Address","Roof Area","Value","Status","Date",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
-          </thead>
-          <tbody>
-            {filtered.map(p=>{
-              const cust=getCustomer(p.customerId)
-              return (
-                <tr key={p.id} style={{cursor:"pointer"}} onClick={()=>{ setSelectedProject(p); setView("project") }}>
-                  <td style={s.td}><div style={{fontWeight:500}}>{cust?.name||"—"}</div><div style={{fontSize:11,color:"#64748b"}}>{cust?.phone}</div></td>
-                  <td style={{...s.td,maxWidth:200}}><div style={{fontSize:12,color:"#64748b",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{p.address}</div></td>
-                  <td style={s.td}>{p.area>0 ? p.area+" m²" : <span style={{color:"#94a3b8"}}>—</span>}</td>
-                  <td style={s.td}><span style={{fontWeight:600}}>{p.estimate?fmt(p.estimate.total):<span style={{color:"#94a3b8"}}>—</span>}</span></td>
-                  <td style={s.td}><StatusBadge status={p.status}/></td>
-                  <td style={{...s.td,color:"#64748b",fontSize:12}}>{fmtD(p.createdAt)}</td>
-                  <td style={s.td}><span style={{color:"#3b82f6",fontSize:12}}>View →</span></td>
-                </tr>
-              )
-            })}
-            {filtered.length===0&&<tr><td colSpan={7} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No projects found</td></tr>}
-          </tbody>
-        </table>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",minWidth:640}}>
+            <thead>
+              <tr>{["Customer","Address","Roof Area","Value","Status","Date",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
+            </thead>
+            <tbody>
+              {filtered.map(p=>{
+                const cust=getCustomer(p.customerId)
+                return (
+                  <tr key={p.id} style={{cursor:"pointer"}} onClick={()=>{ setSelectedProject(p); setView("project") }}>
+                    <td style={s.td}><div style={{fontWeight:500}}>{cust?.name||"—"}</div><div style={{fontSize:11,color:"#64748b"}}>{cust?.phone}</div></td>
+                    <td style={{...s.td,maxWidth:200}}><div style={{fontSize:12,color:"#64748b",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{p.address}</div></td>
+                    <td style={s.td}>{p.area>0 ? p.area+" m²" : <span style={{color:"#94a3b8"}}>—</span>}</td>
+                    <td style={s.td}><span style={{fontWeight:600}}>{p.estimate?fmt(p.estimate.total):<span style={{color:"#94a3b8"}}>—</span>}</span></td>
+                    <td style={s.td}><StatusBadge status={p.status}/></td>
+                    <td style={{...s.td,color:"#64748b",fontSize:12}}>{fmtD(p.createdAt)}</td>
+                    <td style={s.td}><span style={{color:"#3b82f6",fontSize:12}}>View →</span></td>
+                  </tr>
+                )
+              })}
+              {filtered.length===0&&<tr><td colSpan={7} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No projects found</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   )
@@ -1425,7 +1491,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
 
   return (
     <div>
-      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20}}>
+      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20,flexWrap:"wrap"}}>
         <Btn onClick={()=>setView("projects")}>← Projects</Btn>
         <div style={{flex:1}}/>
         <select value={project.status} onChange={ev=>updateStatus(ev.target.value)}
@@ -1435,7 +1501,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
         <Btn primary onClick={onEdit}>✏ Edit Project</Btn>
       </div>
 
-      <div style={s.grid2}>
+      <div style={s.grid2} className="grid2-responsive">
         <div>
           <div style={s.card}>
             <div style={{fontWeight:700,fontSize:15,marginBottom:4}}>{cust?.name||"—"}</div>
@@ -1660,51 +1726,53 @@ function Customers({ customers, setCustomers, projects }) {
 
   return (
     <div>
-      <div style={{display:"flex",gap:12,marginBottom:20}}>
+      <div style={{display:"flex",gap:12,marginBottom:20,flexWrap:"wrap"}}>
         <input style={{...s.input,width:260}} placeholder="Search customers..." value={search} onChange={e=>setSearch(e.target.value)}/>
         <Btn primary onClick={()=>{ setForm({name:"",email:"",phone:"",address:""}); setEditCust(null); setShowNew(true) }}>+ New Customer</Btn>
       </div>
       <div style={{...s.card,padding:0,overflow:"hidden"}}>
-        <table style={{width:"100%",borderCollapse:"collapse"}}>
-          <thead>
-            <tr>{["Name","Email","Phone","Address","Projects","Total Value",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
-          </thead>
-          <tbody>
-            {filtered.map(c=>{
-              const cProjects = projects.filter(p=>p.customerId===c.id)
-              const cVal = cProjects.reduce((a,p)=>a+(p.estimate?.total||0),0)
-              return (
-                <tr key={c.id}>
-                  <td style={s.td}>
-                    <div style={{display:"flex",alignItems:"center",gap:10}}>
-                      <div style={{width:32,height:32,borderRadius:"50%",background:"#dbeafe",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#1e40af",flexShrink:0}}>
-                        {c.name.split(" ").map(w=>w[0]).slice(0,2).join("")}
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",minWidth:620}}>
+            <thead>
+              <tr>{["Name","Email","Phone","Address","Projects","Total Value",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
+            </thead>
+            <tbody>
+              {filtered.map(c=>{
+                const cProjects = projects.filter(p=>p.customerId===c.id)
+                const cVal = cProjects.reduce((a,p)=>a+(p.estimate?.total||0),0)
+                return (
+                  <tr key={c.id}>
+                    <td style={s.td}>
+                      <div style={{display:"flex",alignItems:"center",gap:10}}>
+                        <div style={{width:32,height:32,borderRadius:"50%",background:"#dbeafe",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#1e40af",flexShrink:0}}>
+                          {c.name.split(" ").map(w=>w[0]).slice(0,2).join("")}
+                        </div>
+                        <span style={{fontWeight:500}}>{c.name}</span>
                       </div>
-                      <span style={{fontWeight:500}}>{c.name}</span>
-                    </div>
-                  </td>
-                  <td style={{...s.td,color:"#3b82f6"}}>{c.email||"—"}</td>
-                  <td style={s.td}>{c.phone||"—"}</td>
-                  <td style={{...s.td,fontSize:12,color:"#64748b",maxWidth:160}}><div style={{whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{c.address||"—"}</div></td>
-                  <td style={s.td}>{cProjects.length}</td>
-                  <td style={{...s.td,fontWeight:600}}>{cVal>0?fmt(cVal):"—"}</td>
-                  <td style={s.td}>
-                    <div style={{display:"flex",gap:6}}>
-                      <Btn sm onClick={()=>openEdit(c)}>Edit</Btn>
-                      <Btn sm danger onClick={()=>del(c.id)}>Delete</Btn>
-                    </div>
-                  </td>
-                </tr>
-              )
-            })}
-            {filtered.length===0&&<tr><td colSpan={7} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No customers found</td></tr>}
-          </tbody>
-        </table>
+                    </td>
+                    <td style={{...s.td,color:"#3b82f6"}}>{c.email||"—"}</td>
+                    <td style={s.td}>{c.phone||"—"}</td>
+                    <td style={{...s.td,fontSize:12,color:"#64748b",maxWidth:160}}><div style={{whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{c.address||"—"}</div></td>
+                    <td style={s.td}>{cProjects.length}</td>
+                    <td style={{...s.td,fontWeight:600}}>{cVal>0?fmt(cVal):"—"}</td>
+                    <td style={s.td}>
+                      <div style={{display:"flex",gap:6}}>
+                        <Btn sm onClick={()=>openEdit(c)}>Edit</Btn>
+                        <Btn sm danger onClick={()=>del(c.id)}>Delete</Btn>
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+              {filtered.length===0&&<tr><td colSpan={7} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No customers found</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       {showNew&&(
         <Modal title={editCust?"Edit Customer":"New Customer"} onClose={closeModal}>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
             <FG label="Full Name *"><input style={s.input} value={form.name}    onChange={e=>upd("name")(e.target.value)}    placeholder="Sarah Thompson"/></FG>
             <FG label="Phone *">   <input style={s.input} value={form.phone}   onChange={e=>upd("phone")(e.target.value)}   placeholder="021 999 0011"/></FG>
             <FG label="Email">     <input style={s.input} value={form.email}   onChange={e=>upd("email")(e.target.value)}   placeholder="sarah@email.com"/></FG>
@@ -1779,7 +1847,7 @@ function Users({ currentUser }) {
 
   return (
     <div style={{width:"100%"}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:10}}>
         <div style={{fontSize:13,color:"#64748b"}}>Manage who has access to aTopRoof CRM.</div>
         <Btn primary onClick={openNew}>+ Add User</Btn>
       </div>
@@ -1788,54 +1856,56 @@ function Users({ currentUser }) {
         {loading ? (
           <div style={{padding:40,textAlign:"center",color:"#94a3b8",fontSize:13}}>Loading users…</div>
         ) : (
-          <table style={{width:"100%",borderCollapse:"collapse"}}>
-            <thead>
-              <tr>{["User","Email","Status","Joined",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
-            </thead>
-            <tbody>
-              {users.map(u => {
-                const isMe   = u.id === currentUser?.id
-                const active = u.isActive !== false
-                return (
-                  <tr key={u.id}>
-                    <td style={s.td}>
-                      <div style={{display:"flex",alignItems:"center",gap:10}}>
-                        <div style={{width:34,height:34,borderRadius:"50%",flexShrink:0,background:active?"linear-gradient(135deg,#f59e0b,#f97316)":"#e2e8f0",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:active?"#000":"#94a3b8"}}>
-                          {u.name?.split(" ").map(w=>w[0]).slice(0,2).join("").toUpperCase()}
-                        </div>
-                        <div>
-                          <div style={{fontWeight:600,fontSize:13}}>
-                            {u.name}
-                            {isMe && <span style={{marginLeft:6,fontSize:10,background:"#dbeafe",color:"#1e40af",padding:"1px 7px",borderRadius:10,fontWeight:600}}>You</span>}
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",minWidth:560}}>
+              <thead>
+                <tr>{["User","Email","Status","Joined",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
+              </thead>
+              <tbody>
+                {users.map(u => {
+                  const isMe   = u.id === currentUser?.id
+                  const active = u.isActive !== false
+                  return (
+                    <tr key={u.id}>
+                      <td style={s.td}>
+                        <div style={{display:"flex",alignItems:"center",gap:10}}>
+                          <div style={{width:34,height:34,borderRadius:"50%",flexShrink:0,background:active?"linear-gradient(135deg,#f59e0b,#f97316)":"#e2e8f0",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:active?"#000":"#94a3b8"}}>
+                            {u.name?.split(" ").map(w=>w[0]).slice(0,2).join("").toUpperCase()}
+                          </div>
+                          <div>
+                            <div style={{fontWeight:600,fontSize:13}}>
+                              {u.name}
+                              {isMe && <span style={{marginLeft:6,fontSize:10,background:"#dbeafe",color:"#1e40af",padding:"1px 7px",borderRadius:10,fontWeight:600}}>You</span>}
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    </td>
-                    <td style={{...s.td,color:"#3b82f6",fontSize:12}}>{u.email}</td>
-                    <td style={s.td}>
-                      <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,background:active?"#d1fae5":"#fee2e2",color:active?"#065f46":"#991b1b"}}>
-                        <span style={{width:6,height:6,borderRadius:"50%",background:active?"#10b981":"#ef4444"}}/>
-                        {active ? "Active" : "Disabled"}
-                      </span>
-                    </td>
-                    <td style={{...s.td,fontSize:12,color:"#64748b"}}>{fmtD(u.createdAt)}</td>
-                    <td style={s.td}>
-                      <div style={{display:"flex",gap:6,justifyContent:"flex-end"}}>
-                        <Btn sm onClick={()=>openEdit(u)}>Edit</Btn>
-                        {!isMe && (
-                          <button onClick={()=>toggleActive(u)} disabled={togglingId===u.id}
-                            style={{padding:"6px 12px",borderRadius:8,fontSize:12,fontWeight:500,cursor:togglingId===u.id?"not-allowed":"pointer",border:"1px solid",fontFamily:"inherit",transition:"all .15s",opacity:togglingId===u.id?0.6:1,background:active?"#fee2e2":"#d1fae5",color:active?"#b91c1c":"#065f46",borderColor:active?"#fca5a5":"#6ee7b7"}}>
-                            {togglingId===u.id ? "…" : active ? "Disable" : "Enable"}
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                )
-              })}
-              {users.length===0&&<tr><td colSpan={5} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No users found</td></tr>}
-            </tbody>
-          </table>
+                      </td>
+                      <td style={{...s.td,color:"#3b82f6",fontSize:12}}>{u.email}</td>
+                      <td style={s.td}>
+                        <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,background:active?"#d1fae5":"#fee2e2",color:active?"#065f46":"#991b1b"}}>
+                          <span style={{width:6,height:6,borderRadius:"50%",background:active?"#10b981":"#ef4444"}}/>
+                          {active ? "Active" : "Disabled"}
+                        </span>
+                      </td>
+                      <td style={{...s.td,fontSize:12,color:"#64748b"}}>{fmtD(u.createdAt)}</td>
+                      <td style={s.td}>
+                        <div style={{display:"flex",gap:6,justifyContent:"flex-end"}}>
+                          <Btn sm onClick={()=>openEdit(u)}>Edit</Btn>
+                          {!isMe && (
+                            <button onClick={()=>toggleActive(u)} disabled={togglingId===u.id}
+                              style={{padding:"6px 12px",borderRadius:8,fontSize:12,fontWeight:500,cursor:togglingId===u.id?"not-allowed":"pointer",border:"1px solid",fontFamily:"inherit",transition:"all .15s",opacity:togglingId===u.id?0.6:1,background:active?"#fee2e2":"#d1fae5",color:active?"#b91c1c":"#065f46",borderColor:active?"#fca5a5":"#6ee7b7"}}>
+                              {togglingId===u.id ? "…" : active ? "Disable" : "Enable"}
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
+                {users.length===0&&<tr><td colSpan={5} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No users found</td></tr>}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
 
@@ -1847,7 +1917,7 @@ function Users({ currentUser }) {
 
       {showModal && (
         <Modal title={editUser ? "Edit User" : "Add New User"} onClose={closeModal} width={440}>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
             <FG label="Full Name *"><input style={s.input} value={form.name}  onChange={upd("name")}  placeholder="Jane Smith"/></FG>
             <FG label="Email *">    <input style={s.input} type="email" value={form.email} onChange={upd("email")} placeholder="jane@company.com"/></FG>
           </div>
@@ -1887,7 +1957,7 @@ function Settings({ settings, onSave }) {
     <div style={{maxWidth:600}}>
       <div style={{...s.card,marginBottom:16}}>
         <div style={{fontWeight:700,marginBottom:16}}>Company Profile</div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
           <FG label="Company Name">  <input style={s.input} value={form.companyName}    onChange={upd("companyName")}/></FG>
           <FG label="GST Number">    <input style={s.input} value={form.companyGst}     onChange={upd("companyGst")}/></FG>
           <FG label="Phone">         <input style={s.input} value={form.companyPhone}   onChange={upd("companyPhone")}/></FG>
@@ -1898,7 +1968,7 @@ function Settings({ settings, onSave }) {
       </div>
       <div style={{...s.card,marginBottom:16}}>
         <div style={{fontWeight:700,marginBottom:16}}>Default Pricing</div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
           <FG label="Default Day Rate ($)"><input style={s.input} type="number" value={form.dayRate}  onChange={updNum("dayRate")}/></FG>
           <FG label="Default Margin %">   <input style={s.input} type="number" value={form.margin}   onChange={updNum("margin")}/></FG>
           <FG label="GST Rate %">         <input style={{...s.input,background:"#f8fafc",color:"#64748b"}} type="number" value={GST_RATE*100} readOnly/></FG>
@@ -1937,6 +2007,7 @@ export default function App() {
   const [toast,           setToast]          = useState(null)
   const [showWizard,      setShowWizard]     = useState(false)
   const [editingProject,  setEditingProject] = useState(null)
+  const [mobileNavOpen,   setMobileNavOpen]  = useState(false)
 
   const { user, login, logout } = useAuth()
 
@@ -1987,9 +2058,10 @@ export default function App() {
   }
 
   function handleNav(key) {
-    if(key==="new") { setEditingProject(null); setShowWizard(true); return }
+    if(key==="new") { setEditingProject(null); setShowWizard(true); setMobileNavOpen(false); return }
     setView(key)
     if(key!=="project") setSelectedProject(null)
+    setMobileNavOpen(false)
   }
 
   async function handleSaveProject(project, pendingNewCust) {
@@ -2067,20 +2139,176 @@ export default function App() {
           [data-quote-content] > div { max-width:100%!important; width:100%!important; border:none!important; border-radius:0!important; box-shadow:none!important; padding:0!important; }
           @page { size: A4; margin: 12mm 14mm; }
         }
+
+        /* ── Responsive modal (Bootstrap-like, mobile-first) ── */
+        .responsive-modal {
+          margin: 24px auto;
+          border-radius: 14px;
+        }
+        @media (max-width: 992px) {
+          .responsive-modal { max-width: 92vw !important; }
+        }
+        @media (max-width: 640px) {
+          .responsive-modal {
+            margin: 0;
+            width: 100vw !important;
+            max-width: 100vw !important;
+            height: 100vh !important;
+            max-height: 100vh !important;
+            border-radius: 0;
+          }
+          .responsive-modal-body { padding: 14px !important; }
+        }
+
+        /* ── Wizard step layout ── */
+        .wizard-step-grid { display:grid; gap:10px; }
+        .wizard-review-grid { display:flex; gap:20px; align-items:flex-start; }
+        @media (max-width: 900px) {
+          .wizard-review-grid { flex-direction: column; }
+          .wizard-review-sidebar { width:100% !important; }
+        }
+        .wizard-steps-row { flex-wrap: wrap; row-gap: 10px; }
+        @media (max-width: 640px) {
+          .wizard-step-label { display: none; }
+        }
+
+        /* ── Measurement tool responsive grid ── */
+        .mt-grid {
+          display:grid;
+          grid-template-columns: 1fr 250px;
+          gap:12px;
+        }
+        @media (max-width: 900px) {
+          .mt-grid { grid-template-columns: 1fr; }
+          .mt-sidepanel { max-height: 340px; }
+        }
+        .mt-canvas-wrap {
+          position: relative;
+          width: 100%;
+          aspect-ratio: 490 / 330;
+        }
+        .mt-canvas-wrap canvas {
+          position: absolute;
+          top:0; left:0;
+          width: 100% !important;
+          height: 100% !important;
+          display:block;
+        }
+        .mt-toolbar { flex-wrap: wrap; }
+
+        /* ── General responsive grids ── */
+        @media (max-width: 800px) {
+          .grid2-responsive  { grid-template-columns: 1fr !important; }
+          .grid2r-responsive { grid-template-columns: 1fr !important; }
+        }
+        @media (max-width: 900px) {
+          .grid4-responsive { grid-template-columns: repeat(2,1fr) !important; }
+        }
+        @media (max-width: 480px) {
+          .grid4-responsive { grid-template-columns: 1fr !important; }
+        }
+
+        /* ── Quote view padding on small screens ── */
+        @media (max-width: 640px) {
+          .quote-view-responsive { padding: 18px !important; }
+        }
+
+        /* ── App shell: sidebar collapses to a top drawer on mobile ── */
+        @media (max-width: 768px) {
+          .app-shell { flex-direction: column !important; height: 100vh !important; }
+          .app-sidebar {
+            width: 100% !important;
+            min-width: 0 !important;
+            height: auto !important;
+            flex-direction: row !important;
+            align-items: center !important;
+            padding: 8px 12px !important;
+          }
+          .app-sidebar .app-sidebar-logo { display:none !important; }
+          .app-sidebar .app-sidebar-nav {
+            display: none !important;
+          }
+          .app-sidebar.nav-open .app-sidebar-nav {
+            display: flex !important;
+            position: fixed;
+            top: 56px; left: 0; right: 0; bottom: 0;
+            background: #0f172a;
+            flex-direction: column !important;
+            padding: 16px;
+            z-index: 999;
+            overflow-y: auto;
+          }
+          .app-sidebar .app-sidebar-user { display:none !important; }
+          .mobile-menu-btn { display:flex !important; }
+          .app-topbar { flex-wrap: wrap; row-gap: 8px; padding: 10px 14px !important; }
+          .app-topbar-title { font-size: 15px !important; }
+          .app-content { padding: 14px !important; }
+        }
+        .mobile-menu-btn { display:none; }
       `}</style>
 
-      <div style={s.app}>
-        <div data-sidebar>
-          <Sidebar view={view} onNav={handleNav} projects={projects} user={user} onLogout={logout}/>
+      <div className="app-shell" style={s.app}>
+        <div data-sidebar className={"app-sidebar"+(mobileNavOpen?" nav-open":"")} style={s.sidebar}>
+          <button
+            className="mobile-menu-btn"
+            onClick={()=>setMobileNavOpen(o=>!o)}
+            style={{display:"none",alignItems:"center",justifyContent:"center",width:36,height:36,border:"none",background:"rgba(255,255,255,0.08)",borderRadius:8,color:"#fff",fontSize:18,cursor:"pointer",flexShrink:0,marginRight:10}}
+          >
+            {mobileNavOpen ? "✕" : "☰"}
+          </button>
+          <div className="app-sidebar-logo" style={s.logo}>
+            <img src="/aTopRoof.png" alt="aTopRoof" style={{width:"100%",maxWidth:164,display:"block",background:"#ffffff",borderRadius:10,padding:"8px 12px",boxShadow:"0 1px 4px rgba(0,0,0,0.25)"}}/>
+            <div style={{fontSize:10,color:"#f59e0b",letterSpacing:1,textTransform:"uppercase",marginTop:8,fontWeight:600}}>Elevate Your Roofing Business</div>
+          </div>
+          <nav className="app-sidebar-nav" style={s.nav}>
+            {[
+              { key:"dashboard",  label:"Dashboard",   icon:"⬛" },
+              { key:"new",        label:"New Project", icon:"📸", primary:true },
+              null,
+              { key:"pipeline",   label:"Pipeline",    icon:"▦", badge:projects.filter(p=>p.status==="Quote Sent").length||null },
+              { key:"projects",   label:"Projects",    icon:"📁" },
+              { key:"customers",  label:"Customers",   icon:"👤" },
+              null,
+              { key:"users",      label:"Users",       icon:"🔑" },
+              { key:"settings",   label:"Settings",    icon:"⚙" },
+            ].map((item,i)=> item===null
+              ? <div key={i} style={{height:1,background:"rgba(255,255,255,0.06)",margin:"8px 0"}}/>
+              : (
+                <div key={item.key}
+                  onClick={()=>handleNav(item.key)}
+                  style={{...s.navItem,
+                    ...(view===item.key ? {background:"rgba(245,158,11,0.15)",color:"#f59e0b"} : {}),
+                    ...(item.primary ? {marginTop:4,background:"rgba(245,158,11,0.1)",color:"#f59e0b",border:"1px solid rgba(245,158,11,0.2)"} : {})
+                  }}
+                >
+                  <span style={{fontSize:14}}>{item.icon}</span>
+                  <span>{item.label}</span>
+                  {item.badge && <span style={{marginLeft:"auto",background:"#f59e0b",color:"#000",fontSize:10,fontWeight:700,padding:"1px 7px",borderRadius:20}}>{item.badge}</span>}
+                </div>
+              )
+            )}
+          </nav>
+          <div className="app-sidebar-user" style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginTop:12,padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,0.04)"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
+              <div style={{width:28,height:28,borderRadius:"50%",background:"linear-gradient(135deg,#f59e0b,#f97316)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#000",flexShrink:0}}>
+                {user?.name?.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}
+              </div>
+              <div style={{minWidth:0}}>
+                <div style={{fontSize:12,color:"#fff",fontWeight:500,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user?.name}</div>
+                <div style={{fontSize:10,color:"#475569"}}>aTopRoof CRM</div>
+              </div>
+            </div>
+            <button onClick={logout} title="Sign out" style={{background:"none",border:"none",cursor:"pointer",color:"#475569",fontSize:16,padding:4,lineHeight:1,flexShrink:0}}>⏻</button>
+          </div>
         </div>
         <div style={s.main}>
-          <div data-topbar style={s.topbar}>
-            <div style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800}}>
+          <div data-topbar className="app-topbar" style={s.topbar}>
+            <div className="app-topbar-title" style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800}}>
               {view==="project"&&currentProject
                 ? (customers.find(c=>c.id===currentProject.customerId)?.name||"Project Detail")
                 : PAGE_TITLES[view]||view}
             </div>
-            <div style={{display:"flex",gap:10,alignItems:"center"}}>
+            <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
               {view==="project"&&currentProject&&<StatusBadge status={currentProject.status}/>}
               {view==="projects"&&<span style={{fontSize:13,color:"#64748b"}}>{projects.length} total</span>}
               {/* ← Currency selector lives here, always visible in the topbar */}
@@ -2091,7 +2319,7 @@ export default function App() {
             </div>
           </div>
 
-          <div data-main-content style={s.content}>
+          <div data-main-content className="app-content" style={s.content}>
             {view==="dashboard"&&(
               <Dashboard
                 projects={projects} customers={customers}
@@ -2110,7 +2338,7 @@ export default function App() {
             )}
             {view==="quote_print"&&currentProject&&(
               <div data-quote-content>
-                <div className="print-hide" style={{display:"flex",gap:10,marginBottom:20}}>
+                <div className="print-hide" style={{display:"flex",gap:10,marginBottom:20,flexWrap:"wrap"}}>
                   <Btn onClick={()=>setView("project")}>← Back to Project</Btn>
                   <Btn primary onClick={()=>window.print()}>🖨 Print / Save PDF</Btn>
                 </div>
@@ -2130,7 +2358,7 @@ export default function App() {
       </div>
 
       {showWizard&&(
-        <Modal title={editingProject?"Edit Project":"New Project"} onClose={()=>{ setShowWizard(false); setEditingProject(null) }} width={700}>
+        <Modal title={editingProject?"Edit Project":"New Project"} onClose={()=>{ setShowWizard(false); setEditingProject(null) }} width={1400}>
           <NewProjectWizard
             customers={customers} projects={projects}
             existingProject={editingProject}
