@@ -447,6 +447,77 @@ function App() {
     if(key!=="project") setSelectedProject(null)
   }
 
+  function MeasurementTool({ onGeometryChange }) {
+    const [useCamera, setUseCamera] = useState(false);
+    
+    const handleCameraCapture = async (imageBlob) => {
+      try {
+        setLoading(true);
+        const measurements = await sendToRoofMeasureAPI(imageBlob, currentProject?.id);
+        
+        // Update the form with AI-detected values
+        onGeometryChange({
+          area: measurements.area,
+          roofType: measurements.roofType,
+          source: 'camera_ai'
+        });
+        
+        setToastMsg('✓ Roof measurements detected');
+        setUseCamera(false);
+      } catch (err) {
+        setToastMsg('✗ Could not process image');
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    return (
+      <div>
+        {useCamera ? (
+          <LiveCamera onCapture={handleCameraCapture} />
+        ) : (
+          <>
+            {/* Existing photo upload and canvas code */}
+            <button 
+              onClick={() => setUseCamera(true)}
+              style={{ ...buttonStyle, marginTop: 10 }}
+            >
+              📹 Use Live Camera
+            </button>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  async function sendToRoofMeasureAPI(imageBlob, projectId) {
+    try {
+      const formData = new FormData();
+      formData.append('image', imageBlob);
+      formData.append('project_id', projectId);
+
+      const response = await fetch(
+        'http://localhost:5000/api/measure', // adjust to your Python API port
+        {
+          method: 'POST',
+          body: formData
+        }
+      );
+
+      if (!response.ok) throw new Error('API error');
+      const result = await response.json();
+      
+      return {
+        area: result.estimated_area,
+        roofType: result.detected_type,
+        measurements: result.measurements
+      };
+    } catch (error) {
+      console.error('Roof measurement API error:', error);
+      throw error;
+    }
+  }
+
   async function handleSaveProject(project, pendingNewCust) {
     try {
       const isEdit = projects.some(p=>p.id===project.id)

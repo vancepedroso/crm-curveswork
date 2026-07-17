@@ -4,6 +4,9 @@ import { customersApi, projectsApi, usersApi } from "./api"
 import { useAuth } from "./AuthContext"
 import LoginPage   from "./LoginPage"
 import { CurrencyProvider, useCurrency } from "./CurrencyContext"
+import ARCameraMeasurement from "./ARCamera/ARCameraMeasurment";
+import LiveCameraMeasurements from "./LiveCamera/LiveCameraMeasurement";
+
 
 // ─────────────────────────── CONSTANTS ───────────────────────────
 const STATUSES = ["New Lead","Estimating","Quote Sent","Won","Lost"]
@@ -383,7 +386,11 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
   )
 }
 
-// ─────────────────────────── MODULE 1: ROOF MEASUREMENT TOOL ───────────────────────────
+// ─────────────────────────── MODULE 1: ROOF MEASUREMENT TOOL (MVP) ───────────────────────────
+// Assisted (non-AI) measurement: upload a photo, trace the roof outline with points,
+// enter one known real-world measurement, and the tool scales everything proportionally.
+// Includes zoom (wheel / buttons), pan (Space+drag, middle-mouse, or the Pan tool),
+// and editable points — every placed point can be dragged to reposition it later.
 const SEC_COLORS = ["#3b82f6","#10b981","#8b5cf6","#f59e0b","#ef4444","#06b6d4","#f97316","#84cc16","#ec4899","#14b8a6"]
 const PEN_TYPES  = ["skylight","pipe","flue","vent","other"]
 const PEN_COLORS = { skylight:"#f59e0b", pipe:"#94a3b8", flue:"#ef4444", vent:"#10b981", other:"#8b5cf6" }
@@ -408,13 +415,15 @@ function linelenPx(pts) {
   return l
 }
 
-// Fixed internal drawing resolution. The canvas element is scaled to 100%
-// of its container via CSS (see .mt-canvas-wrap), so on smaller screens it
-// shrinks visually while all click coordinates below are computed from
-// getBoundingClientRect() — which already accounts for that CSS scaling —
-// so hit-testing / point placement stays accurate at every screen size.
+// Fixed internal drawing resolution (world / image space). Zoom & pan are
+// applied as a view transform on top of this — stored points always stay in
+// this fixed coordinate space, so area/length math never needs to know
+// about the current zoom or pan.
 const MT_CANVAS_W = 490
 const MT_CANVAS_H = 330
+const MIN_ZOOM = 1
+const MAX_ZOOM = 6
+const HIT_RADIUS = 9 // world-space px for grabbing an existing point
 
 function MeasurementTool({ onGeometryChange }) {
   const canvasRef   = useRef(null)
@@ -430,6 +439,16 @@ function MeasurementTool({ onGeometryChange }) {
   const [penSub,    setPenSub]    = useState("pipe")
   const [drawPts,   setDrawPts]   = useState([])
   const [hoverPt,   setHoverPt]   = useState(null)
+
+  // ── Zoom / Pan view state ──────────────────────────────────────────
+  // screenX = worldX*zoom + offX ,  screenY = worldY*zoom + offY
+  const [view, setView] = useState({ zoom:1, offX:0, offY:0 })
+  const panRef = useRef(null) // { startX, startY, startOffX, startOffY }
+  const [spaceDown, setSpaceDown] = useState(false)
+
+  // ── Editable points ─────────────────────────────────────────────────
+  const dragRef = useRef(null) // { kind, id, idx? } currently-dragged point
+  const [editMode, setEditMode] = useState(false)
 
   const mPerPx = useMemo(()=>{
     if(!scaleLine?.p1||!scaleLine?.p2) return null
@@ -471,27 +490,76 @@ function MeasurementTool({ onGeometryChange }) {
 
   useEffect(()=>{ onGeometryChange?.(geometry) },[geometry, onGeometryChange])
 
+  // Screen (rendered CSS pixels) -> world (fixed MT_CANVAS_W x MT_CANVAS_H
+  // drawing space), accounting for CSS scaling of the canvas element AND
+  // the current zoom/pan view transform.
+  const getWorldPt = useCallback((clientX, clientY) => {
+    const cv = canvasRef.current
+    const r = cv.getBoundingClientRect()
+    const cssScaleX = MT_CANVAS_W / r.width
+    const cssScaleY = MT_CANVAS_H / r.height
+    const cvX = (clientX - r.left) * cssScaleX
+    const cvY = (clientY - r.top)  * cssScaleY
+    return { x: (cvX - view.offX) / view.zoom, y: (cvY - view.offY) / view.zoom }
+  }, [view])
+
+  function clampView(v) {
+    const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v.zoom))
+    const maxOffX = MT_CANVAS_W * (zoom - 1) + MT_CANVAS_W*0.3
+    const maxOffY = MT_CANVAS_H * (zoom - 1) + MT_CANVAS_H*0.3
+    const minOffX = -MT_CANVAS_W*(zoom-1) - MT_CANVAS_W*0.3
+    const minOffY = -MT_CANVAS_H*(zoom-1) - MT_CANVAS_H*0.3
+    return { zoom, offX: Math.min(maxOffX, Math.max(minOffX, v.offX)), offY: Math.min(maxOffY, Math.max(minOffY, v.offY)) }
+  }
+
+  function zoomAt(cvX, cvY, factor) {
+    setView(prev=>{
+      const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prev.zoom*factor))
+      const worldX = (cvX - prev.offX) / prev.zoom
+      const worldY = (cvY - prev.offY) / prev.zoom
+      return clampView({ zoom:newZoom, offX: cvX - worldX*newZoom, offY: cvY - worldY*newZoom })
+    })
+  }
+  function zoomButton(factor) { zoomAt(MT_CANVAS_W/2, MT_CANVAS_H/2, factor) }
+  function resetView() { setView({ zoom:1, offX:0, offY:0 }) }
+
+  // Space bar toggles temporary pan mode (Photoshop/Figma-style)
+  useEffect(()=>{
+    function onKeyDown(e){ if(e.code==="Space" && !e.repeat) setSpaceDown(true) }
+    function onKeyUp(e){ if(e.code==="Space") setSpaceDown(false) }
+    window.addEventListener("keydown", onKeyDown)
+    window.addEventListener("keyup", onKeyUp)
+    return ()=>{ window.removeEventListener("keydown", onKeyDown); window.removeEventListener("keyup", onKeyUp) }
+  },[])
+
+  const isPanMode = activeTool==="pan" || spaceDown
+
   const drawCanvas = useCallback(()=>{
     const cv=canvasRef.current; if(!cv)return
-    const ctx=cv.getContext("2d"); const W=cv.width,H=cv.height
-    ctx.clearRect(0,0,W,H)
+    const ctx=cv.getContext("2d")
+    ctx.setTransform(1,0,0,1,0,0)
+    ctx.clearRect(0,0,cv.width,cv.height)
+    ctx.save()
+    ctx.translate(view.offX, view.offY)
+    ctx.scale(view.zoom, view.zoom)
+    const lw = px=>px/view.zoom // keep stroke/point sizes visually constant across zoom levels
 
-    if(imgRef.current){ ctx.drawImage(imgRef.current,0,0,W,H) }
+    if(imgRef.current){ ctx.drawImage(imgRef.current,0,0,MT_CANVAS_W,MT_CANVAS_H) }
     else{
-      ctx.fillStyle="#1e293b"; ctx.fillRect(0,0,W,H)
-      ctx.strokeStyle="rgba(255,255,255,0.04)"; ctx.lineWidth=1
-      for(let x=0;x<W;x+=20){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke()}
-      for(let y=0;y<H;y+=20){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke()}
-      ctx.fillStyle="rgba(255,255,255,0.09)"; ctx.font="12px DM Sans"; ctx.textAlign="center"
-      ctx.fillText("Upload a roof photo or aerial image above",W/2,H/2-10)
-      ctx.fillText("then click to trace sections, flashings & accessories",W/2,H/2+10)
+      ctx.fillStyle="#1e293b"; ctx.fillRect(0,0,MT_CANVAS_W,MT_CANVAS_H)
+      ctx.strokeStyle="rgba(255,255,255,0.04)"; ctx.lineWidth=lw(1)
+      for(let x=0;x<MT_CANVAS_W;x+=20){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,MT_CANVAS_H);ctx.stroke()}
+      for(let y=0;y<MT_CANVAS_H;y+=20){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(MT_CANVAS_W,y);ctx.stroke()}
+      ctx.fillStyle="rgba(255,255,255,0.09)"; ctx.font=`${12/view.zoom}px DM Sans`; ctx.textAlign="center"
+      ctx.fillText("Upload a roof photo or aerial image above",MT_CANVAS_W/2,MT_CANVAS_H/2-10)
+      ctx.fillText("then click to trace sections, flashings & accessories",MT_CANVAS_W/2,MT_CANVAS_H/2+10)
     }
 
     sections.forEach((sec,idx)=>{
       if(!sec.pts.length) return
       const col=sec.color
-      ctx.strokeStyle=col; ctx.lineWidth=2
-      ctx.setLineDash(sec.closed?[]:[6,3])
+      ctx.strokeStyle=col; ctx.lineWidth=lw(2)
+      ctx.setLineDash(sec.closed?[]:[lw(6),lw(3)])
       ctx.beginPath(); ctx.moveTo(sec.pts[0].x,sec.pts[0].y)
       sec.pts.forEach(p=>ctx.lineTo(p.x,p.y))
       if(sec.closed) ctx.closePath()
@@ -499,45 +567,48 @@ function MeasurementTool({ onGeometryChange }) {
       if(sec.closed){ctx.fillStyle=col+"2a";ctx.fill()}
       ctx.setLineDash([])
       sec.pts.forEach((p,i)=>{
-        ctx.fillStyle=i===0?col:"#fff"; ctx.beginPath(); ctx.arc(p.x,p.y,i===0?5:3,0,Math.PI*2); ctx.fill()
-        ctx.strokeStyle=col; ctx.lineWidth=1.5; ctx.beginPath(); ctx.arc(p.x,p.y,i===0?5:3,0,Math.PI*2); ctx.stroke()
+        ctx.fillStyle=i===0?col:"#fff"; ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?5:3),0,Math.PI*2); ctx.fill()
+        ctx.strokeStyle=editMode?"#fff88f":col; ctx.lineWidth=lw(editMode?2.5:1.5); ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?5:3),0,Math.PI*2); ctx.stroke()
       })
       if(sec.closed){
         const cx=sec.pts.reduce((a,p)=>a+p.x,0)/sec.pts.length
         const cy=sec.pts.reduce((a,p)=>a+p.y,0)/sec.pts.length
         ctx.fillStyle="rgba(0,0,0,0.6)"; ctx.beginPath()
-        ctx.roundRect&&ctx.roundRect(cx-36,cy-14,72,28,4); ctx.fill()
-        ctx.fillStyle="#fff"; ctx.font="bold 11px DM Sans"; ctx.textAlign="center"
-        ctx.fillText(sec.name||`Sec ${idx+1}`,cx,cy-2)
+        ctx.roundRect&&ctx.roundRect(cx-lw(36),cy-lw(14),lw(72),lw(28),lw(4)); ctx.fill()
+        ctx.fillStyle="#fff"; ctx.font=`bold ${11/view.zoom}px DM Sans`; ctx.textAlign="center"
+        ctx.fillText(sec.name||`Sec ${idx+1}`,cx,cy-lw(2))
         const gs=geometry.sections[idx]
-        if(gs?.surface_m2){ctx.font="9px DM Sans";ctx.fillStyle=col;ctx.fillText(gs.surface_m2+" m²",cx,cy+12)}
+        if(gs?.surface_m2){ctx.font=`${9/view.zoom}px DM Sans`;ctx.fillStyle=col;ctx.fillText(gs.surface_m2+" m²",cx,cy+lw(12))}
       }
     })
 
     if(activeTool==="section"&&drawPts.length>0){
       const col=SEC_COLORS[sections.length%SEC_COLORS.length]
-      ctx.strokeStyle=col; ctx.lineWidth=2; ctx.setLineDash([6,3])
+      ctx.strokeStyle=col; ctx.lineWidth=lw(2); ctx.setLineDash([lw(6),lw(3)])
       ctx.beginPath(); ctx.moveTo(drawPts[0].x,drawPts[0].y)
       drawPts.forEach(p=>ctx.lineTo(p.x,p.y))
       if(hoverPt) ctx.lineTo(hoverPt.x,hoverPt.y)
       ctx.stroke(); ctx.setLineDash([])
       drawPts.forEach((p,i)=>{
-        ctx.fillStyle=i===0?col:"#fff"; ctx.beginPath(); ctx.arc(p.x,p.y,i===0?6:3.5,0,Math.PI*2); ctx.fill()
-        if(i===0){ctx.strokeStyle="#fff88f";ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(p.x,p.y,10,0,Math.PI*2);ctx.stroke()}
+        ctx.fillStyle=i===0?col:"#fff"; ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?6:3.5),0,Math.PI*2); ctx.fill()
+        if(i===0){ctx.strokeStyle="#fff88f";ctx.lineWidth=lw(1.5);ctx.beginPath();ctx.arc(p.x,p.y,lw(10),0,Math.PI*2);ctx.stroke()}
       })
     }
 
     lineItems.forEach(li=>{
       ctx.strokeStyle=li.type==="flashing"?"#f59e0b":"#06b6d4"
-      ctx.lineWidth=2.5; ctx.setLineDash(li.type==="flashing"?[8,4]:[4,2])
+      ctx.lineWidth=lw(2.5); ctx.setLineDash(li.type==="flashing"?[lw(8),lw(4)]:[lw(4),lw(2)])
       ctx.beginPath(); li.pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y)); ctx.stroke()
       ctx.setLineDash([])
-      li.pts.forEach(p=>{ctx.fillStyle=li.type==="flashing"?"#f59e0b":"#06b6d4";ctx.beginPath();ctx.arc(p.x,p.y,3,0,Math.PI*2);ctx.fill()})
+      li.pts.forEach(p=>{
+        ctx.fillStyle=li.type==="flashing"?"#f59e0b":"#06b6d4";ctx.beginPath();ctx.arc(p.x,p.y,lw(3),0,Math.PI*2);ctx.fill()
+        if(editMode){ ctx.strokeStyle="#fff88f"; ctx.lineWidth=lw(1.5); ctx.beginPath(); ctx.arc(p.x,p.y,lw(5),0,Math.PI*2); ctx.stroke() }
+      })
     })
 
     if((activeTool==="flashing"||activeTool==="gutter")&&drawPts.length>0){
       const col=activeTool==="flashing"?"#f59e0b":"#06b6d4"
-      ctx.strokeStyle=col; ctx.lineWidth=2.5; ctx.setLineDash(activeTool==="flashing"?[8,4]:[4,2])
+      ctx.strokeStyle=col; ctx.lineWidth=lw(2.5); ctx.setLineDash(activeTool==="flashing"?[lw(8),lw(4)]:[lw(4),lw(2)])
       ctx.beginPath(); ctx.moveTo(drawPts[0].x,drawPts[0].y)
       drawPts.forEach(p=>ctx.lineTo(p.x,p.y))
       if(hoverPt) ctx.lineTo(hoverPt.x,hoverPt.y)
@@ -546,68 +617,126 @@ function MeasurementTool({ onGeometryChange }) {
 
     ptItems.forEach(pi=>{
       if(pi.type==="downpipe"){
-        ctx.fillStyle="#0ea5e9"; ctx.strokeStyle="#0284c7"; ctx.lineWidth=1.5
-        ctx.beginPath(); ctx.arc(pi.x,pi.y,8,0,Math.PI*2); ctx.fill(); ctx.stroke()
-        ctx.fillStyle="#fff"; ctx.font="bold 7px DM Sans"; ctx.textAlign="center"; ctx.fillText("DP",pi.x,pi.y+3)
+        ctx.fillStyle="#0ea5e9"; ctx.strokeStyle=editMode?"#fff88f":"#0284c7"; ctx.lineWidth=lw(1.5)
+        ctx.beginPath(); ctx.arc(pi.x,pi.y,lw(8),0,Math.PI*2); ctx.fill(); ctx.stroke()
+        ctx.fillStyle="#fff"; ctx.font=`bold ${7/view.zoom}px DM Sans`; ctx.textAlign="center"; ctx.fillText("DP",pi.x,pi.y+lw(3))
       } else if(pi.type==="drain"){
-        ctx.fillStyle="#6366f1"; ctx.strokeStyle="#4f46e5"; ctx.lineWidth=1.5
-        ctx.beginPath(); ctx.arc(pi.x,pi.y,8,0,Math.PI*2); ctx.fill(); ctx.stroke()
-        ctx.fillStyle="#fff"; ctx.font="bold 7px DM Sans"; ctx.textAlign="center"; ctx.fillText("DR",pi.x,pi.y+3)
+        ctx.fillStyle="#6366f1"; ctx.strokeStyle=editMode?"#fff88f":"#4f46e5"; ctx.lineWidth=lw(1.5)
+        ctx.beginPath(); ctx.arc(pi.x,pi.y,lw(8),0,Math.PI*2); ctx.fill(); ctx.stroke()
+        ctx.fillStyle="#fff"; ctx.font=`bold ${7/view.zoom}px DM Sans`; ctx.textAlign="center"; ctx.fillText("DR",pi.x,pi.y+lw(3))
       } else if(pi.type==="penetration"){
         const col=PEN_COLORS[pi.subtype]||"#8b5cf6"
-        ctx.fillStyle=col; ctx.strokeStyle="#fff"; ctx.lineWidth=1.5
-        ctx.beginPath(); const r=7
+        ctx.fillStyle=col; ctx.strokeStyle=editMode?"#fff88f":"#fff"; ctx.lineWidth=lw(1.5)
+        ctx.beginPath(); const r=lw(7)
         ctx.moveTo(pi.x,pi.y-r);ctx.lineTo(pi.x+r,pi.y);ctx.lineTo(pi.x,pi.y+r);ctx.lineTo(pi.x-r,pi.y)
         ctx.closePath(); ctx.fill(); ctx.stroke()
-        ctx.fillStyle="#fff"; ctx.font="bold 7px DM Sans"; ctx.textAlign="center"
-        ctx.fillText(pi.subtype[0].toUpperCase(),pi.x,pi.y+2.5)
+        ctx.fillStyle="#fff"; ctx.font=`bold ${7/view.zoom}px DM Sans`; ctx.textAlign="center"
+        ctx.fillText(pi.subtype[0].toUpperCase(),pi.x,pi.y+lw(2.5))
       }
     })
 
     if(scaleLine?.p1){
-      ctx.strokeStyle="#10b981"; ctx.lineWidth=2.5; ctx.setLineDash([])
+      ctx.strokeStyle="#10b981"; ctx.lineWidth=lw(2.5); ctx.setLineDash([])
       ctx.beginPath(); ctx.moveTo(scaleLine.p1.x,scaleLine.p1.y)
       const p2=scaleLine.p2||(activeTool==="scale"?hoverPt:null)
       if(p2) ctx.lineTo(p2.x,p2.y)
       ctx.stroke()
-      const tick=p=>{ctx.beginPath();ctx.moveTo(p.x,p.y-8);ctx.lineTo(p.x,p.y+8);ctx.stroke()}
+      const tick=p=>{ctx.beginPath();ctx.moveTo(p.x,p.y-lw(8));ctx.lineTo(p.x,p.y+lw(8));ctx.stroke()}
       tick(scaleLine.p1)
       if(scaleLine.p2){
         tick(scaleLine.p2)
         const mx=(scaleLine.p1.x+scaleLine.p2.x)/2,my=(scaleLine.p1.y+scaleLine.p2.y)/2
         ctx.fillStyle="#10b981"
-        try{ctx.beginPath();ctx.roundRect(mx-22,my-10,44,16,4);ctx.fill()}catch{ctx.fillRect(mx-22,my-10,44,16)}
-        ctx.fillStyle="#fff"; ctx.font="bold 10px DM Sans"; ctx.textAlign="center"
-        ctx.fillText(scaleLine.knownM+"m",mx,my+1)
+        try{ctx.beginPath();ctx.roundRect(mx-lw(22),my-lw(10),lw(44),lw(16),lw(4));ctx.fill()}catch{ctx.fillRect(mx-lw(22),my-lw(10),lw(44),lw(16))}
+        ctx.fillStyle="#fff"; ctx.font=`bold ${10/view.zoom}px DM Sans`; ctx.textAlign="center"
+        ctx.fillText(scaleLine.knownM+"m",mx,my+lw(1))
       }
     }
 
     if(hoverPt&&["downpipe","drain","penetration"].includes(activeTool)){
-      ctx.strokeStyle="rgba(255,255,255,0.35)"; ctx.lineWidth=1; ctx.setLineDash([4,2])
-      ctx.beginPath();ctx.moveTo(hoverPt.x-14,hoverPt.y);ctx.lineTo(hoverPt.x+14,hoverPt.y);ctx.stroke()
-      ctx.beginPath();ctx.moveTo(hoverPt.x,hoverPt.y-14);ctx.lineTo(hoverPt.x,hoverPt.y+14);ctx.stroke()
+      ctx.strokeStyle="rgba(255,255,255,0.35)"; ctx.lineWidth=lw(1); ctx.setLineDash([lw(4),lw(2)])
+      ctx.beginPath();ctx.moveTo(hoverPt.x-lw(14),hoverPt.y);ctx.lineTo(hoverPt.x+lw(14),hoverPt.y);ctx.stroke()
+      ctx.beginPath();ctx.moveTo(hoverPt.x,hoverPt.y-lw(14));ctx.lineTo(hoverPt.x,hoverPt.y+lw(14));ctx.stroke()
       ctx.setLineDash([])
     }
-  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,geometry,imgSrc])
+
+    ctx.restore()
+  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,geometry,imgSrc,view,editMode])
 
   useEffect(()=>{ drawCanvas() },[drawCanvas])
 
-  // getBoundingClientRect() reflects the CSS-rendered size of the canvas
-  // (which is scaled to 100% of .mt-canvas-wrap), so we map the click's
-  // page position into that rendered box, then scale into the canvas's
-  // fixed internal coordinate space (MT_CANVAS_W × MT_CANVAS_H). This
-  // keeps section/line/point placement pixel-accurate at any screen size.
-  const getPt = e=>{
-    const r=canvasRef.current.getBoundingClientRect()
-    const scaleX = MT_CANVAS_W / r.width
-    const scaleY = MT_CANVAS_H / r.height
-    return { x:(e.clientX-r.left)*scaleX, y:(e.clientY-r.top)*scaleY }
+  // ── Hit-testing for editable points ──────────────────────────────────
+  function findHit(pt) {
+    for(const sec of sections){
+      for(let i=0;i<sec.pts.length;i++){
+        if(Math.hypot(sec.pts[i].x-pt.x, sec.pts[i].y-pt.y) <= HIT_RADIUS) return { kind:"section", id:sec.id, idx:i }
+      }
+    }
+    for(const li of lineItems){
+      for(let i=0;i<li.pts.length;i++){
+        if(Math.hypot(li.pts[i].x-pt.x, li.pts[i].y-pt.y) <= HIT_RADIUS) return { kind:"line", id:li.id, idx:i }
+      }
+    }
+    for(const pi of ptItems){
+      if(Math.hypot(pi.x-pt.x, pi.y-pt.y) <= HIT_RADIUS) return { kind:"point", id:pi.id }
+    }
+    if(scaleLine?.p1 && Math.hypot(scaleLine.p1.x-pt.x, scaleLine.p1.y-pt.y) <= HIT_RADIUS) return { kind:"scale", which:"p1" }
+    if(scaleLine?.p2 && Math.hypot(scaleLine.p2.x-pt.x, scaleLine.p2.y-pt.y) <= HIT_RADIUS) return { kind:"scale", which:"p2" }
+    return null
   }
-  function handleMouseMove(e){ setHoverPt(getPt(e)) }
-  function handleMouseLeave(){ setHoverPt(null) }
 
-  function handleClick(e){
-    const pt=getPt(e)
+  function moveHit(hit, pt) {
+    if(hit.kind==="section"){
+      setSections(prev=>prev.map(sec=> sec.id!==hit.id ? sec : { ...sec, pts: sec.pts.map((p,i)=> i===hit.idx ? pt : p) }))
+    } else if(hit.kind==="line"){
+      setLineItems(prev=>prev.map(li=> li.id!==hit.id ? li : { ...li, pts: li.pts.map((p,i)=> i===hit.idx ? pt : p) }))
+    } else if(hit.kind==="point"){
+      setPtItems(prev=>prev.map(pi=> pi.id!==hit.id ? pi : { ...pi, x:pt.x, y:pt.y }))
+    } else if(hit.kind==="scale"){
+      setScaleLine(prev=> prev ? { ...prev, [hit.which]: pt } : prev)
+    }
+  }
+
+  function handleMouseDown(e){
+    if(isPanMode || e.button===1){
+      panRef.current = { startX:e.clientX, startY:e.clientY, startOffX:view.offX, startOffY:view.offY }
+      return
+    }
+    const pt = getWorldPt(e.clientX, e.clientY)
+    const hit = findHit(pt)
+    if(hit){ dragRef.current = hit; return }
+    if(editMode) return // in edit mode, empty-space clicks don't start new geometry
+    handleClick(pt)
+  }
+
+  function handleMouseMove(e){
+    if(panRef.current){
+      const dx = e.clientX - panRef.current.startX
+      const dy = e.clientY - panRef.current.startY
+      const cv = canvasRef.current
+      const r = cv.getBoundingClientRect()
+      const scaleX = MT_CANVAS_W / r.width, scaleY = MT_CANVAS_H / r.height
+      setView(v=>clampView({ ...v, offX: panRef.current.startOffX + dx*scaleX, offY: panRef.current.startOffY + dy*scaleY }))
+      return
+    }
+    const pt = getWorldPt(e.clientX, e.clientY)
+    if(dragRef.current){ moveHit(dragRef.current, pt); return }
+    setHoverPt(pt)
+  }
+  function handleMouseUp(){ panRef.current = null; dragRef.current = null }
+  function handleMouseLeave(){ panRef.current = null; dragRef.current = null; setHoverPt(null) }
+
+  function handleWheel(e){
+    e.preventDefault()
+    const cv = canvasRef.current
+    const r = cv.getBoundingClientRect()
+    const scaleX = MT_CANVAS_W / r.width, scaleY = MT_CANVAS_H / r.height
+    const cvX = (e.clientX - r.left) * scaleX
+    const cvY = (e.clientY - r.top) * scaleY
+    zoomAt(cvX, cvY, e.deltaY < 0 ? 1.15 : 1/1.15)
+  }
+
+  function handleClick(pt){
     if(activeTool==="section"){
       if(drawPts.length>=3){
         const fp=drawPts[0], d=Math.hypot(pt.x-fp.x,pt.y-fp.y)
@@ -647,8 +776,6 @@ function MeasurementTool({ onGeometryChange }) {
     }
   }
 
-
-
   function finishLine(){
     if(drawPts.length>=2) setLineItems(prev=>[...prev,{id:uid(),type:activeTool,pts:drawPts}])
     setDrawPts([])
@@ -657,6 +784,7 @@ function MeasurementTool({ onGeometryChange }) {
   function clearAll(){
     setSections([]); setLineItems([]); setPtItems([])
     setScaleLine(null); setDrawPts([]); setAsbestos(false)
+    resetView()
   }
 
   function loadImage(file){
@@ -668,7 +796,7 @@ function MeasurementTool({ onGeometryChange }) {
     }
     r.readAsDataURL(file)
   }
-  
+
   const TOOLS=[
     {key:"section",    label:"Roof Section",icon:"▲",color:"#3b82f6",hint:"Click to add points · click first point (⭕) to close · right-click to cancel"},
     {key:"flashing",   label:"Flashing",    icon:"⚡",color:"#f59e0b",hint:"Click points to trace · right-click or press Done ✓ to finish"},
@@ -677,9 +805,10 @@ function MeasurementTool({ onGeometryChange }) {
     {key:"drain",      label:"Roof Drain",  icon:"⊙",color:"#6366f1",hint:"Click canvas to place a roof drain (DR) marker"},
     {key:"penetration",label:"Penetration", icon:"◇",color:"#8b5cf6",hint:"Click to place — select type below"},
     {key:"scale",      label:"Set Scale",   icon:"📏",color:"#10b981",hint:"Click two points over a known dimension · right-click to cancel"},
+    {key:"pan",        label:"Pan",         icon:"✋",color:"#64748b",hint:"Drag to pan the image (or hold Space with any tool)"},
   ]
 
-  const tip=TOOLS.find(t=>t.key===activeTool)?.hint||""
+  const tip = isPanMode ? "Drag to pan · release Space to resume drawing" : (TOOLS.find(t=>t.key===activeTool)?.hint||"")
 
   return (
     <div>
@@ -707,12 +836,27 @@ function MeasurementTool({ onGeometryChange }) {
                 <span>{t.icon}</span>{t.label}
               </button>
             ))}
-            <div style={{marginLeft:"auto",display:"flex",gap:5}}>
+            <button
+              onClick={()=>setEditMode(m=>!m)}
+              title="Toggle point editing — drag any existing point to move it"
+              style={{padding:"5px 9px",borderRadius:6,
+                border:`1px solid ${editMode?"#fbbf24":"rgba(255,255,255,0.14)"}`,
+                background:editMode?"#fbbf2428":"transparent",
+                color:editMode?"#fbbf24":"#94a3b8",
+                fontSize:11,fontWeight:editMode?600:400,cursor:"pointer",
+                display:"flex",alignItems:"center",gap:4,fontFamily:"inherit"}}>
+              <span>✎</span>Edit Points
+            </button>
+            <div style={{marginLeft:"auto",display:"flex",gap:5,alignItems:"center"}}>
               {(activeTool==="flashing"||activeTool==="gutter")&&drawPts.length>=2&&(
                 <button onClick={finishLine} style={{padding:"5px 10px",borderRadius:6,border:"1px solid #10b981",background:"#10b981",color:"#fff",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
                   Done ✓
                 </button>
               )}
+              <button onClick={()=>zoomButton(1/1.3)} title="Zoom out" style={{width:26,height:26,borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#94a3b8",fontSize:14,cursor:"pointer",fontFamily:"inherit"}}>−</button>
+              <span style={{fontSize:10,color:"#64748b",width:34,textAlign:"center"}}>{Math.round(view.zoom*100)}%</span>
+              <button onClick={()=>zoomButton(1.3)} title="Zoom in" style={{width:26,height:26,borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#94a3b8",fontSize:14,cursor:"pointer",fontFamily:"inherit"}}>+</button>
+              <button onClick={resetView} title="Reset zoom/pan" style={{padding:"5px 9px",borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#64748b",fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>Reset View</button>
               <button onClick={clearAll} style={{padding:"5px 10px",borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#64748b",fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>
                 Clear All
               </button>
@@ -720,7 +864,7 @@ function MeasurementTool({ onGeometryChange }) {
           </div>
 
           <div style={{padding:"5px 12px",background:"#0f172a",fontSize:11,color:"#475569",display:"flex",alignItems:"center",justifyContent:"space-between",minHeight:28,flexWrap:"wrap",gap:6}}>
-            <span>{tip}</span>
+            <span>{tip}{editMode && !isPanMode ? " · Edit mode: drag any highlighted point" : ""}</span>
             <div style={{display:"flex",alignItems:"center",gap:8}}>
               {activeTool==="penetration"&&(
                 <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
@@ -747,10 +891,13 @@ function MeasurementTool({ onGeometryChange }) {
 
           <div className="mt-canvas-wrap">
             <canvas ref={canvasRef} width={MT_CANVAS_W} height={MT_CANVAS_H}
-              style={{cursor:["section","flashing","gutter","scale"].includes(activeTool)?"crosshair":"cell"}}
-              onClick={handleClick}
-              onContextMenu={handleContextMenu}
-              onMouseMove={handleMouseMove} onMouseLeave={handleMouseLeave}/>
+              style={{cursor:isPanMode?(panRef.current?"grabbing":"grab"):(["section","flashing","gutter","scale"].includes(activeTool)?"crosshair":"cell")}}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              onMouseLeave={handleMouseLeave}
+              onWheel={handleWheel}
+              onContextMenu={handleContextMenu}/>
           </div>
 
           <div style={{padding:"7px 12px",background:"#0f172a",display:"flex",gap:14,alignItems:"center",flexWrap:"wrap"}}>
@@ -1058,6 +1205,12 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
   const [area,      setArea]      = useState(existingProject?.area||null)
   const [estimate,  setEstimate]  = useState(existingProject?.estimate||null)
 
+  // ← Which measurement method is active on the Measure step: 'upload' (draw
+  //   on an uploaded/blank photo), 'live' (open device camera + draw), or
+  //   'ar' (WebXR AR session). Defaults to 'upload' since it's the most
+  //   broadly supported method across devices/browsers.
+  const [measureMethod, setMeasureMethod] = useState("upload")
+
   const STEPS  = ["Customer","Measure","Estimate","Quote & Save"]
   const isEdit = !!existingProject
 
@@ -1092,6 +1245,18 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
 
   const stepNext = () => setStep(n=>n+1)
   const stepBack = () => setStep(n=>n-1)
+
+  // ← Shared handler passed to whichever measurement component is active;
+  //   all three (MeasurementTool, LiveCameraMeasurements, ARCameraMeasurement)
+  //   report geometry with the same total_surface_m2 field, so the wizard
+  //   doesn't need to know which method produced it.
+  const handleGeometryChange = g => setArea(g?.total_surface_m2 || 0)
+
+  const MEASURE_METHODS = [
+    { key:"upload", label:"Upload & draw", icon:"📷", desc:"Upload a photo (or draw on blank canvas), then trace roof sections manually." },
+    { key:"live",   label:"Live camera",   icon:"🎥", desc:"Open your device camera, freeze a frame, adjust it, then trace measurements." },
+    { key:"ar",     label:"AR camera",     icon:"📐", desc:"WebXR AR session — tap real-world points to measure in 3D. Needs an ARCore-capable Android device." },
+  ]
 
   return (
     <div>
@@ -1148,7 +1313,44 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
         </div>
       )}
 
-      {step===1 && <MeasurementTool onGeometryChange={g=>setArea(g.total_surface_m2)}/>}
+      {step===1 && (
+        <div>
+          {/* ← Measurement method picker: switches between the three
+                measurement tools without losing wizard state. Switching
+                methods clears the previous method's in-progress drawing
+                (each component owns its own internal state), so the area
+                shown resets to whatever the newly active tool reports. */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:16}} className="grid2-responsive">
+            {MEASURE_METHODS.map(m=>(
+              <div key={m.key}
+                onClick={()=>setMeasureMethod(m.key)}
+                style={{
+                  cursor:"pointer",padding:"12px 14px",borderRadius:10,
+                  border: measureMethod===m.key ? "2px solid #f59e0b" : "1px solid #e2e8f0",
+                  background: measureMethod===m.key ? "#fef3c7" : "#fff",
+                  transition:"all .15s",
+                }}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                  <span style={{fontSize:16}}>{m.icon}</span>
+                  <span style={{fontWeight:600,fontSize:13}}>{m.label}</span>
+                </div>
+                <div style={{fontSize:11,color:"#64748b",lineHeight:1.5}}>{m.desc}</div>
+              </div>
+            ))}
+          </div>
+
+          {measureMethod==="upload" && (
+            <MeasurementTool onGeometryChange={handleGeometryChange}/>
+          )}
+          {measureMethod==="live" && (
+            <LiveCameraMeasurements onGeometryChange={handleGeometryChange}/>
+          )}
+          {measureMethod==="ar" && (
+            <ARCameraMeasurement onGeometryChange={handleGeometryChange}/>
+          )}
+        </div>
+      )}
+
       {step===2 && <EstimateEngine initialArea={area||0} onEstimateChange={setEstimate}/>}
 
       {step===3 && (
@@ -2193,6 +2395,7 @@ export default function App() {
           width: 100% !important;
           height: 100% !important;
           display:block;
+          touch-action: none;
         }
         .mt-toolbar { flex-wrap: wrap; }
 
