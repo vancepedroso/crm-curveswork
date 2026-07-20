@@ -14,6 +14,25 @@ CREATE TABLE customers (
     updated_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- ─────────────── JOBS ───────────────
+CREATE TABLE jobs (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    job_number  VARCHAR(60) NOT NULL,
+    notes       TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE job_photos (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_id      UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    filename    VARCHAR(255) NOT NULL,
+    url         TEXT NOT NULL,
+    caption     VARCHAR(255),
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- ─────────────── PROJECTS ───────────────
 CREATE TYPE project_status AS ENUM (
     'New Lead', 'Estimating', 'Quote Sent', 'Won', 'Lost'
@@ -22,6 +41,7 @@ CREATE TYPE project_status AS ENUM (
 CREATE TABLE projects (
     id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    job_id      UUID REFERENCES jobs(id) ON DELETE SET NULL,
     address     TEXT,
     status      project_status DEFAULT 'New Lead',
     area        DECIMAL(10,2) DEFAULT 0,
@@ -29,6 +49,7 @@ CREATE TABLE projects (
     notes       TEXT,
     quote_num   VARCHAR(20),
     quote_date  DATE,
+    is_deleted  BOOLEAN NOT NULL DEFAULT FALSE,
     created_at  DATE DEFAULT CURRENT_DATE,
     updated_at  TIMESTAMPTZ DEFAULT NOW()
 );
@@ -81,6 +102,10 @@ CREATE INDEX idx_projects_customer ON projects(customer_id);
 CREATE INDEX idx_projects_status   ON projects(status);
 CREATE INDEX idx_estimates_project ON estimates(project_id);
 CREATE INDEX idx_geometries_project ON project_geometries(project_id);
+CREATE INDEX idx_jobs_customer ON jobs(customer_id);
+CREATE INDEX idx_job_photos_job ON job_photos(job_id);
+CREATE INDEX idx_projects_job ON projects(job_id);
+CREATE INDEX idx_projects_is_deleted ON projects(is_deleted);
 
 -- ─────────────── UPDATED_AT TRIGGER ───────────────
 CREATE OR REPLACE FUNCTION update_updated_at()
@@ -98,4 +123,6 @@ CREATE TRIGGER trg_projects_updated BEFORE UPDATE ON projects
 CREATE TRIGGER trg_estimates_updated BEFORE UPDATE ON estimates
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 CREATE TRIGGER trg_geometries_updated BEFORE UPDATE ON project_geometries
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER trg_jobs_updated BEFORE UPDATE ON jobs
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();

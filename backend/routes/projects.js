@@ -10,6 +10,7 @@ function serializeProject(row) {
   return {
     id:         row.id,
     customerId: row.customer_id,
+    jobId:      row.job_id,
     address:    row.address,
     status:     row.status,
     area:       parseFloat(row.area)       || 0,
@@ -17,6 +18,7 @@ function serializeProject(row) {
     notes:      row.notes                  || "",
     quoteNum:   row.quote_num              || "",
     quoteDate:  row.quote_date             || "",
+    isDeleted:  row.is_deleted             || false,
     createdAt:  row.created_at
       ? new Date(row.created_at).toISOString().slice(0, 10)
       : "",
@@ -79,7 +81,7 @@ const PROJECT_SELECT = `
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/", async (req, res) => {
   try {
-    const { rows } = await pool.query(PROJECT_SELECT + "ORDER BY p.created_at DESC");
+    const { rows } = await pool.query(PROJECT_SELECT + "WHERE p.is_deleted = FALSE ORDER BY p.created_at DESC");
     res.json(rows.map(serializeProject));
   } catch (err) {
     console.error(err);
@@ -112,7 +114,7 @@ router.post("/", async (req, res) => {
     await client.query("BEGIN");
 
     const {
-      customerId, address, status, area, roofType,
+      customerId, jobId, address, status, area, roofType,
       notes, quoteNum, quoteDate, createdAt, estimate,
     } = req.body;
 
@@ -122,12 +124,12 @@ router.post("/", async (req, res) => {
 
     const { rows: [project] } = await client.query(
       `INSERT INTO projects
-         (customer_id, address, status, area, roof_type, notes,
+         (customer_id, job_id, address, status, area, roof_type, notes,
           quote_num, quote_date, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        RETURNING *`,
       [
-        customerId, address, status || "New Lead", area || 0,
+        customerId, jobId || null, address, status || "New Lead", area || 0,
         roofType || "", notes || "",
         quoteNum  || null,
         quoteDate || null,
@@ -180,18 +182,18 @@ router.put("/:id", async (req, res) => {
     await client.query("BEGIN");
 
     const {
-      customerId, address, status, area,
+      customerId, jobId, address, status, area,
       roofType, notes, quoteNum, quoteDate, estimate,
     } = req.body;
 
     const { rows: [project] } = await client.query(
       `UPDATE projects
-         SET customer_id=$1, address=$2, status=$3, area=$4,
-             roof_type=$5, notes=$6, quote_num=$7, quote_date=$8
-       WHERE id=$9
+         SET customer_id=$1, job_id=$2, address=$3, status=$4, area=$5,
+             roof_type=$6, notes=$7, quote_num=$8, quote_date=$9
+       WHERE id=$10
        RETURNING *`,
       [
-        customerId, address, status, area || 0,
+        customerId, jobId || null, address, status, area || 0,
         roofType || "", notes || "",
         quoteNum  || null,
         quoteDate || null,
@@ -268,12 +270,13 @@ router.patch("/:id/status", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DELETE /projects/:id
+// DELETE /projects/:id — soft delete (flags is_deleted, keeps the row so
+// estimates/quotes/geometry history tied to it aren't lost)
 // ─────────────────────────────────────────────────────────────────────────────
 router.delete("/:id", async (req, res) => {
   try {
     const { rowCount } = await pool.query(
-      "DELETE FROM projects WHERE id = $1", [req.params.id]
+      "UPDATE projects SET is_deleted = TRUE WHERE id = $1", [req.params.id]
     );
     if (!rowCount) return res.status(404).json({ error: "Not found" });
     res.json({ success: true });

@@ -1,10 +1,11 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react"
+import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "react"
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts"
-import { customersApi, projectsApi, usersApi } from "./api"
+import { customersApi, projectsApi, usersApi, photosApi, quotesApi, jobsApi, jobPhotosApi, materialsApi } from "./api"
 import { useAuth } from "./AuthContext"
 import LoginPage   from "./LoginPage"
 import { CurrencyProvider, useCurrency } from "./CurrencyContext"
-import ARCameraMeasurement from "./ARCamera/ARCameraMeasurment";
+import jsPDF from "jspdf"
+import html2canvas from "html2canvas"
 import LiveCameraMeasurements from "./LiveCamera/LiveCameraMeasurement";
 
 
@@ -232,6 +233,7 @@ function Sidebar({ view, onNav, projects, user, onLogout }) {
     { key:"pipeline",   label:"Pipeline",    icon:"▦", badge:pending||null },
     { key:"projects",   label:"Projects",    icon:"📁" },
     { key:"customers",  label:"Customers",   icon:"👤" },
+    { key:"jobs",       label:"Jobs",        icon:"🧰" },
     null,
     { key:"users",      label:"Users",       icon:"🔑" },
     { key:"settings",   label:"Settings",    icon:"⚙" },
@@ -285,9 +287,11 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
     const won      = projects.filter(p=>p.status==="Won")
     const sent     = projects.filter(p=>p.status==="Quote Sent")
     const leads    = projects.filter(p=>p.status==="New Lead")
+    const pending  = projects.filter(p=>p.status==="Estimating" || p.status==="Quote Sent")
     const revenue  = won.reduce((a,p)=>a+(p.estimate?.total||0),0)
     const pipeline = sent.reduce((a,p)=>a+(p.estimate?.total||0),0)
-    return { leads:leads.length, sent:sent.length, won:won.length, revenue, pipeline, total:projects.length }
+    const pendingValue = pending.reduce((a,p)=>a+(p.estimate?.total||0),0)
+    return { leads:leads.length, sent:sent.length, won:won.length, pending:pending.length, pendingValue, revenue, pipeline, total:projects.length }
   },[projects])
 
   const chartData = STATUSES.map(st=>({
@@ -303,10 +307,10 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
     <div>
       <div style={s.grid4} className="grid4-responsive">
         {[
-          { label:"Total Projects", val:stats.total,        sub:`${stats.leads} new leads`,                                                 bg:"#dbeafe", color:"#1e40af" },
+          { label:"Total Leads",    val:stats.leads,        sub:`${stats.total} total projects`,                                             bg:"#dbeafe", color:"#1e40af" },
           { label:"Quotes Sent",    val:stats.sent,         sub:fmt(stats.pipeline)+" in pipeline",                                         bg:"#fef3c7", color:"#92400e" },
-          { label:"Jobs Won",       val:stats.won,          sub:`${stats.total?Math.round(stats.won/stats.total*100):0}% conversion`,        bg:"#d1fae5", color:"#065f46" },
-          { label:"Revenue (Won)",  val:fmt(stats.revenue), sub:"All time total",                                                            bg:"#ede9fe", color:"#5b21b6" },
+          { label:"Projects Won",   val:stats.won,          sub:`${stats.total?Math.round(stats.won/stats.total*100):0}% conversion`,        bg:"#d1fae5", color:"#065f46" },
+          { label:"Pending Quotes", val:stats.pending,      sub:fmt(stats.pendingValue)+" pending value",                                    bg:"#ede9fe", color:"#5b21b6" },
         ].map(c=>(
           <div key={c.label} style={s.card}>
             <div style={{fontSize:11,color:"#64748b",textTransform:"uppercase",letterSpacing:.5,marginBottom:8}}>{c.label}</div>
@@ -425,7 +429,7 @@ const MIN_ZOOM = 1
 const MAX_ZOOM = 6
 const HIT_RADIUS = 9 // world-space px for grabbing an existing point
 
-function MeasurementTool({ onGeometryChange }) {
+function MeasurementTool({ onGeometryChange, photoUrl }) {
   const canvasRef   = useRef(null)
   const imgRef      = useRef(null)
   const [imgSrc,    setImgSrc]    = useState(null)
@@ -453,8 +457,8 @@ function MeasurementTool({ onGeometryChange }) {
   const mPerPx = useMemo(()=>{
     if(!scaleLine?.p1||!scaleLine?.p2) return null
     const px=Math.sqrt((scaleLine.p2.x-scaleLine.p1.x)**2+(scaleLine.p2.y-scaleLine.p1.y)**2)
-    return px>0 ? scaleLine.knownM/px : null
-  },[scaleLine])
+    return px>0 ? knownM/px : null
+  },[scaleLine, knownM])
 
   const geometry = useMemo(()=>{
     const sf = mPerPx || 0.05
@@ -649,7 +653,7 @@ function MeasurementTool({ onGeometryChange }) {
         ctx.fillStyle="#10b981"
         try{ctx.beginPath();ctx.roundRect(mx-lw(22),my-lw(10),lw(44),lw(16),lw(4));ctx.fill()}catch{ctx.fillRect(mx-lw(22),my-lw(10),lw(44),lw(16))}
         ctx.fillStyle="#fff"; ctx.font=`bold ${10/view.zoom}px DM Sans`; ctx.textAlign="center"
-        ctx.fillText(scaleLine.knownM+"m",mx,my+lw(1))
+        ctx.fillText(knownM+"m",mx,my+lw(1))
       }
     }
 
@@ -661,7 +665,7 @@ function MeasurementTool({ onGeometryChange }) {
     }
 
     ctx.restore()
-  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,geometry,imgSrc,view,editMode])
+  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,knownM,geometry,imgSrc,view,editMode])
 
   useEffect(()=>{ drawCanvas() },[drawCanvas])
 
@@ -752,8 +756,12 @@ function MeasurementTool({ onGeometryChange }) {
     else if(activeTool==="drain")       { setPtItems(prev=>[...prev,{id:uid(),type:"drain",      x:pt.x,y:pt.y}]) }
     else if(activeTool==="penetration") { setPtItems(prev=>[...prev,{id:uid(),type:"penetration",subtype:penSub,x:pt.x,y:pt.y}]) }
     else if(activeTool==="scale"){
-      if(!scaleLine?.p1)       setScaleLine({p1:pt,p2:null,knownM})
-      else if(!scaleLine?.p2){ setScaleLine(prev=>({...prev,p2:pt})); setActiveTool("section") }
+      if(!scaleLine?.p1)       setScaleLine({p1:pt,p2:null})
+      else if(!scaleLine?.p2){ setScaleLine(prev=>({...prev,p2:pt})) }
+      // ← stays on the Scale tool after both points are placed (rather than
+      //   auto-jumping to Roof Section) so the "Known length" input remains
+      //   visible and editable — otherwise it's easy to draw the line before
+      //   correcting the default 10m and never get a chance to fix it.
     }
   }
 
@@ -796,6 +804,18 @@ function MeasurementTool({ onGeometryChange }) {
     }
     r.readAsDataURL(file)
   }
+
+  // ← Loads a photo picked from a job's photo library directly by URL
+  //   (instead of a local file), so it can be traced the same way as an
+  //   uploaded image.
+  useEffect(()=>{
+    if(!photoUrl) return
+    const img = new Image()
+    img.crossOrigin = "anonymous"
+    img.onload = () => { imgRef.current = img; drawCanvas() }
+    img.src = photoUrl
+    setImgSrc(photoUrl)
+  },[photoUrl])
 
   const TOOLS=[
     {key:"section",    label:"Roof Section",icon:"▲",color:"#3b82f6",hint:"Click to add points · click first point (⭕) to close · right-click to cancel"},
@@ -878,12 +898,14 @@ function MeasurementTool({ onGeometryChange }) {
                   ))}
                 </div>
               )}
-              {activeTool==="scale"&&!scaleLine?.p2&&(
+              {activeTool==="scale"&&(
                 <div style={{display:"flex",alignItems:"center",gap:5}}>
                   <span style={{color:"#64748b",fontSize:10}}>Known length:</span>
-                  <input type="number" value={knownM} onChange={e=>setKnownM(parseFloat(e.target.value)||10)}
-                    style={{width:46,padding:"1px 5px",background:"rgba(255,255,255,0.1)",border:"1px solid rgba(255,255,255,0.2)",borderRadius:4,color:"#fff",fontSize:11}}/>
-                  <span style={{color:"#64748b",fontSize:10}}>m</span>
+                  <input type="number" min="0.01" step="0.01" value={knownM}
+                    onChange={e=>setKnownM(e.target.value===""?"":parseFloat(e.target.value))}
+                    onBlur={()=>{ if(!knownM || knownM<=0) setKnownM(10) }}
+                    style={{width:56,padding:"2px 6px",background:"rgba(255,255,255,0.12)",border:"1px solid rgba(16,185,129,0.5)",borderRadius:4,color:"#fff",fontSize:11,fontWeight:600}}/>
+                  <span style={{color:"#64748b",fontSize:10}}>m — enter the actual measured distance</span>
                 </div>
               )}
             </div>
@@ -998,6 +1020,131 @@ function MeasurementTool({ onGeometryChange }) {
 
 
 // ─────────────────────────── ESTIMATE ENGINE ───────────────────────────
+// ─── Searchable combobox over the supplier material price catalog ───────────
+// Debounces server-side search (min 2 chars) instead of shipping the whole
+// multi-thousand-row catalog to the client.
+function MaterialPicker({ value, onSelect }) {
+  const [query,   setQuery]   = useState(value || "")
+  const [results, setResults] = useState([])
+  const [open,    setOpen]    = useState(false)
+  const [loading, setLoading] = useState(false)
+  const debounceRef = useRef(null)
+  const boxRef = useRef(null)
+
+  // ── Cascading Supplier → Type → Material dropdowns ──────────────────
+  const [suppliers,       setSuppliers]       = useState([])
+  const [types,           setTypes]           = useState([])
+  const [byTypeMaterials, setByTypeMaterials] = useState([])
+  const [supplier,        setSupplier]        = useState("")
+  const [type,            setType]            = useState("")
+  const [materialId,      setMaterialId]      = useState("")
+
+  useEffect(()=>{ materialsApi.getSuppliers().then(setSuppliers).catch(()=>setSuppliers([])) },[])
+
+  useEffect(()=>{
+    setType(""); setMaterialId(""); setByTypeMaterials([])
+    if(!supplier){ setTypes([]); return }
+    materialsApi.getTypes(supplier).then(setTypes).catch(()=>setTypes([]))
+  },[supplier])
+
+  useEffect(()=>{
+    setMaterialId("")
+    if(!supplier || !type){ setByTypeMaterials([]); return }
+    materialsApi.getByType(supplier, type).then(setByTypeMaterials).catch(()=>setByTypeMaterials([]))
+  },[supplier, type])
+
+  function pickFromDropdown(id) {
+    setMaterialId(id)
+    const m = byTypeMaterials.find(x=>x.id===id)
+    if(m) pick(m)
+  }
+
+  useEffect(()=>{ setQuery(value || "") },[value])
+
+  useEffect(()=>{
+    function onDocClick(e){ if(boxRef.current && !boxRef.current.contains(e.target)) setOpen(false) }
+    document.addEventListener("mousedown", onDocClick)
+    return ()=>document.removeEventListener("mousedown", onDocClick)
+  },[])
+
+  function handleChange(v) {
+    setQuery(v)
+    setOpen(true)
+    clearTimeout(debounceRef.current)
+    if(v.trim().length < 2){ setResults([]); return }
+    setLoading(true)
+    debounceRef.current = setTimeout(()=>{
+      materialsApi.search(v.trim())
+        .then(rows=>setResults(rows))
+        .catch(()=>setResults([]))
+        .finally(()=>setLoading(false))
+    }, 300)
+  }
+
+  function pick(m) {
+    const label = m.supplier ? `${m.supplier} — ${m.description}` : m.description
+    const rate  = m.rateM2 ?? (m.rateLm && m.coverWidth ? m.rateLm / (m.coverWidth/1000) : 0)
+    onSelect({ label, rate: parseFloat(rate.toFixed(2)) })
+    setQuery(label)
+    setOpen(false)
+  }
+
+  return (
+    <div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}} className="grid2-responsive">
+        <select style={s.input} value={supplier} onChange={ev=>setSupplier(ev.target.value)}>
+          <option value="">— Supplier —</option>
+          {suppliers.map(sup=><option key={sup} value={sup}>{sup}</option>)}
+        </select>
+        <select style={s.input} value={type} onChange={ev=>setType(ev.target.value)} disabled={!supplier}>
+          <option value="">{supplier?"— Type —":"Pick a supplier first"}</option>
+          {types.map(t=><option key={t} value={t}>{t}</option>)}
+        </select>
+        <select style={s.input} value={materialId} onChange={ev=>pickFromDropdown(ev.target.value)} disabled={!type}>
+          <option value="">{type?"— Material —":"Pick a type first"}</option>
+          {byTypeMaterials.map(m=>
+            <option key={m.id} value={m.id}>
+              {m.description}{m.rateM2?` — $${m.rateM2.toFixed(2)}/m²`:m.rateLm?` — $${m.rateLm.toFixed(2)}/lm`:""}
+            </option>
+          )}
+        </select>
+      </div>
+      <div style={{fontSize:11,color:"#94a3b8",margin:"2px 0 8px"}}>or search by keyword instead:</div>
+      <div ref={boxRef} style={{position:"relative"}}>
+      <input
+        style={s.input}
+        value={query}
+        placeholder="Search supplier catalog — e.g. Dimond corrugate, Metalcraft flashing…"
+        onChange={e=>handleChange(e.target.value)}
+        onFocus={()=>setOpen(true)}
+      />
+      {open && (query.trim().length>=2) && (
+        <div style={{position:"absolute",top:"100%",left:0,right:0,zIndex:20,background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,marginTop:4,maxHeight:280,overflowY:"auto",boxShadow:"0 8px 24px rgba(0,0,0,0.12)"}}>
+          {loading && <div style={{padding:"10px 14px",fontSize:12,color:"#94a3b8"}}>Searching…</div>}
+          {!loading && results.length===0 && <div style={{padding:"10px 14px",fontSize:12,color:"#94a3b8"}}>No matches in supplier catalog</div>}
+          {!loading && results.map(m=>(
+            <div key={m.id} onClick={()=>pick(m)}
+              style={{padding:"9px 14px",cursor:"pointer",borderBottom:"1px solid #f1f5f9"}}
+              onMouseEnter={e=>e.currentTarget.style.background="#f8fafc"}
+              onMouseLeave={e=>e.currentTarget.style.background="#fff"}>
+              <div style={{fontSize:12,fontWeight:600,color:"#0f172a"}}>{m.description}</div>
+              <div style={{fontSize:11,color:"#64748b",marginTop:2}}>
+                {m.supplier && <span>{m.supplier} · </span>}
+                {m.coating && <span>{m.coating} · </span>}
+                {m.sku && <span>{m.sku} · </span>}
+                <span style={{color:"#f59e0b",fontWeight:600}}>
+                  {m.rateM2 ? `$${m.rateM2.toFixed(2)}/m²` : m.rateLm ? `$${m.rateLm.toFixed(2)}/lm` : "no rate"}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      </div>
+    </div>
+  )
+}
+
 function EstimateEngine({ initialArea, onEstimateChange }) {
   const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
 
@@ -1038,13 +1185,23 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
         <div style={{...s.card,marginBottom:14}}>
           <div style={{fontWeight:700,marginBottom:14}}>Materials</div>
           <FG label="Material Type">
-            <select style={s.input} onChange={ev=>{
-              const m=MATERIALS.find(x=>x.label===ev.target.value)
-              if(m) setE(prev=>({...prev,materialLabel:m.label,materialRate:m.rate}))
-            }} value={e.materialLabel}>
-              {MATERIALS.map(m=><option key={m.label} value={m.label}>{m.label} — ${m.rate}/m²</option>)}
-            </select>
+            <MaterialPicker
+              value={e.materialLabel}
+              onSelect={({label,rate})=>setE(prev=>({...prev,materialLabel:label,materialRate:rate}))}
+            />
           </FG>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <FG label="Material Rate ($/m²)"><input style={s.input} type="number" value={e.materialRate} onChange={ev=>upd("materialRate")(ev.target.value)}/></FG>
+            <FG label="Or pick from the 5 common defaults">
+              <select style={s.input} onChange={ev=>{
+                const m=MATERIALS.find(x=>x.label===ev.target.value)
+                if(m) setE(prev=>({...prev,materialLabel:m.label,materialRate:m.rate}))
+              }} value="">
+                <option value="">— quick pick —</option>
+                {MATERIALS.map(m=><option key={m.label} value={m.label}>{m.label} — ${m.rate}/m²</option>)}
+              </select>
+            </FG>
+          </div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
             <FG label={`Flashings (m) @ $${RATES.flashings}/m`}><input style={s.input} type="number" value={e.flashings} onChange={ev=>upd("flashings")(ev.target.value)}/></FG>
             <FG label={`Guttering (m) @ $${RATES.guttering}/m`}><input style={s.input} type="number" value={e.guttering} onChange={ev=>upd("guttering")(ev.target.value)}/></FG>
@@ -1093,6 +1250,62 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
 }
 
 // ─────────────────────────── QUOTE VIEW ───────────────────────────
+// Renders the on-screen quote node to a canvas and paginates it into an
+// A4 PDF — real file download, not a browser print dialog.
+async function downloadQuotePdf(node, filename) {
+  const canvas = await html2canvas(node, { scale: 2, useCORS: true, backgroundColor: "#ffffff" })
+  const imgData = canvas.toDataURL("image/png")
+
+  const pdf = new jsPDF({ unit: "mm", format: "a4" })
+  const pageW = pdf.internal.pageSize.getWidth()
+  const pageH = pdf.internal.pageSize.getHeight()
+  const imgH  = (canvas.height * pageW) / canvas.width
+
+  let heightLeft = imgH
+  let y = 0
+  pdf.addImage(imgData, "PNG", 0, y, pageW, imgH)
+  heightLeft -= pageH
+
+  while (heightLeft > 0) {
+    y = heightLeft - imgH
+    pdf.addPage()
+    pdf.addImage(imgData, "PNG", 0, y, pageW, imgH)
+    heightLeft -= pageH
+  }
+
+  pdf.save(filename)
+}
+
+function QuotePrintView({ project, customer, company, setView }) {
+  const contentRef = useRef(null)
+  const [downloading, setDownloading] = useState(false)
+
+  async function handleDownload() {
+    if (!contentRef.current) return
+    setDownloading(true)
+    try {
+      await downloadQuotePdf(contentRef.current, `Quote-${project.quoteNum || project.id}.pdf`)
+    } catch (err) {
+      console.error("PDF export failed:", err)
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  return (
+    <div>
+      <div className="print-hide" style={{display:"flex",gap:10,marginBottom:20,flexWrap:"wrap"}}>
+        <Btn onClick={()=>setView("project")}>← Back to Project</Btn>
+        <Btn primary onClick={handleDownload}>{downloading ? "Generating…" : "⬇ Download PDF"}</Btn>
+        <Btn onClick={()=>window.print()}>🖨 Print</Btn>
+      </div>
+      <div ref={contentRef} data-quote-content>
+        <QuoteView project={project} customer={customer} company={company}/>
+      </div>
+    </div>
+  )
+}
+
 function QuoteView({ project, customer, company }) {
   const { currency, formatMoney: fmt } = useCurrency()   // ← currency-aware fmt + name
 
@@ -1192,7 +1405,7 @@ function QuoteView({ project, customer, company }) {
 }
 
 // ─────────────────────────── NEW PROJECT WIZARD ───────────────────────────
-function NewProjectWizard({ customers, projects, onSave, onCancel, existingProject, company }) {
+function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existingProject, company }) {
   const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
 
   const [step,    setStep]    = useState(0)
@@ -1204,6 +1417,30 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
   const [isNewCust, setIsNewCust] = useState(false)
   const [area,      setArea]      = useState(existingProject?.area||null)
   const [estimate,  setEstimate]  = useState(existingProject?.estimate||null)
+
+  const [selectedJobId,       setSelectedJobId]       = useState(existingProject?.jobId||"")
+  const [jobPhotos,           setJobPhotos]           = useState([])
+  const [selectedJobPhotos,   setSelectedJobPhotos]   = useState([])
+  const [activeMeasurePhotoUrl, setActiveMeasurePhotoUrl] = useState(null)
+
+  useEffect(()=>{
+    if(!selectedJobId) { setJobPhotos([]); setSelectedJobPhotos([]); return }
+    let cancelled = false
+    jobPhotosApi.getForJob(selectedJobId)
+      .then(rows => { if(!cancelled) setJobPhotos(rows) })
+      .catch(()  => { if(!cancelled) setJobPhotos([]) })
+    return () => { cancelled = true }
+  }, [selectedJobId])
+
+  const togglePhoto = id => setSelectedJobPhotos(prev =>
+    prev.includes(id) ? prev.filter(p=>p!==id) : [...prev, id]
+  )
+
+  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
+  function pickMeasurePhoto(ph) {
+    togglePhoto(ph.id)
+    setActiveMeasurePhotoUrl(`${API_ORIGIN}${ph.url}`)
+  }
 
   // ← Which measurement method is active on the Measure step: 'upload' (draw
   //   on an uploaded/blank photo), 'live' (open device camera + draw), or
@@ -1226,6 +1463,8 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
       ...form,
       id: existingProject?.id || uid(),
       customerId: cid,
+      jobId: selectedJobId || null,
+      jobPhotoIds: selectedJobPhotos,
       area: area||0,
       estimate,
       quoteNum:  existingProject?.quoteNum  || (estimate ? nextQuoteNum(projects) : ""),
@@ -1239,7 +1478,7 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
   const upd = k => v => setForm(prev=>({...prev,[k]:v}))
 
   const canNext = [
-    isNewCust ? newCust.name && newCust.phone : form.customerId,
+    (isNewCust ? newCust.name && newCust.phone : form.customerId) && form.address.trim(),
     true, true, true,
   ]
 
@@ -1252,11 +1491,28 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
   //   doesn't need to know which method produced it.
   const handleGeometryChange = g => setArea(g?.total_surface_m2 || 0)
 
+  // ← Live camera only makes sense on a device with a built-in/rear camera
+  //   the user is holding up to the roof — laptops/desktops have front-facing
+  //   webcams at best, so the option is hidden there and only offered on
+  //   phones/tablets (iOS reports iPad as "Macintosh" post-iPadOS 13, so touch
+  //   support is checked as a fallback for that case).
+  const isMobileOrTablet = useMemo(() => {
+    const ua = navigator.userAgent
+    if (/Mobi|Android|iPhone|iPad|iPod/i.test(ua)) return true
+    return /Macintosh/i.test(ua) && navigator.maxTouchPoints > 1
+  }, [])
+
   const MEASURE_METHODS = [
     { key:"upload", label:"Upload & draw", icon:"📷", desc:"Upload a photo (or draw on blank canvas), then trace roof sections manually." },
-    { key:"live",   label:"Live camera",   icon:"🎥", desc:"Open your device camera, freeze a frame, adjust it, then trace measurements." },
-    { key:"ar",     label:"AR camera",     icon:"📐", desc:"WebXR AR session — tap real-world points to measure in 3D. Needs an ARCore-capable Android device." },
+    ...(isMobileOrTablet ? [
+      { key:"live",   label:"Live camera",   icon:"🎥", desc:"Open your device camera, freeze a frame, adjust it, then trace measurements." },
+    ] : []),
+    { key:"ar",     label:"AR camera",     icon:"📐", desc:"Coming soon — WebXR AR measuring is in development.", disabled:true },
   ]
+
+  useEffect(()=>{
+    if(measureMethod==="live" && !isMobileOrTablet) setMeasureMethod("upload")
+  },[measureMethod, isMobileOrTablet])
 
   return (
     <div>
@@ -1281,12 +1537,24 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
             <Btn onClick={()=>setIsNewCust(true)}  style={{border:isNewCust?"2px solid #f59e0b":"1px solid #e2e8f0",background:isNewCust?"#fef3c7":""}}>+ New Customer</Btn>
           </div>
           {!isNewCust ? (
-            <FG label="Select Customer">
-              <select style={s.input} value={form.customerId} onChange={e=>upd("customerId")(e.target.value)}>
-                <option value="">— Choose customer —</option>
-                {customers.map(c=><option key={c.id} value={c.id}>{c.name} · {c.phone}</option>)}
-              </select>
-            </FG>
+            <>
+              <FG label="Select Customer">
+                <select style={s.input} value={form.customerId} onChange={e=>{ upd("customerId")(e.target.value); setSelectedJobId(""); }}>
+                  <option value="">— Choose customer —</option>
+                  {customers.map(c=><option key={c.id} value={c.id}>{c.name} · {c.phone}</option>)}
+                </select>
+              </FG>
+              {form.customerId && (
+                <FG label="Job (optional)">
+                  <select style={s.input} value={selectedJobId} onChange={e=>setSelectedJobId(e.target.value)}>
+                    <option value="">— No job —</option>
+                    {jobs.filter(j=>j.customerId===form.customerId).map(j=>
+                      <option key={j.id} value={j.id}>{j.jobNumber}</option>
+                    )}
+                  </select>
+                </FG>
+              )}
+            </>
           ):(
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
               <FG label="Full Name"><input style={s.input} value={newCust.name}    onChange={e=>setNewCust(p=>({...p,name:e.target.value}))}    placeholder="Sarah Thompson"/></FG>
@@ -1315,21 +1583,49 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
 
       {step===1 && (
         <div>
+          {selectedJobId && (
+            <div style={{marginBottom:16}}>
+              <FG label="Select a photo from the job library to measure on">
+                {jobPhotos.length===0 ? (
+                  <div style={{fontSize:12,color:"#94a3b8"}}>No photos in this job yet.</div>
+                ) : (
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(80px,1fr))",gap:8}}>
+                    {jobPhotos.map(ph=>{
+                      const picked = selectedJobPhotos.includes(ph.id)
+                      return (
+                        <div key={ph.id} onClick={()=>pickMeasurePhoto(ph)}
+                          style={{position:"relative",aspectRatio:"1",borderRadius:8,overflow:"hidden",cursor:"pointer",
+                            border: picked ? "3px solid #f59e0b" : "1px solid #e2e8f0"}}>
+                          <img src={`${API_ORIGIN}${ph.url}`} alt="Job" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
+                          {picked && <div style={{position:"absolute",top:4,right:4,width:18,height:18,borderRadius:"50%",background:"#f59e0b",color:"#000",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center"}}>✓</div>}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </FG>
+            </div>
+          )}
           {/* ← Measurement method picker: switches between the three
                 measurement tools without losing wizard state. Switching
                 methods clears the previous method's in-progress drawing
                 (each component owns its own internal state), so the area
                 shown resets to whatever the newly active tool reports. */}
-          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:16}} className="grid2-responsive">
+          <div style={{display:"grid",gridTemplateColumns:`repeat(${MEASURE_METHODS.length},1fr)`,gap:10,marginBottom:16}} className="grid2-responsive">
             {MEASURE_METHODS.map(m=>(
               <div key={m.key}
-                onClick={()=>setMeasureMethod(m.key)}
+                onClick={()=>{ if(!m.disabled) setMeasureMethod(m.key) }}
                 style={{
-                  cursor:"pointer",padding:"12px 14px",borderRadius:10,
+                  cursor: m.disabled ? "not-allowed" : "pointer",padding:"12px 14px",borderRadius:10,
                   border: measureMethod===m.key ? "2px solid #f59e0b" : "1px solid #e2e8f0",
                   background: measureMethod===m.key ? "#fef3c7" : "#fff",
+                  opacity: m.disabled ? 0.55 : 1,
                   transition:"all .15s",
+                  position:"relative",
                 }}>
+                {m.disabled && (
+                  <span style={{position:"absolute",top:8,right:8,fontSize:9,fontWeight:700,color:"#92400e",background:"#fef3c7",border:"1px solid #f59e0b",borderRadius:999,padding:"2px 7px"}}>SOON</span>
+                )}
                 <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
                   <span style={{fontSize:16}}>{m.icon}</span>
                   <span style={{fontWeight:600,fontSize:13}}>{m.label}</span>
@@ -1340,13 +1636,17 @@ function NewProjectWizard({ customers, projects, onSave, onCancel, existingProje
           </div>
 
           {measureMethod==="upload" && (
-            <MeasurementTool onGeometryChange={handleGeometryChange}/>
+            <MeasurementTool onGeometryChange={handleGeometryChange} photoUrl={activeMeasurePhotoUrl}/>
           )}
           {measureMethod==="live" && (
             <LiveCameraMeasurements onGeometryChange={handleGeometryChange}/>
           )}
           {measureMethod==="ar" && (
-            <ARCameraMeasurement onGeometryChange={handleGeometryChange}/>
+            <div style={{padding:"48px 20px",textAlign:"center",border:"1px dashed #e2e8f0",borderRadius:10,color:"#64748b"}}>
+              <div style={{fontSize:32,marginBottom:10}}>📐</div>
+              <div style={{fontWeight:600,fontSize:14,marginBottom:4,color:"#0f172a"}}>AR Camera — Coming Soon</div>
+              <div style={{fontSize:12}}>WebXR AR measuring is currently in development. Use Upload &amp; draw or Live camera for now.</div>
+            </div>
           )}
         </div>
       )}
@@ -1516,12 +1816,20 @@ function Pipeline({ projects, customers, setProjects, setView, setSelectedProjec
 }
 
 // ─────────────────────────── PROJECTS LIST ───────────────────────────
-function ProjectsList({ projects, customers, setView, setSelectedProject }) {
+function ProjectsList({ projects, customers, setProjects, setView, setSelectedProject }) {
   const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
 
   const [search,       setSearch]       = useState("")
   const [filterStatus, setFilterStatus] = useState("All")
   const getCustomer = id => customers.find(c=>c.id===id)
+
+  async function del(id) {
+    if(!window.confirm("Delete this project? It can be restored from the database if needed.")) return
+    try {
+      await projectsApi.delete(id)
+      setProjects(prev=>prev.filter(p=>p.id!==id))
+    } catch(err) { console.error("Failed to delete project:", err) }
+  }
 
   const filtered = projects
     .filter(p=>filterStatus==="All"||p.status===filterStatus)
@@ -1552,7 +1860,7 @@ function ProjectsList({ projects, customers, setView, setSelectedProject }) {
         <div style={{overflowX:"auto"}}>
           <table style={{width:"100%",borderCollapse:"collapse",minWidth:640}}>
             <thead>
-              <tr>{["Customer","Address","Roof Area","Value","Status","Date",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
+              <tr>{["Customer","Address","Roof Area","Value","Status","Date","",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
             </thead>
             <tbody>
               {filtered.map(p=>{
@@ -1566,10 +1874,13 @@ function ProjectsList({ projects, customers, setView, setSelectedProject }) {
                     <td style={s.td}><StatusBadge status={p.status}/></td>
                     <td style={{...s.td,color:"#64748b",fontSize:12}}>{fmtD(p.createdAt)}</td>
                     <td style={s.td}><span style={{color:"#3b82f6",fontSize:12}}>View →</span></td>
+                    <td style={s.td} onClick={e=>e.stopPropagation()}>
+                      <Btn sm danger onClick={()=>del(p.id)}>Delete</Btn>
+                    </td>
                   </tr>
                 )
               })}
-              {filtered.length===0&&<tr><td colSpan={7} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No projects found</td></tr>}
+              {filtered.length===0&&<tr><td colSpan={8} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No projects found</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1579,6 +1890,186 @@ function ProjectsList({ projects, customers, setView, setSelectedProject }) {
 }
 
 // ─────────────────────────── PROJECT DETAIL ───────────────────────────
+// ─────────────────────────── LINKED JOB PHOTOS (read-only) ───────────────────────────
+// Shows the photos from the job this project was created from — no upload
+// dropzone here, since uploading happens on the Jobs page against the
+// shared job library, not per-project.
+function LinkedJobPhotos({ jobId }) {
+  const [photos, setPhotos]   = useState([])
+  const [loading, setLoading] = useState(true)
+  const [lightbox, setLightbox] = useState(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    jobPhotosApi.getForJob(jobId)
+      .then(rows => { if (!cancelled) setPhotos(rows) })
+      .catch(()  => { if (!cancelled) setPhotos([]) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [jobId])
+
+  if (loading || photos.length===0) return null
+
+  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
+
+  return (
+    <div style={{...s.card, marginTop:14}}>
+      <div style={{fontWeight:700,marginBottom:14}}>Photos <span style={{color:"#94a3b8",fontWeight:400}}>({photos.length})</span></div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(90px,1fr))",gap:8}}>
+        {photos.map(ph=>(
+          <div key={ph.id} onClick={()=>setLightbox(`${API_ORIGIN}${ph.url}`)}
+            style={{aspectRatio:"1",borderRadius:8,overflow:"hidden",border:"1px solid #e2e8f0",cursor:"pointer"}}>
+            <img src={`${API_ORIGIN}${ph.url}`} alt="Job" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
+          </div>
+        ))}
+      </div>
+      {lightbox && (
+        <div onClick={()=>setLightbox(null)} style={{position:"fixed",inset:0,background:"rgba(15,23,42,.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,cursor:"zoom-out"}}>
+          <img src={lightbox} alt="Job full size" style={{maxWidth:"90vw",maxHeight:"90vh",borderRadius:8}}/>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─────────────────────────── PROJECT PHOTOS ───────────────────────────
+// Drag-and-drop gallery for a project's roof photos. Talks straight to the
+// photos API rather than routing through project state, since photos are
+// their own resource (own table, own upload lifecycle).
+function ProjectPhotos({ projectId }) {
+  const [photos, setPhotos]   = useState([])
+  const [loading, setLoading] = useState(true)
+  const [uploading, setUploading] = useState(false)
+  const [dragOver, setDragOver]   = useState(false)
+  const [error, setError]         = useState("")
+  const [lightbox, setLightbox]   = useState(null)
+  const fileInputRef = useRef(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    photosApi.getForProject(projectId)
+      .then(rows => { if (!cancelled) setPhotos(rows) })
+      .catch(err => { if (!cancelled) setError(err.message) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [projectId])
+
+  async function uploadFiles(fileList) {
+    const files = Array.from(fileList || []).filter(f => f.type.startsWith("image/"))
+    if (!files.length) return
+    setUploading(true); setError("")
+    try {
+      const created = await photosApi.upload(projectId, files)
+      setPhotos(prev => [...created, ...prev])
+    } catch (err) {
+      setError(err.message || "Upload failed")
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  async function removePhoto(id) {
+    const prev = photos
+    setPhotos(p => p.filter(ph => ph.id !== id))
+    try { await photosApi.delete(id) }
+    catch (err) { setError(err.message); setPhotos(prev) }
+  }
+
+  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
+
+  return (
+    <div style={{...s.card, marginTop:14}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+        <div style={{fontWeight:700}}>Photos {photos.length>0 && <span style={{color:"#94a3b8",fontWeight:400}}>({photos.length})</span>}</div>
+        {uploading && <span style={{fontSize:11,color:"#f59e0b"}}>Uploading…</span>}
+      </div>
+
+      <div
+        onClick={()=>fileInputRef.current?.click()}
+        onDragOver={e=>{ e.preventDefault(); setDragOver(true) }}
+        onDragLeave={()=>setDragOver(false)}
+        onDrop={e=>{ e.preventDefault(); setDragOver(false); uploadFiles(e.dataTransfer.files) }}
+        style={{
+          border: dragOver ? "2px dashed #f59e0b" : "2px dashed #e2e8f0",
+          background: dragOver ? "#fef3c7" : "#f8fafc",
+          borderRadius:10, padding:"22px 14px", textAlign:"center",
+          cursor:"pointer", transition:"all .15s", marginBottom: photos.length ? 14 : 0,
+        }}>
+        <div style={{fontSize:22,marginBottom:4}}>📷</div>
+        <div style={{fontSize:12,fontWeight:600,color:"#0f172a"}}>Drag & drop roof photos here</div>
+        <div style={{fontSize:11,color:"#64748b",marginTop:2}}>or click to browse — JPG, PNG, WEBP up to 10MB</div>
+        <input
+          ref={fileInputRef} type="file" accept="image/*" multiple
+          style={{display:"none"}}
+          onChange={e=>{ uploadFiles(e.target.files); e.target.value="" }}
+        />
+      </div>
+
+      {error && <div style={{fontSize:12,color:"#991b1b",background:"#fee2e2",borderRadius:8,padding:"8px 12px",marginBottom:10}}>{error}</div>}
+
+      {!loading && photos.length>0 && (
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(90px,1fr))",gap:8}}>
+          {photos.map(ph=>(
+            <div key={ph.id} style={{position:"relative",aspectRatio:"1",borderRadius:8,overflow:"hidden",border:"1px solid #e2e8f0"}}>
+              <img
+                src={`${API_ORIGIN}${ph.url}`} alt="Roof"
+                onClick={()=>setLightbox(`${API_ORIGIN}${ph.url}`)}
+                style={{width:"100%",height:"100%",objectFit:"cover",cursor:"pointer"}}
+              />
+              <button
+                onClick={()=>removePhoto(ph.id)}
+                title="Remove photo"
+                style={{position:"absolute",top:4,right:4,width:20,height:20,borderRadius:"50%",border:"none",background:"rgba(15,23,42,.75)",color:"#fff",fontSize:11,lineHeight:1,cursor:"pointer"}}
+              >✕</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {lightbox && (
+        <div onClick={()=>setLightbox(null)} style={{position:"fixed",inset:0,background:"rgba(15,23,42,.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,cursor:"zoom-out"}}>
+          <img src={lightbox} alt="Roof full size" style={{maxWidth:"90vw",maxHeight:"90vh",borderRadius:8}}/>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─────────────────────────── QUOTE HISTORY ───────────────────────────
+function QuoteHistory({ projectId }) {
+  const { formatMoney } = useCurrency()
+  const [quotes, setQuotes]   = useState([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    quotesApi.getForProject(projectId)
+      .then(rows => { if (!cancelled) setQuotes(rows) })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [projectId])
+
+  if (loading || !quotes.length) return null
+
+  return (
+    <div style={{...s.card, marginTop:14}}>
+      <div style={{fontWeight:700,marginBottom:12}}>Quote History</div>
+      {quotes.map(q=>(
+        <div key={q.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid #f1f5f9",fontSize:12}}>
+          <div>
+            <div style={{fontWeight:600}}>{q.quoteNum}</div>
+            <div style={{color:"#94a3b8"}}>{fmtD(q.quoteDate)}</div>
+          </div>
+          <div style={{fontWeight:600}}>{formatMoney(q.total)}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function ProjectDetail({ project, customers, setProjects, setView, onEdit, company }) {
   const { formatMoney } = useCurrency()   // ← currency-aware formatter
 
@@ -1593,6 +2084,15 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
       await projectsApi.updateStatus(project.id, newStatus)
       setProjects(prev=>prev.map(p=>p.id===project.id?{...p,status:newStatus}:p))
     } catch(err) { console.error("updateStatus failed:", err) }
+  }
+
+  async function del() {
+    if(!window.confirm("Delete this project? It can be restored from the database if needed.")) return
+    try {
+      await projectsApi.delete(project.id)
+      setProjects(prev=>prev.filter(p=>p.id!==project.id))
+      setView("projects")
+    } catch(err) { console.error("Failed to delete project:", err) }
   }
 
   function handlePrint() {
@@ -1701,6 +2201,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
           {STATUSES.map(st=><option key={st}>{st}</option>)}
         </select>
         <Btn primary onClick={onEdit}>✏ Edit Project</Btn>
+        <Btn danger onClick={del}>Delete</Btn>
       </div>
 
       <div style={s.grid2} className="grid2-responsive">
@@ -1717,6 +2218,10 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
               <div style={{marginTop:14,padding:12,background:"#f8fafc",borderRadius:8,fontSize:12,color:"#64748b",lineHeight:1.7}}>📋 {project.notes}</div>
             )}
           </div>
+
+          {project.jobId
+            ? <LinkedJobPhotos jobId={project.jobId}/>
+            : <ProjectPhotos projectId={project.id}/>}
 
           {e&&(
             <div style={{...s.card,marginTop:14}}>
@@ -1766,7 +2271,9 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
             </div>
           )}
 
-          <div style={s.card}>
+          <QuoteHistory projectId={project.id}/>
+
+          <div style={{...s.card, marginTop:14}}>
             <div style={{fontWeight:700,marginBottom:14}}>Timeline</div>
             {[
               { label:"Project Created",    date:project.createdAt,                             color:"#94a3b8" },
@@ -1992,6 +2499,225 @@ function Customers({ customers, setCustomers, projects }) {
   )
 }
 
+// ─────────────────────────── JOB PHOTOS ───────────────────────────
+function JobPhotos({ jobId }) {
+  const [photos, setPhotos]   = useState([])
+  const [loading, setLoading] = useState(true)
+  const [uploading, setUploading] = useState(false)
+  const [dragOver, setDragOver]   = useState(false)
+  const [error, setError]         = useState("")
+  const [lightbox, setLightbox]   = useState(null)
+  const fileInputRef = useRef(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    jobPhotosApi.getForJob(jobId)
+      .then(rows => { if (!cancelled) setPhotos(rows) })
+      .catch(err => { if (!cancelled) setError(err.message) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [jobId])
+
+  async function uploadFiles(fileList) {
+    const files = Array.from(fileList || []).filter(f => f.type.startsWith("image/"))
+    if (!files.length) return
+    setUploading(true); setError("")
+    try {
+      const created = await jobPhotosApi.upload(jobId, files)
+      setPhotos(prev => [...created, ...prev])
+    } catch (err) {
+      setError(err.message || "Upload failed")
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  async function removePhoto(id) {
+    const prev = photos
+    setPhotos(p => p.filter(ph => ph.id !== id))
+    try { await jobPhotosApi.delete(id) }
+    catch (err) { setError(err.message); setPhotos(prev) }
+  }
+
+  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
+
+  return (
+    <div style={{...s.card, marginTop:14}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+        <div style={{fontWeight:700}}>Photos {photos.length>0 && <span style={{color:"#94a3b8",fontWeight:400}}>({photos.length})</span>}</div>
+        {uploading && <span style={{fontSize:11,color:"#f59e0b"}}>Uploading…</span>}
+      </div>
+
+      <div
+        onClick={()=>fileInputRef.current?.click()}
+        onDragOver={e=>{ e.preventDefault(); setDragOver(true) }}
+        onDragLeave={()=>setDragOver(false)}
+        onDrop={e=>{ e.preventDefault(); setDragOver(false); uploadFiles(e.dataTransfer.files) }}
+        style={{
+          border: dragOver ? "2px dashed #f59e0b" : "2px dashed #e2e8f0",
+          background: dragOver ? "#fef3c7" : "#f8fafc",
+          borderRadius:10, padding:"22px 14px", textAlign:"center",
+          cursor:"pointer", transition:"all .15s", marginBottom: photos.length ? 14 : 0,
+        }}>
+        <div style={{fontSize:22,marginBottom:4}}>📷</div>
+        <div style={{fontSize:12,fontWeight:600,color:"#0f172a"}}>Drag & drop job photos here</div>
+        <div style={{fontSize:11,color:"#64748b",marginTop:2}}>or click to browse — JPG, PNG, WEBP up to 10MB</div>
+        <input
+          ref={fileInputRef} type="file" accept="image/*" multiple
+          style={{display:"none"}}
+          onChange={e=>{ uploadFiles(e.target.files); e.target.value="" }}
+        />
+      </div>
+
+      {error && <div style={{fontSize:12,color:"#991b1b",background:"#fee2e2",borderRadius:8,padding:"8px 12px",marginBottom:10}}>{error}</div>}
+
+      {!loading && photos.length>0 && (
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(90px,1fr))",gap:8}}>
+          {photos.map(ph=>(
+            <div key={ph.id} style={{position:"relative",aspectRatio:"1",borderRadius:8,overflow:"hidden",border:"1px solid #e2e8f0"}}>
+              <img
+                src={`${API_ORIGIN}${ph.url}`} alt="Job"
+                onClick={()=>setLightbox(`${API_ORIGIN}${ph.url}`)}
+                style={{width:"100%",height:"100%",objectFit:"cover",cursor:"pointer"}}
+              />
+              <button
+                onClick={()=>removePhoto(ph.id)}
+                title="Remove photo"
+                style={{position:"absolute",top:4,right:4,width:20,height:20,borderRadius:"50%",border:"none",background:"rgba(15,23,42,.75)",color:"#fff",fontSize:11,lineHeight:1,cursor:"pointer"}}
+              >✕</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {lightbox && (
+        <div onClick={()=>setLightbox(null)} style={{position:"fixed",inset:0,background:"rgba(15,23,42,.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,cursor:"zoom-out"}}>
+          <img src={lightbox} alt="Job full size" style={{maxWidth:"90vw",maxHeight:"90vh",borderRadius:8}}/>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─────────────────────────── JOBS ───────────────────────────
+function Jobs({ jobs, setJobs, customers }) {
+  const [search,     setSearch]     = useState("")
+  const [editJob,     setEditJob]   = useState(null)
+  const [showNew,     setShowNew]   = useState(false)
+  const [saving,      setSaving]    = useState(false)
+  const [expandedId,  setExpandedId]= useState(null)
+  const [form,        setForm]      = useState({ customerId:"", jobNumber:"", notes:"" })
+
+  const custName = id => customers.find(c=>c.id===id)?.name || "—"
+
+  const filtered = jobs.filter(j=>{
+    const q = search.toLowerCase()
+    return !q || j.jobNumber.toLowerCase().includes(q) || custName(j.customerId).toLowerCase().includes(q)
+  })
+
+  const upd = k => v => setForm(prev=>({...prev,[k]:v}))
+
+  function openEdit(j){ setForm({customerId:j.customerId, jobNumber:j.jobNumber, notes:j.notes||""}); setEditJob(j); setShowNew(true) }
+  function closeModal(){ setShowNew(false); setEditJob(null); setForm({customerId:"",jobNumber:"",notes:""}) }
+
+  async function save() {
+    if(!form.customerId || !form.jobNumber.trim()) return
+    setSaving(true)
+    try {
+      if(editJob) {
+        const updated = await jobsApi.update(editJob.id, form)
+        setJobs(prev=>prev.map(j=>j.id===editJob.id?updated:j))
+      } else {
+        const created = await jobsApi.create(form)
+        setJobs(prev=>[created, ...prev])
+      }
+      closeModal()
+    } catch(err) {
+      console.error("Failed to save job:", err)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function del(id) {
+    if(!window.confirm("Delete this job? Its photos will be removed too.")) return
+    try {
+      await jobsApi.delete(id)
+      setJobs(prev=>prev.filter(j=>j.id!==id))
+      if(expandedId===id) setExpandedId(null)
+    } catch(err) { console.error("Failed to delete job:", err) }
+  }
+
+  return (
+    <div>
+      <div style={{display:"flex",gap:12,marginBottom:20,flexWrap:"wrap"}}>
+        <input style={{...s.input,width:260}} placeholder="Search jobs..." value={search} onChange={e=>setSearch(e.target.value)}/>
+        <Btn primary onClick={()=>{ setForm({customerId:"",jobNumber:"",notes:""}); setEditJob(null); setShowNew(true) }}>+ New Job</Btn>
+      </div>
+      <div style={{...s.card,padding:0,overflow:"hidden"}}>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",minWidth:560}}>
+            <thead>
+              <tr>{["Customer","Job Number","Notes","Created",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
+            </thead>
+            <tbody>
+              {filtered.map(j=>(
+                <Fragment key={j.id}>
+                  <tr>
+                    <td style={s.td}><span style={{fontWeight:500}}>{custName(j.customerId)}</span></td>
+                    <td style={{...s.td,fontWeight:600}}>{j.jobNumber}</td>
+                    <td style={{...s.td,fontSize:12,color:"#64748b",maxWidth:200}}><div style={{whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{j.notes||"—"}</div></td>
+                    <td style={{...s.td,fontSize:12,color:"#64748b"}}>{j.createdAt ? new Date(j.createdAt).toLocaleDateString() : "—"}</td>
+                    <td style={s.td} onClick={e=>e.stopPropagation()}>
+                      <div style={{display:"flex",gap:6}}>
+                        <Btn sm primary={expandedId===j.id} onClick={()=>setExpandedId(prev=>prev===j.id?null:j.id)}>
+                          📷 Photos
+                        </Btn>
+                        <Btn sm onClick={()=>openEdit(j)}>Edit</Btn>
+                        <Btn sm danger onClick={()=>del(j.id)}>Delete</Btn>
+                      </div>
+                    </td>
+                  </tr>
+                  {expandedId===j.id && (
+                    <tr key={`${j.id}-photos`}>
+                      <td colSpan={5} style={{...s.td,background:"#f8fafc"}}>
+                        <JobPhotos jobId={j.id}/>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              ))}
+              {filtered.length===0&&<tr><td colSpan={5} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No jobs found</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {showNew&&(
+        <Modal title={editJob?"Edit Job":"New Job"} onClose={closeModal}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
+            <FG label="Customer *">
+              <select style={s.input} value={form.customerId} onChange={e=>upd("customerId")(e.target.value)} disabled={!!editJob}>
+                <option value="">— Choose customer —</option>
+                {customers.map(c=><option key={c.id} value={c.id}>{c.name} · {c.phone}</option>)}
+              </select>
+            </FG>
+            <FG label="Job Number *"><input style={s.input} value={form.jobNumber} onChange={e=>upd("jobNumber")(e.target.value)} placeholder="JOB-1023"/></FG>
+          </div>
+          <FG label="Notes"><textarea style={{...s.input,resize:"vertical"}} rows={3} value={form.notes} onChange={e=>upd("notes")(e.target.value)} placeholder="Optional notes about this job..."/></FG>
+          <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:20}}>
+            <Btn onClick={closeModal}>Cancel</Btn>
+            <Btn primary onClick={save} style={{opacity:(form.customerId&&form.jobNumber.trim())?1:.5}}>
+              {saving?"Saving…":editJob?"Save Changes":"Create Job"}
+            </Btn>
+          </div>
+        </Modal>
+      )}
+    </div>
+  )
+}
+
 // ─────────────────────────── USERS ───────────────────────────
 function Users({ currentUser }) {
   const [users,      setUsers]      = useState([])
@@ -2204,6 +2930,7 @@ export default function App() {
   const [view,            setView]           = useState("dashboard")
   const [projects,        setProjects]       = useState([])
   const [customers,       setCustomers]      = useState([])
+  const [jobs,            setJobs]           = useState([])
   const [selectedProject, setSelectedProject]= useState(null)
   const [loaded,          setLoaded]         = useState(false)
   const [toast,           setToast]          = useState(null)
@@ -2223,20 +2950,24 @@ export default function App() {
       setLoaded(false)
       setProjects([])
       setCustomers([])
+      setJobs([])
       return
     }
     async function loadData() {
       try {
-        const [rawProjects, rawCustomers] = await Promise.all([
+        const [rawProjects, rawCustomers, rawJobs] = await Promise.all([
           projectsApi.getAll(),
           customersApi.getAll(),
+          jobsApi.getAll(),
         ])
         setProjects(rawProjects.map(normalizeProject))
         setCustomers(rawCustomers.map(normalizeKeys))
+        setJobs(rawJobs)
       } catch(err) {
         console.warn("Backend not available, using seed data:", err.message)
         setProjects(seed_projects)
         setCustomers(seed_customers)
+        setJobs([])
       }
       setLoaded(true)
     }
@@ -2256,6 +2987,7 @@ export default function App() {
     dashboard:"Dashboard", pipeline:"Pipeline",
     projects:"Projects",   project:"Project Detail",
     customers:"Customers", quote_print:"Quote",
+    jobs:"Jobs",
     users:"Users",         settings:"Settings",
   }
 
@@ -2289,6 +3021,17 @@ export default function App() {
         setCustomers(prev=>[...prev, newCust])
       }
 
+      // Persist a quote snapshot whenever the save produced a numbered quote —
+      // this is what backs the quote-history list on the project page.
+      if (savedProject.quoteNum && savedProject.estimate) {
+        quotesApi.save(savedProject.id, {
+          quoteNum:  savedProject.quoteNum,
+          quoteDate: savedProject.quoteDate || today(),
+          total:     savedProject.estimate.total || 0,
+          snapshot:  { project: savedProject, estimate: savedProject.estimate },
+        }).catch(err => console.error("Quote history save failed:", err))
+      }
+
       setShowWizard(false)
       setEditingProject(null)
       setSelectedProject(savedProject)
@@ -2296,7 +3039,7 @@ export default function App() {
       setToast(isEdit?"Project updated!":"Project created!")
     } catch(err) {
       console.error("Save failed:", err)
-      setToast("Error saving project. Is the backend running?")
+      setToast(err.status ? `Error saving project: ${err.message}` : "Error saving project. Is the backend running?")
     }
   }
 
@@ -2471,6 +3214,7 @@ export default function App() {
               { key:"pipeline",   label:"Pipeline",    icon:"▦", badge:projects.filter(p=>p.status==="Quote Sent").length||null },
               { key:"projects",   label:"Projects",    icon:"📁" },
               { key:"customers",  label:"Customers",   icon:"👤" },
+              { key:"jobs",       label:"Jobs",        icon:"🧰" },
               null,
               { key:"users",      label:"Users",       icon:"🔑" },
               { key:"settings",   label:"Settings",    icon:"⚙" },
@@ -2530,7 +3274,7 @@ export default function App() {
                 onNewProject={()=>{ setEditingProject(null); setShowWizard(true) }}
               />
             )}
-            {view==="projects"&&<ProjectsList projects={projects} customers={customers} setView={setView} setSelectedProject={setSelectedProject}/>}
+            {view==="projects"&&<ProjectsList projects={projects} customers={customers} setProjects={setProjects} setView={setView} setSelectedProject={setSelectedProject}/>}
             {view==="project"&&currentProject&&(
               <ProjectDetail
                 project={currentProject} customers={customers}
@@ -2540,20 +3284,11 @@ export default function App() {
               />
             )}
             {view==="quote_print"&&currentProject&&(
-              <div data-quote-content>
-                <div className="print-hide" style={{display:"flex",gap:10,marginBottom:20,flexWrap:"wrap"}}>
-                  <Btn onClick={()=>setView("project")}>← Back to Project</Btn>
-                  <Btn primary onClick={()=>window.print()}>🖨 Print / Save PDF</Btn>
-                </div>
-                <QuoteView
-                  project={currentProject}
-                  customer={customers.find(c=>c.id===currentProject.customerId)}
-                  company={settings}
-                />
-              </div>
+              <QuotePrintView project={currentProject} customer={customers.find(c=>c.id===currentProject.customerId)} company={settings} setView={setView}/>
             )}
             {view==="pipeline"&&<Pipeline projects={projects} customers={customers} setProjects={setProjects} setView={setView} setSelectedProject={setSelectedProject}/>}
             {view==="customers"&&<Customers customers={customers} setCustomers={setCustomers} projects={projects}/>}
+            {view==="jobs"&&<Jobs jobs={jobs} setJobs={setJobs} customers={customers}/>}
             {view==="users"&&<Users currentUser={user}/>}
             {view==="settings"&&<Settings settings={settings} onSave={saveSettings}/>}
           </div>
@@ -2563,7 +3298,7 @@ export default function App() {
       {showWizard&&(
         <Modal title={editingProject?"Edit Project":"New Project"} onClose={()=>{ setShowWizard(false); setEditingProject(null) }} width={1400}>
           <NewProjectWizard
-            customers={customers} projects={projects}
+            customers={customers} projects={projects} jobs={jobs}
             existingProject={editingProject}
             onSave={handleSaveProject}
             onCancel={()=>{ setShowWizard(false); setEditingProject(null) }}
