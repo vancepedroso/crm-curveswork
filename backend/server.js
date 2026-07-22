@@ -18,6 +18,7 @@ const quotesRouter     = require("./routes/quotes");
 const jobsRouter       = require("./routes/jobs");
 const jobPhotosRouter  = require("./routes/jobPhotos");
 const materialsRouter  = require("./routes/materials");
+const companyProfileRouter = require("./routes/companyProfile");
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -43,6 +44,7 @@ app.use("/api/quotes",    quotesRouter);
 app.use("/api/jobs",       jobsRouter);
 app.use("/api/job-photos", jobPhotosRouter);
 app.use("/api/materials",  materialsRouter);
+app.use("/api/company-profile", companyProfileRouter);
 
 // ── Dashboard stats ──
 app.get("/api/dashboard", async (req, res) => {

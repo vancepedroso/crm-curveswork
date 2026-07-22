@@ -34,6 +34,7 @@ function serializeProject(row) {
       dayRate:       parseFloat(row.day_rate)      || 850,
       days:          parseFloat(row.days)          || 0,
       margin:        parseFloat(row.margin)        || 20,
+      complexity:    row.complexity                || "medium",
       adjArea:       parseFloat(row.adj_area)      || 0,
       matCost:       parseFloat(row.mat_cost)      || 0,
       flashCost:     parseFloat(row.flash_cost)    || 0,
@@ -64,7 +65,7 @@ const PROJECT_SELECT = `
          e.pitch, e.waste,
          e.material_rate, e.material_label,
          e.flashings, e.guttering,
-         e.day_rate, e.days, e.margin,
+         e.day_rate, e.days, e.margin, e.complexity,
          e.adj_area, e.mat_cost, e.flash_cost, e.gut_cost, e.lab_cost,
          e.margin_amt, e.sell_price, e.gst, e.total,
          c.name    AS customer_name,
@@ -141,15 +142,15 @@ router.post("/", async (req, res) => {
       await client.query(
         `INSERT INTO estimates
            (project_id, area, pitch, waste, material_rate, material_label,
-            flashings, guttering, day_rate, days, margin,
+            flashings, guttering, day_rate, days, margin, complexity,
             adj_area, mat_cost, flash_cost, gut_cost, lab_cost,
             margin_amt, sell_price, gst, total)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
         [
           project.id, estimate.area, estimate.pitch, estimate.waste,
           estimate.materialRate, estimate.materialLabel,
           estimate.flashings, estimate.guttering,
-          estimate.dayRate, estimate.days, estimate.margin,
+          estimate.dayRate, estimate.days, estimate.margin, estimate.complexity || "medium",
           estimate.adjArea, estimate.matCost, estimate.flashCost,
           estimate.gutCost, estimate.labCost,
           estimate.marginAmt, estimate.sellPrice, estimate.gst, estimate.total,
@@ -207,15 +208,16 @@ router.put("/:id", async (req, res) => {
       await client.query(
         `INSERT INTO estimates
            (project_id, area, pitch, waste, material_rate, material_label,
-            flashings, guttering, day_rate, days, margin,
+            flashings, guttering, day_rate, days, margin, complexity,
             adj_area, mat_cost, flash_cost, gut_cost, lab_cost,
             margin_amt, sell_price, gst, total)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
          ON CONFLICT (project_id) DO UPDATE SET
            area=EXCLUDED.area, pitch=EXCLUDED.pitch, waste=EXCLUDED.waste,
            material_rate=EXCLUDED.material_rate, material_label=EXCLUDED.material_label,
            flashings=EXCLUDED.flashings, guttering=EXCLUDED.guttering,
            day_rate=EXCLUDED.day_rate, days=EXCLUDED.days, margin=EXCLUDED.margin,
+           complexity=EXCLUDED.complexity,
            adj_area=EXCLUDED.adj_area, mat_cost=EXCLUDED.mat_cost,
            flash_cost=EXCLUDED.flash_cost, gut_cost=EXCLUDED.gut_cost,
            lab_cost=EXCLUDED.lab_cost, margin_amt=EXCLUDED.margin_amt,
@@ -224,7 +226,7 @@ router.put("/:id", async (req, res) => {
           req.params.id, estimate.area, estimate.pitch, estimate.waste,
           estimate.materialRate, estimate.materialLabel,
           estimate.flashings, estimate.guttering,
-          estimate.dayRate, estimate.days, estimate.margin,
+          estimate.dayRate, estimate.days, estimate.margin, estimate.complexity || "medium",
           estimate.adjArea, estimate.matCost, estimate.flashCost,
           estimate.gutCost, estimate.labCost,
           estimate.marginAmt, estimate.sellPrice, estimate.gst, estimate.total,

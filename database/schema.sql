@@ -62,12 +62,13 @@ CREATE TABLE estimates (
     pitch           DECIMAL(6,3) DEFAULT 1.15,
     waste           DECIMAL(5,1) DEFAULT 10,
     material_rate   DECIMAL(8,2) DEFAULT 55,
-    material_label  VARCHAR(60) DEFAULT 'Long Run Steel',
+    material_label  VARCHAR(255) DEFAULT 'Long Run Steel',
     flashings       DECIMAL(8,2) DEFAULT 0,
     guttering       DECIMAL(8,2) DEFAULT 0,
     day_rate        DECIMAL(8,2) DEFAULT 850,
     days            DECIMAL(4,1) DEFAULT 2,
     margin          DECIMAL(5,1) DEFAULT 20,
+    complexity      VARCHAR(20) DEFAULT 'medium',
     adj_area        DECIMAL(10,2) DEFAULT 0,
     mat_cost        DECIMAL(10,2) DEFAULT 0,
     flash_cost      DECIMAL(10,2) DEFAULT 0,
@@ -93,8 +94,32 @@ CREATE TABLE project_geometries (
     total_surface_m2    DECIMAL(10,2) DEFAULT 0,
     total_flashing_m    DECIMAL(8,2) DEFAULT 0,
     total_gutter_m      DECIMAL(8,2) DEFAULT 0,
+    snapshot_url        TEXT,
     created_at          TIMESTAMPTZ DEFAULT NOW(),
     updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ─────────────── COMPANY PROFILES (per-user quotation branding) ───────────────
+-- NOTE: references users(id) — the users table itself is created ad hoc
+-- outside this file (see backend auth setup), not defined in schema.sql.
+CREATE TABLE company_profiles (
+    id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id           INTEGER UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    company_name      VARCHAR(120) DEFAULT 'DK Roofing',
+    company_address   TEXT,
+    company_phone     VARCHAR(40),
+    company_email     VARCHAR(150),
+    company_gst       VARCHAR(40),
+    company_bank      VARCHAR(120),
+    logo_url          TEXT,
+    badges_url        TEXT,
+    estimator_name    VARCHAR(120),
+    estimator_title   VARCHAR(80),
+    day_rate          DECIMAL(8,2) DEFAULT 850,
+    margin            DECIMAL(5,1) DEFAULT 20,
+    wastage           DECIMAL(5,1) DEFAULT 10,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- ─────────────── INDEXES ───────────────
@@ -105,6 +130,7 @@ CREATE INDEX idx_geometries_project ON project_geometries(project_id);
 CREATE INDEX idx_jobs_customer ON jobs(customer_id);
 CREATE INDEX idx_job_photos_job ON job_photos(job_id);
 CREATE INDEX idx_projects_job ON projects(job_id);
+CREATE INDEX idx_company_profiles_user ON company_profiles(user_id);
 CREATE INDEX idx_projects_is_deleted ON projects(is_deleted);
 
 -- ─────────────── UPDATED_AT TRIGGER ───────────────

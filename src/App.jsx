@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "react"
+import { useState, useEffect, useRef, useCallback, useMemo, Fragment, forwardRef, useImperativeHandle } from "react"
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts"
-import { customersApi, projectsApi, usersApi, photosApi, quotesApi, jobsApi, jobPhotosApi, materialsApi } from "./api"
+import { customersApi, projectsApi, usersApi, photosApi, quotesApi, jobsApi, jobPhotosApi, materialsApi, companyProfileApi, estimatesApi } from "./api"
 import { useAuth } from "./AuthContext"
 import LoginPage   from "./LoginPage"
 import { CurrencyProvider, useCurrency } from "./CurrencyContext"
@@ -73,13 +73,24 @@ const normalizeProject = raw => {
   return p
 }
 
+// Labour-cost multiplier by job complexity — access, roof shape/cutting,
+// and safety requirements all drive labour time up independent of raw m².
+const COMPLEXITY_LEVELS = [
+  { key:"low",          label:"Low",          factor:1.0,  desc:"Simple gable/mono roof, easy access" },
+  { key:"medium",       label:"Medium",       factor:1.15, desc:"Standard hip roof, normal access" },
+  { key:"high",         label:"High",         factor:1.3,  desc:"Multiple planes, steep pitch or restricted access" },
+  { key:"complex",      label:"Complex",      factor:1.5,  desc:"Heavy cutting, valleys/dormers, height/safety gear" },
+  { key:"very_complex", label:"Very Complex", factor:1.75, desc:"Highly irregular roof, difficult access, specialist crew" },
+]
+const complexityFactor = key => COMPLEXITY_LEVELS.find(c=>c.key===key)?.factor || 1
+
 function calcEst(e) {
   if(!e) return null
   const adjArea   = e.area * e.pitch * (1 + (e.waste||0)/100)
   const matCost   = adjArea * e.materialRate
   const flashCost = (e.flashings||0) * RATES.flashings
   const gutCost   = (e.guttering||0) * RATES.guttering
-  const labCost   = (e.dayRate||850) * (e.days||0)
+  const labCost   = (e.dayRate||850) * (e.days||0) * complexityFactor(e.complexity)
   const sub       = matCost + flashCost + gutCost + labCost
   const marginAmt = sub * ((e.margin||0)/100)
   const sellPrice = sub + marginAmt
@@ -139,49 +150,37 @@ const s = {
 }
 
 function Btn({ children, primary, danger, sm, full, onClick, style={} }) {
-  const base = { display:"inline-flex", alignItems:"center", gap:6, padding:sm?"6px 12px":"8px 16px", borderRadius:8, fontSize:13, fontWeight:500, cursor:"pointer", border:"none", transition:"all .15s", fontFamily:"inherit", ...style }
-  if(primary) return <button style={{...base, background:"#f59e0b", color:"#000"}} onClick={onClick}>{children}</button>
-  if(danger)  return <button style={{...base, background:"#fee2e2", color:"#b91c1c", border:"1px solid #fca5a5"}} onClick={onClick}>{children}</button>
-  return <button style={{...base, background:"transparent", color:"#64748b", border:"1px solid #e2e8f0", ...(full&&{width:"100%",justifyContent:"center"})}} onClick={onClick}>{children}</button>
+  const base = `inline-flex items-center gap-1.5 ${sm?"px-3 py-1.5 text-xs":"px-4 py-2 text-[13px]"} rounded-lg font-medium cursor-pointer border transition-colors font-sans ${full?"w-full justify-center":""}`
+  if(primary) return <button style={style} className={`${base} bg-accent hover:bg-accent-dark text-slate-900 border-accent`} onClick={onClick}>{children}</button>
+  if(danger)  return <button style={style} className={`${base} bg-red-50 hover:bg-red-100 text-red-700 border-red-200`} onClick={onClick}>{children}</button>
+  return <button style={style} className={`${base} bg-transparent hover:bg-slate-50 text-slate-500 border-slate-200`} onClick={onClick}>{children}</button>
 }
 
 function StatusBadge({ status }) {
   const st = STATUS_STYLE[status]||STATUS_STYLE["New Lead"]
-  return <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,background:st.bg,color:st.color}}>
-    <span style={{width:6,height:6,borderRadius:"50%",background:st.dot}}/>
+  return <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold" style={{background:st.bg,color:st.color}}>
+    <span className="w-1.5 h-1.5 rounded-full" style={{background:st.dot}}/>
     {status}
   </span>
 }
 
-// ─── Responsive Modal (Bootstrap-modal-xl-like): full-screen on mobile,
-//     large centered panel on tablet/desktop, internal scroll. ───────────
+// ─── Responsive Modal: full-screen on mobile, large centered panel on
+//     tablet/desktop, internal scroll. ───────────
 function Modal({ title, onClose, children, width=560, height }) {
   return (
     <div
-      style={{
-        position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",
-        display:"flex",alignItems:"flex-start",justifyContent:"center",
-        zIndex:1000,overflowY:"auto",
-      }}
+      className="fixed inset-0 bg-slate-900/50 flex items-start justify-center z-[1000] overflow-y-auto"
       onClick={e=>e.target===e.currentTarget&&onClose()}
     >
       <div
-        className="responsive-modal"
-        style={{
-          background:"#fff",
-          width:"100%",
-          maxWidth:width,
-          maxHeight: height ? height : "90vh",
-          display:"flex",
-          flexDirection:"column",
-          boxShadow:"0 20px 60px rgba(0,0,0,0.2)",
-        }}
+        className="responsive-modal bg-white w-full flex flex-col shadow-2xl"
+        style={{ maxWidth:width, maxHeight: height ? height : "90vh" }}
       >
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"16px 20px",borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
-          <span style={{fontWeight:700,fontSize:16}}>{title}</span>
-          <button onClick={onClose} style={{border:"none",background:"none",cursor:"pointer",fontSize:22,color:"#64748b",lineHeight:1,padding:4}}>×</button>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200 shrink-0">
+          <span className="font-bold text-base font-display">{title}</span>
+          <button onClick={onClose} className="border-none bg-transparent cursor-pointer text-2xl text-slate-500 leading-none p-1 hover:text-slate-800">×</button>
         </div>
-        <div className="responsive-modal-body" style={{padding:20,overflowY:"auto",flex:1}}>{children}</div>
+        <div className="responsive-modal-body p-5 overflow-y-auto flex-1">{children}</div>
       </div>
     </div>
   )
@@ -189,8 +188,8 @@ function Modal({ title, onClose, children, width=560, height }) {
 
 function Toast({ msg, onDone }) {
   useEffect(()=>{ const t = setTimeout(onDone, 3000); return ()=>clearTimeout(t) },[onDone])
-  return <div style={{position:"fixed",bottom:24,right:24,background:"#0f172a",color:"#fff",padding:"12px 20px",borderRadius:10,fontSize:13,fontWeight:500,zIndex:9999,display:"flex",alignItems:"center",gap:8}}>
-    <span style={{color:"#10b981",fontSize:16}}>✓</span> {msg}
+  return <div className="fixed bottom-6 right-6 bg-navy text-white px-5 py-3 rounded-xl text-[13px] font-medium z-[9999] flex items-center gap-2 shadow-lg">
+    <span className="text-emerald-400 text-base">✓</span> {msg}
   </div>
 }
 
@@ -202,11 +201,7 @@ function CurrencySelector() {
       value={currency.code}
       onChange={e => updateCurrency(e.target.value)}
       title="Change display currency"
-      style={{
-        padding:"5px 10px", border:"1px solid #e2e8f0", borderRadius:8,
-        fontSize:12, fontFamily:"inherit", background:"#fff",
-        cursor:"pointer", color:"#0f172a", fontWeight:500, outline:"none",
-      }}
+      className="px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs font-sans bg-white cursor-pointer text-slate-900 font-medium outline-none"
     >
       {currencies.map(c => (
         <option key={c.code} value={c.code}>{c.symbol} {c.code} — {c.name}</option>
@@ -215,9 +210,22 @@ function CurrencySelector() {
   )
 }
 
+// ─── Big money display: a single formal sans-serif weight for the whole
+//     amount (no display/heading font on numerals — that's what read as
+//     playful/"AI-generated" rather than an invoice), tabular figures so
+//     digits don't jitter, symbol at the same baseline as the digits
+//     instead of superscript-style. ─────────────────────────────────────
+function Money({ value, size=24, weight=700, color="inherit" }) {
+  return (
+    <span style={{fontFamily:"'DM Sans',sans-serif",fontSize:size,fontWeight:weight,color,fontVariantNumeric:"tabular-nums",letterSpacing:"-0.01em"}}>
+      {value}
+    </span>
+  )
+}
+
 function FG({ label, children, half }) {
-  return <div style={{marginBottom:14,...(half&&{gridColumn:"span 1"})}}>
-    <label style={s.label}>{label}</label>
+  return <div className={`mb-3.5 ${half?"col-span-1":""}`}>
+    <label className="block text-xs text-slate-500 mb-1.5 font-medium">{label}</label>
     {children}
   </div>
 }
@@ -240,40 +248,39 @@ function Sidebar({ view, onNav, projects, user, onLogout }) {
   ]
 
   return (
-    <div style={s.sidebar}>
-      <div style={s.logo}>
-        <img src="/aTopRoof.png" alt="aTopRoof" style={{width:"100%",maxWidth:164,display:"block",background:"#ffffff",borderRadius:10,padding:"8px 12px",boxShadow:"0 1px 4px rgba(0,0,0,0.25)"}}/>
-        <div style={{fontSize:10,color:"#f59e0b",letterSpacing:1,textTransform:"uppercase",marginTop:8,fontWeight:600}}>Elevate Your Roofing Business</div>
+    <div className="w-[220px] min-w-[220px] bg-navy flex flex-col h-full">
+      <div className="px-5 pt-5 pb-4 border-b border-white/10">
+        <img src="/aTopRoof.png" alt="aTopRoof" className="w-full max-w-[164px] block bg-white rounded-[10px] px-3 py-2 shadow-md"/>
+        <div className="text-[10px] text-accent tracking-widest uppercase mt-2 font-semibold">Elevate Your Roofing Business</div>
       </div>
-      <nav style={s.nav}>
+      <nav className="flex-1 px-2.5 py-3 flex flex-col gap-0.5 overflow-y-auto">
         {items.map((item,i)=> item===null
-          ? <div key={i} style={{height:1,background:"rgba(255,255,255,0.06)",margin:"8px 0"}}/>
+          ? <div key={i} className="h-px bg-white/[.06] my-2"/>
           : (
             <div key={item.key}
               onClick={()=>onNav(item.key)}
-              style={{...s.navItem,
-                ...(view===item.key ? {background:"rgba(245,158,11,0.15)",color:"#f59e0b"} : {}),
-                ...(item.primary ? {marginTop:4,background:"rgba(245,158,11,0.1)",color:"#f59e0b",border:"1px solid rgba(245,158,11,0.2)"} : {})
-              }}
+              className={`flex items-center gap-2.5 px-2.5 py-2.5 rounded-lg cursor-pointer text-slate-300 text-[13px] font-medium transition-colors select-none hover:bg-white/5
+                ${view===item.key ? "!bg-accent/15 !text-accent" : ""}
+                ${item.primary ? "mt-1 bg-accent/10 text-accent border border-accent/20" : ""}`}
             >
-              <span style={{fontSize:14}}>{item.icon}</span>
+              <span className="text-sm">{item.icon}</span>
               <span>{item.label}</span>
-              {item.badge && <span style={{marginLeft:"auto",background:"#f59e0b",color:"#000",fontSize:10,fontWeight:700,padding:"1px 7px",borderRadius:20}}>{item.badge}</span>}
+              {item.badge && <span className="ml-auto bg-accent text-slate-900 text-[10px] font-bold px-1.5 py-px rounded-full">{item.badge}</span>}
             </div>
           )
         )}
       </nav>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginTop:12,padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,0.04)"}}>
-        <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
-          <div style={{width:28,height:28,borderRadius:"50%",background:"linear-gradient(135deg,#f59e0b,#f97316)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#000",flexShrink:0}}>
+      <div className="flex items-center justify-between gap-2 mt-3 mx-2 mb-2 px-2.5 py-2 rounded-lg bg-white/[.04]">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="w-7 h-7 rounded-full bg-gradient-to-br from-accent to-orange-500 flex items-center justify-center text-[11px] font-bold text-slate-900 shrink-0">
             {user?.name?.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}
           </div>
-          <div style={{minWidth:0}}>
-            <div style={{fontSize:12,color:"#fff",fontWeight:500,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user?.name}</div>
-            <div style={{fontSize:10,color:"#475569"}}>aTopRoof CRM</div>
+          <div className="min-w-0">
+            <div className="text-xs text-white font-medium whitespace-nowrap overflow-hidden text-ellipsis">{user?.name}</div>
+            <div className="text-[10px] text-slate-500">aTopRoof CRM</div>
           </div>
         </div>
-        <button onClick={onLogout} title="Sign out" style={{background:"none",border:"none",cursor:"pointer",color:"#475569",fontSize:16,padding:4,lineHeight:1,flexShrink:0}}>⏻</button>
+        <button onClick={onLogout} title="Sign out" className="bg-transparent border-none cursor-pointer text-slate-500 hover:text-slate-300 text-base p-1 leading-none shrink-0">⏻</button>
       </div>
     </div>
   )
@@ -305,48 +312,48 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
 
   return (
     <div>
-      <div style={s.grid4} className="grid4-responsive">
+      <div className="grid grid-cols-4 gap-3.5 mb-6 grid4-responsive">
         {[
           { label:"Total Leads",    val:stats.leads,        sub:`${stats.total} total projects`,                                             bg:"#dbeafe", color:"#1e40af" },
           { label:"Quotes Sent",    val:stats.sent,         sub:fmt(stats.pipeline)+" in pipeline",                                         bg:"#fef3c7", color:"#92400e" },
           { label:"Projects Won",   val:stats.won,          sub:`${stats.total?Math.round(stats.won/stats.total*100):0}% conversion`,        bg:"#d1fae5", color:"#065f46" },
           { label:"Pending Quotes", val:stats.pending,      sub:fmt(stats.pendingValue)+" pending value",                                    bg:"#ede9fe", color:"#5b21b6" },
         ].map(c=>(
-          <div key={c.label} style={s.card}>
-            <div style={{fontSize:11,color:"#64748b",textTransform:"uppercase",letterSpacing:.5,marginBottom:8}}>{c.label}</div>
-            <div style={{fontFamily:"'Syne',sans-serif",fontSize:26,fontWeight:800}}>{c.val}</div>
-            <div style={{display:"inline-flex",alignItems:"center",marginTop:6,fontSize:11,padding:"2px 8px",borderRadius:12,background:c.bg,color:c.color}}>{c.sub}</div>
+          <div key={c.label} className="bg-white border border-slate-200 rounded-xl p-[18px]">
+            <div className="text-[11px] text-slate-500 uppercase tracking-wide mb-2">{c.label}</div>
+            <div className="font-display text-[26px] font-extrabold">{c.val}</div>
+            <div className="inline-flex items-center mt-1.5 text-[11px] px-2 py-0.5 rounded-full" style={{background:c.bg,color:c.color}}>{c.sub}</div>
           </div>
         ))}
       </div>
 
-      <div style={s.grid2r} className="grid2r-responsive">
+      <div className="grid grid-cols-[1fr_340px] gap-4 grid2r-responsive">
         <div>
-          <div style={s.card}>
-            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
-              <span style={{fontWeight:700,fontSize:14}}>Recent Projects</span>
+          <div className="bg-white border border-slate-200 rounded-xl p-[18px]">
+            <div className="flex items-center justify-between mb-4">
+              <span className="font-bold text-sm">Recent Projects</span>
               <Btn sm onClick={()=>setView("projects")}>View all</Btn>
             </div>
             {recent.map(p=>{
               const cust = customers.find(c=>c.id===p.customerId)
               const st   = STATUS_STYLE[p.status]
               return (
-                <div key={p.id} onClick={()=>openProject(p)} style={{display:"flex",alignItems:"center",gap:14,padding:"11px 0",borderBottom:"1px solid #f1f5f9",cursor:"pointer"}}>
-                  <div style={{width:8,height:8,borderRadius:"50%",background:st.dot,flexShrink:0}}/>
-                  <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontWeight:500,fontSize:13,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{cust?.name||"—"}</div>
-                    <div style={{fontSize:11,color:"#64748b",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{p.address}</div>
+                <div key={p.id} onClick={()=>openProject(p)} className="flex items-center gap-3.5 py-2.5 border-b border-slate-100 last:border-b-0 cursor-pointer">
+                  <div className="w-2 h-2 rounded-full shrink-0" style={{background:st.dot}}/>
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-[13px] whitespace-nowrap overflow-hidden text-ellipsis">{cust?.name||"—"}</div>
+                    <div className="text-[11px] text-slate-500 whitespace-nowrap overflow-hidden text-ellipsis">{p.address}</div>
                   </div>
-                  <div style={{textAlign:"right",flexShrink:0}}>
+                  <div className="text-right shrink-0">
                     <StatusBadge status={p.status}/>
-                    <div style={{fontSize:11,color:"#64748b",marginTop:3}}>{p.estimate ? fmt(p.estimate.total) : "No estimate"}</div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">{p.estimate ? fmt(p.estimate.total) : "No estimate"}</div>
                   </div>
                 </div>
               )
             })}
           </div>
-          <div style={{...s.card, marginTop:16}}>
-            <div style={{fontWeight:700,fontSize:14,marginBottom:16}}>Pipeline by Stage</div>
+          <div className="bg-white border border-slate-200 rounded-xl p-[18px] mt-4">
+            <div className="font-bold text-sm mb-4">Pipeline by Stage</div>
             <ResponsiveContainer width="100%" height={160}>
               <BarChart data={chartData} barSize={32}>
                 <XAxis dataKey="name" tick={{fontSize:11,fill:"#64748b"}} axisLine={false} tickLine={false}/>
@@ -360,25 +367,25 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
           </div>
         </div>
 
-        <div style={{display:"flex",flexDirection:"column",gap:14}}>
-          <div style={s.card}>
-            <div style={{fontWeight:700,fontSize:14,marginBottom:14}}>Pipeline Summary</div>
+        <div className="flex flex-col gap-3.5">
+          <div className="bg-white border border-slate-200 rounded-xl p-[18px]">
+            <div className="font-bold text-sm mb-3.5">Pipeline Summary</div>
             {STATUSES.map(st=>(
-              <div key={st} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 0",borderBottom:"1px solid #f1f5f9"}}>
-                <div style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:"#475569"}}>
-                  <span style={{width:8,height:8,borderRadius:"50%",background:STATUS_STYLE[st].dot,display:"inline-block"}}/>
+              <div key={st} className="flex items-center justify-between py-2 border-b border-slate-100 last:border-b-0">
+                <div className="flex items-center gap-2 text-[13px] text-slate-600">
+                  <span className="w-2 h-2 rounded-full inline-block" style={{background:STATUS_STYLE[st].dot}}/>
                   {st}
                 </div>
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <span style={{fontSize:12,color:"#64748b"}}>{projects.filter(p=>p.status===st).length} jobs</span>
-                  <span style={{fontWeight:700,fontSize:13}}>{fmt(projects.filter(p=>p.status===st).reduce((a,p)=>a+(p.estimate?.total||0),0))}</span>
+                <div className="flex items-center gap-2.5">
+                  <span className="text-xs text-slate-500">{projects.filter(p=>p.status===st).length} jobs</span>
+                  <span className="font-bold text-[13px]">{fmt(projects.filter(p=>p.status===st).reduce((a,p)=>a+(p.estimate?.total||0),0))}</span>
                 </div>
               </div>
             ))}
           </div>
-          <div style={s.card}>
-            <div style={{fontWeight:700,fontSize:14,marginBottom:12}}>Quick Actions</div>
-            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          <div className="bg-white border border-slate-200 rounded-xl p-[18px]">
+            <div className="font-bold text-sm mb-3">Quick Actions</div>
+            <div className="flex flex-col gap-2">
               <Btn primary full onClick={onNewProject}>📸 New Roof Job</Btn>
               <Btn full onClick={()=>setView("pipeline")}>▦ View Pipeline</Btn>
               <Btn full onClick={()=>setView("customers")}>👤 Manage Customers</Btn>
@@ -429,16 +436,53 @@ const MIN_ZOOM = 1
 const MAX_ZOOM = 6
 const HIT_RADIUS = 9 // world-space px for grabbing an existing point
 
-function MeasurementTool({ onGeometryChange, photoUrl }) {
+// ── Reconstructs MeasurementTool's editable state from the derived geometry
+//    shape it reports upward via onGeometryChange (the same shape returned
+//    by GET /api/estimates/:id/geometry) — lets a remounted or freshly
+//    opened-for-edit tool start pre-populated instead of blank. ───────────
+function initialSectionsFrom(g) {
+  if(!g?.sections?.length) return []
+  return g.sections.map((sec,i)=>({
+    id: sec.id || uid(), name: sec.name || `Section ${i+1}`,
+    pts: sec.shape_points || [], closed: true,
+    pitch: sec.pitch || "1.15", color: SEC_COLORS[i % SEC_COLORS.length],
+  }))
+}
+function initialLineItemsFrom(g) {
+  const flashings = g?.accessories?.flashings || []
+  const gutters    = g?.accessories?.gutters   || []
+  return [...flashings, ...gutters].map(l => ({ id: l.id || uid(), type: l.type, pts: l.pts || [] }))
+}
+function initialPtItemsFrom(g) {
+  const downpipes = g?.accessories?.downpipes   || []
+  const drains     = g?.accessories?.drains     || []
+  const pens       = g?.accessories?.penetrations || []
+  return [...downpipes, ...drains, ...pens].map(p => ({ ...p, id: p.id || uid() }))
+}
+function initialScaleLineFrom(g) {
+  // Exact original calibration line position isn't stored — only the
+  // resolved ratio (scale_m_per_px) — so a synthetic 100px line reproduces
+  // the same ratio; only its on-canvas position is arbitrary (cosmetic).
+  if(!g?.scale_m_per_px) return null
+  return { p1:{x:100,y:280}, p2:{x:200,y:280} }
+}
+function initialKnownMFrom(g) {
+  return g?.scale_m_per_px ? parseFloat((g.scale_m_per_px*100).toFixed(4)) : 10
+}
+
+const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, photoUrl, initialGeometry }, ref) {
   const canvasRef   = useRef(null)
   const imgRef      = useRef(null)
   const [imgSrc,    setImgSrc]    = useState(null)
-  const [sections,  setSections]  = useState([])
-  const [lineItems, setLineItems] = useState([])
-  const [ptItems,   setPtItems]   = useState([])
-  const [scaleLine, setScaleLine] = useState(null)
-  const [knownM,    setKnownM]    = useState(10)
-  const [asbestos,  setAsbestos]  = useState(false)
+  const [sections,  setSections]  = useState(() => initialSectionsFrom(initialGeometry))
+  const [lineItems, setLineItems] = useState(() => initialLineItemsFrom(initialGeometry))
+  const [ptItems,   setPtItems]   = useState(() => initialPtItemsFrom(initialGeometry))
+  const [scaleLine, setScaleLine] = useState(() => initialScaleLineFrom(initialGeometry))
+  const [knownM,    setKnownM]    = useState(() => initialKnownMFrom(initialGeometry))
+  const [calibModalOpen, setCalibModalOpen] = useState(false)
+  const [calibUnit,      setCalibUnit]      = useState("m")
+  const [calibInput,     setCalibInput]     = useState("")
+  const [asbestos,  setAsbestos]  = useState(() => !!initialGeometry?.asbestos)
   const [activeTool,setActiveTool]= useState("section")
   const [penSub,    setPenSub]    = useState("pipe")
   const [drawPts,   setDrawPts]   = useState([])
@@ -453,6 +497,17 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
   // ── Editable points ─────────────────────────────────────────────────
   const dragRef = useRef(null) // { kind, id, idx? } currently-dragged point
   const [editMode, setEditMode] = useState(false)
+
+  // ── Marquee select (Photoshop-style drag-a-box, then Delete) ────────
+  const [selectBox, setSelectBox] = useState(null) // {start:{x,y}, current:{x,y}} while dragging
+  const [selection, setSelection] = useState({ sections:[], lines:[], points:[], scale:false })
+  const selectionCount = selection.sections.length + selection.lines.length + selection.points.length + (selection.scale?1:0)
+
+  // ← Lets the parent wizard grab a PNG snapshot of the traced canvas (for
+  //   embedding in generated quotes) without owning the canvas ref itself.
+  useImperativeHandle(ref, () => ({
+    getSnapshot: () => canvasRef.current?.toDataURL("image/png") || null,
+  }))
 
   const mPerPx = useMemo(()=>{
     if(!scaleLine?.p1||!scaleLine?.p2) return null
@@ -493,6 +548,13 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
   },[sections,lineItems,ptItems,asbestos,mPerPx])
 
   useEffect(()=>{ onGeometryChange?.(geometry) },[geometry, onGeometryChange])
+
+  // ← Lets the wizard grab a PNG of the traced canvas (sections, labels, m²)
+  //   to embed in the generated quote — mirrors the marked-up roof plan
+  //   images attached in the reference quotation template.
+  useImperativeHandle(ref, () => ({
+    getSnapshot: () => canvasRef.current?.toDataURL("image/png") || null,
+  }))
 
   // Screen (rendered CSS pixels) -> world (fixed MT_CANVAS_W x MT_CANVAS_H
   // drawing space), accounting for CSS scaling of the canvas element AND
@@ -537,6 +599,25 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
   },[])
 
   const isPanMode = activeTool==="pan" || spaceDown
+
+  function deleteSelected() {
+    if(selection.sections.length) setSections(prev=>prev.filter(s=>!selection.sections.includes(s.id)))
+    if(selection.lines.length)    setLineItems(prev=>prev.filter(l=>!selection.lines.includes(l.id)))
+    if(selection.points.length)   setPtItems(prev=>prev.filter(p=>!selection.points.includes(p.id)))
+    if(selection.scale)           setScaleLine(null)
+    setSelection({ sections:[], lines:[], points:[], scale:false })
+  }
+
+  // Delete/Backspace removes the current marquee selection (Select tool only)
+  useEffect(()=>{
+    function onKeyDown(e){
+      if(activeTool==="select" && (e.key==="Delete"||e.key==="Backspace") && selectionCount>0){
+        e.preventDefault(); deleteSelected()
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return ()=>window.removeEventListener("keydown", onKeyDown)
+  },[activeTool, selection])
 
   const drawCanvas = useCallback(()=>{
     const cv=canvasRef.current; if(!cv)return
@@ -588,14 +669,36 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
 
     if(activeTool==="section"&&drawPts.length>0){
       const col=SEC_COLORS[sections.length%SEC_COLORS.length]
-      ctx.strokeStyle=col; ctx.lineWidth=lw(2); ctx.setLineDash([lw(6),lw(3)])
+      // ← "closing snap": cursor is near the first point, close enough that a
+      //   click would close the shape (matches the d<15 threshold in handleClick)
+      const isClosing = drawPts.length>=3 && hoverPt && Math.hypot(hoverPt.x-drawPts[0].x,hoverPt.y-drawPts[0].y)<15
+
+      // Live translucent fill — a "shadow" of the enclosed area that grows as
+      // points are placed, instead of only appearing once the shape is closed.
+      if(drawPts.length>=3){
+        ctx.beginPath(); ctx.moveTo(drawPts[0].x,drawPts[0].y)
+        drawPts.forEach(p=>ctx.lineTo(p.x,p.y))
+        if(hoverPt && !isClosing) ctx.lineTo(hoverPt.x,hoverPt.y)
+        ctx.closePath()
+        ctx.fillStyle=col+"2a"
+        ctx.fill()
+      }
+
+      ctx.strokeStyle=col; ctx.lineWidth=lw(2)
+      ctx.setLineDash(isClosing?[]:[lw(6),lw(3)])
       ctx.beginPath(); ctx.moveTo(drawPts[0].x,drawPts[0].y)
       drawPts.forEach(p=>ctx.lineTo(p.x,p.y))
-      if(hoverPt) ctx.lineTo(hoverPt.x,hoverPt.y)
+      if(hoverPt) ctx.lineTo(isClosing?drawPts[0].x:hoverPt.x, isClosing?drawPts[0].y:hoverPt.y)
       ctx.stroke(); ctx.setLineDash([])
       drawPts.forEach((p,i)=>{
         ctx.fillStyle=i===0?col:"#fff"; ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?6:3.5),0,Math.PI*2); ctx.fill()
-        if(i===0){ctx.strokeStyle="#fff88f";ctx.lineWidth=lw(1.5);ctx.beginPath();ctx.arc(p.x,p.y,lw(10),0,Math.PI*2);ctx.stroke()}
+        if(i===0){
+          ctx.strokeStyle=isClosing?"#ffffff":"#fff88f"
+          ctx.lineWidth=lw(isClosing?2.5:1.5)
+          ctx.globalAlpha=isClosing?1:0.6
+          ctx.beginPath();ctx.arc(p.x,p.y,lw(isClosing?12:10),0,Math.PI*2);ctx.stroke()
+          ctx.globalAlpha=1
+        }
       })
     }
 
@@ -664,8 +767,43 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
       ctx.setLineDash([])
     }
 
+    // ── Marquee-selected items get a dashed red bounding-box highlight ──
+    if(selectionCount>0){
+      const bboxOf = pts => ({
+        x1:Math.min(...pts.map(p=>p.x)), y1:Math.min(...pts.map(p=>p.y)),
+        x2:Math.max(...pts.map(p=>p.x)), y2:Math.max(...pts.map(p=>p.y)),
+      })
+      ctx.strokeStyle="#ef4444"; ctx.lineWidth=lw(2); ctx.setLineDash([lw(5),lw(3)])
+      sections.filter(s=>selection.sections.includes(s.id)).forEach(sec=>{
+        const b=bboxOf(sec.pts)
+        ctx.strokeRect(b.x1-lw(6),b.y1-lw(6),(b.x2-b.x1)+lw(12),(b.y2-b.y1)+lw(12))
+      })
+      lineItems.filter(li=>selection.lines.includes(li.id)).forEach(li=>{
+        const b=bboxOf(li.pts)
+        ctx.strokeRect(b.x1-lw(6),b.y1-lw(6),(b.x2-b.x1)+lw(12),(b.y2-b.y1)+lw(12))
+      })
+      ptItems.filter(pi=>selection.points.includes(pi.id)).forEach(pi=>{
+        ctx.strokeRect(pi.x-lw(12),pi.y-lw(12),lw(24),lw(24))
+      })
+      if(selection.scale && scaleLine?.p1 && scaleLine?.p2){
+        const b=bboxOf([scaleLine.p1,scaleLine.p2])
+        ctx.strokeRect(b.x1-lw(6),b.y1-lw(6),(b.x2-b.x1)+lw(12),(b.y2-b.y1)+lw(12))
+      }
+      ctx.setLineDash([])
+    }
+
+    // ── Active marquee drag ──────────────────────────────────────────────
+    if(selectBox){
+      const x1=Math.min(selectBox.start.x,selectBox.current.x), x2=Math.max(selectBox.start.x,selectBox.current.x)
+      const y1=Math.min(selectBox.start.y,selectBox.current.y), y2=Math.max(selectBox.start.y,selectBox.current.y)
+      ctx.fillStyle="rgba(59,130,246,0.15)"; ctx.fillRect(x1,y1,x2-x1,y2-y1)
+      ctx.strokeStyle="rgba(59,130,246,0.85)"; ctx.lineWidth=lw(1); ctx.setLineDash([lw(4),lw(2)])
+      ctx.strokeRect(x1,y1,x2-x1,y2-y1)
+      ctx.setLineDash([])
+    }
+
     ctx.restore()
-  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,knownM,geometry,imgSrc,view,editMode])
+  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,knownM,geometry,imgSrc,view,editMode,selection,selectionCount,selectBox])
 
   useEffect(()=>{ drawCanvas() },[drawCanvas])
 
@@ -707,6 +845,10 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
       return
     }
     const pt = getWorldPt(e.clientX, e.clientY)
+    if(activeTool==="select"){
+      setSelectBox({ start:pt, current:pt })
+      return
+    }
     const hit = findHit(pt)
     if(hit){ dragRef.current = hit; return }
     if(editMode) return // in edit mode, empty-space clicks don't start new geometry
@@ -724,11 +866,32 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
       return
     }
     const pt = getWorldPt(e.clientX, e.clientY)
+    if(selectBox){ setSelectBox(prev=>({ ...prev, current:pt })); return }
     if(dragRef.current){ moveHit(dragRef.current, pt); return }
     setHoverPt(pt)
   }
-  function handleMouseUp(){ panRef.current = null; dragRef.current = null }
-  function handleMouseLeave(){ panRef.current = null; dragRef.current = null; setHoverPt(null) }
+  function handleMouseUp(){
+    if(selectBox){
+      const x1=Math.min(selectBox.start.x,selectBox.current.x), x2=Math.max(selectBox.start.x,selectBox.current.x)
+      const y1=Math.min(selectBox.start.y,selectBox.current.y), y2=Math.max(selectBox.start.y,selectBox.current.y)
+      // A tiny box (basically a click, not a drag) clears the selection —
+      // matches Photoshop's "click empty space to deselect" behaviour.
+      if(x2-x1>3 || y2-y1>3){
+        const inBox = p => p.x>=x1&&p.x<=x2&&p.y>=y1&&p.y<=y2
+        setSelection({
+          sections: sections.filter(sec=>sec.pts.some(inBox)).map(s=>s.id),
+          lines:    lineItems.filter(li=>li.pts.some(inBox)).map(l=>l.id),
+          points:   ptItems.filter(inBox).map(p=>p.id),
+          scale:    !!(scaleLine?.p1 && scaleLine?.p2 && (inBox(scaleLine.p1) || inBox(scaleLine.p2))),
+        })
+      } else {
+        setSelection({ sections:[], lines:[], points:[], scale:false })
+      }
+      setSelectBox(null)
+    }
+    panRef.current = null; dragRef.current = null
+  }
+  function handleMouseLeave(){ panRef.current = null; dragRef.current = null; setSelectBox(null); setHoverPt(null) }
 
   function handleWheel(e){
     e.preventDefault()
@@ -757,11 +920,11 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
     else if(activeTool==="penetration") { setPtItems(prev=>[...prev,{id:uid(),type:"penetration",subtype:penSub,x:pt.x,y:pt.y}]) }
     else if(activeTool==="scale"){
       if(!scaleLine?.p1)       setScaleLine({p1:pt,p2:null})
-      else if(!scaleLine?.p2){ setScaleLine(prev=>({...prev,p2:pt})) }
-      // ← stays on the Scale tool after both points are placed (rather than
-      //   auto-jumping to Roof Section) so the "Known length" input remains
-      //   visible and editable — otherwise it's easy to draw the line before
-      //   correcting the default 10m and never get a chance to fix it.
+      else if(!scaleLine?.p2){
+        setScaleLine(prev=>({...prev,p2:pt}))
+        setCalibInput(String(knownM))
+        setCalibModalOpen(true)
+      }
     }
   }
 
@@ -792,7 +955,20 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
   function clearAll(){
     setSections([]); setLineItems([]); setPtItems([])
     setScaleLine(null); setDrawPts([]); setAsbestos(false)
+    setSelection({sections:[],lines:[],points:[],scale:false}); setSelectBox(null)
     resetView()
+  }
+
+  function applyCalibration(){
+    const raw = parseFloat(calibInput)
+    if(!raw || raw<=0) return
+    setKnownM(calibUnit==="mm" ? raw/1000 : raw)
+    setCalibModalOpen(false)
+  }
+
+  function cancelCalibration(){
+    setScaleLine(null)
+    setCalibModalOpen(false)
   }
 
   function loadImage(file){
@@ -825,6 +1001,7 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
     {key:"drain",      label:"Roof Drain",  icon:"⊙",color:"#6366f1",hint:"Click canvas to place a roof drain (DR) marker"},
     {key:"penetration",label:"Penetration", icon:"◇",color:"#8b5cf6",hint:"Click to place — select type below"},
     {key:"scale",      label:"Set Scale",   icon:"📏",color:"#10b981",hint:"Click two points over a known dimension · right-click to cancel"},
+    {key:"select",     label:"Select",      icon:"⬚",color:"#ef4444",hint:"Drag a box over items to select them · press Delete or click Delete Selected to remove"},
     {key:"pan",        label:"Pan",         icon:"✋",color:"#64748b",hint:"Drag to pan the image (or hold Space with any tool)"},
   ]
 
@@ -846,7 +1023,7 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
           <div className="mt-toolbar" style={{display:"flex",alignItems:"center",gap:5,padding:"8px 10px",background:"#1e293b",flexWrap:"wrap"}}>
             {TOOLS.map(t=>(
               <button key={t.key}
-                onClick={()=>{setActiveTool(t.key);setDrawPts([])}}
+                onClick={()=>{setActiveTool(t.key);setDrawPts([]); if(t.key!=="select"){setSelection({sections:[],lines:[],points:[],scale:false});setSelectBox(null)}}}
                 style={{padding:"5px 9px",borderRadius:6,
                   border:`1px solid ${activeTool===t.key?t.color:"rgba(255,255,255,0.14)"}`,
                   background:activeTool===t.key?t.color+"28":"transparent",
@@ -886,6 +1063,12 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
           <div style={{padding:"5px 12px",background:"#0f172a",fontSize:11,color:"#475569",display:"flex",alignItems:"center",justifyContent:"space-between",minHeight:28,flexWrap:"wrap",gap:6}}>
             <span>{tip}{editMode && !isPanMode ? " · Edit mode: drag any highlighted point" : ""}</span>
             <div style={{display:"flex",alignItems:"center",gap:8}}>
+              {activeTool==="select"&&selectionCount>0&&(
+                <button onClick={deleteSelected}
+                  style={{padding:"5px 10px",borderRadius:6,border:"1px solid #ef4444",background:"#ef444422",color:"#ef4444",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:4}}>
+                  🗑 Delete Selected ({selectionCount})
+                </button>
+              )}
               {activeTool==="penetration"&&(
                 <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
                   {PEN_TYPES.map(t=>(
@@ -898,22 +1081,12 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
                   ))}
                 </div>
               )}
-              {activeTool==="scale"&&(
-                <div style={{display:"flex",alignItems:"center",gap:5}}>
-                  <span style={{color:"#64748b",fontSize:10}}>Known length:</span>
-                  <input type="number" min="0.01" step="0.01" value={knownM}
-                    onChange={e=>setKnownM(e.target.value===""?"":parseFloat(e.target.value))}
-                    onBlur={()=>{ if(!knownM || knownM<=0) setKnownM(10) }}
-                    style={{width:56,padding:"2px 6px",background:"rgba(255,255,255,0.12)",border:"1px solid rgba(16,185,129,0.5)",borderRadius:4,color:"#fff",fontSize:11,fontWeight:600}}/>
-                  <span style={{color:"#64748b",fontSize:10}}>m — enter the actual measured distance</span>
-                </div>
-              )}
             </div>
           </div>
 
           <div className="mt-canvas-wrap">
             <canvas ref={canvasRef} width={MT_CANVAS_W} height={MT_CANVAS_H}
-              style={{cursor:isPanMode?(panRef.current?"grabbing":"grab"):(["section","flashing","gutter","scale"].includes(activeTool)?"crosshair":"cell")}}
+              style={{cursor:isPanMode?(panRef.current?"grabbing":"grab"):(["section","flashing","gutter","scale","select"].includes(activeTool)?"crosshair":"cell")}}
               onMouseDown={handleMouseDown}
               onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp}
@@ -1014,10 +1187,33 @@ function MeasurementTool({ onGeometryChange, photoUrl }) {
           </div>
         </div>
       </div>
+
+      {calibModalOpen && (
+        <Modal title="Set Scale" onClose={cancelCalibration} width={360}>
+          <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
+            Enter the real-world length of the line you just drew.
+          </div>
+          <div style={{display:"flex",gap:8,marginBottom:16}}>
+            <input
+              type="number" min="0.001" step="any" autoFocus value={calibInput}
+              onChange={e=>setCalibInput(e.target.value)}
+              onKeyDown={e=>{ if(e.key==="Enter") applyCalibration(); if(e.key==="Escape") cancelCalibration() }}
+              placeholder={calibUnit==="mm"?"e.g. 3000":"e.g. 3"}
+              style={{...s.input,flex:1}}/>
+            <select value={calibUnit} onChange={e=>setCalibUnit(e.target.value)} style={{...s.input,width:80}}>
+              <option value="m">m</option>
+              <option value="mm">mm</option>
+            </select>
+          </div>
+          <div style={{display:"flex",justifyContent:"flex-end",gap:10}}>
+            <Btn onClick={cancelCalibration}>Cancel</Btn>
+            <Btn primary onClick={applyCalibration} style={{opacity:(parseFloat(calibInput)>0)?1:.5}}>Apply Scale</Btn>
+          </div>
+        </Modal>
+      )}
     </div>
   )
-}
-
+});
 
 // ─────────────────────────── ESTIMATE ENGINE ───────────────────────────
 // ─── Searchable combobox over the supplier material price catalog ───────────
@@ -1151,7 +1347,7 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
   const [e, setE] = useState({
     area:initialArea||0, pitch:1.15, waste:10,
     materialRate:55, materialLabel:"Long Run Steel",
-    flashings:0, guttering:0, dayRate:850, days:2, margin:20,
+    flashings:0, guttering:0, dayRate:850, days:2, margin:20, complexity:"medium",
   })
 
   const result = useMemo(()=>calcEst(e),[e])
@@ -1209,6 +1405,17 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
         </div>
         <div style={s.card}>
           <div style={{fontWeight:700,marginBottom:14}}>Labour & Margin</div>
+          <FG label="Job Complexity">
+            <div style={{display:"flex",flexWrap:"wrap",gap:14}}>
+              {COMPLEXITY_LEVELS.map(c=>(
+                <label key={c.key} style={{display:"flex",alignItems:"center",gap:5,cursor:"pointer",fontSize:13}}>
+                  <input type="radio" name="complexity" value={c.key} checked={e.complexity===c.key}
+                    onChange={()=>setE(prev=>({...prev,complexity:c.key}))}/>
+                  {c.label}
+                </label>
+              ))}
+            </div>
+          </FG>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
             <FG label="Day Rate ($)"><input style={s.input} type="number" value={e.dayRate} onChange={ev=>upd("dayRate")(ev.target.value)}/></FG>
             <FG label="Est. Days"><input style={s.input} type="number" step="0.5" value={e.days} onChange={ev=>upd("days")(ev.target.value)}/></FG>
@@ -1223,14 +1430,14 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
           {row(`Material (${result.adjArea.toFixed(1)} m² × $${e.materialRate})`, fmt(result.matCost))}
           {row(`Flashings (${e.flashings}m × $${RATES.flashings})`, fmt(result.flashCost))}
           {row(`Guttering (${e.guttering}m × $${RATES.guttering})`, fmt(result.gutCost))}
-          {row(`Labour (${e.days} days × $${e.dayRate})`, fmt(result.labCost))}
+          {row(`Labour (${e.days} days × $${e.dayRate} × ${complexityFactor(e.complexity)} ${COMPLEXITY_LEVELS.find(c=>c.key===e.complexity)?.label})`, fmt(result.labCost))}
           {row(`Margin (${e.margin}%)`, fmt(result.marginAmt))}
           <div style={{borderTop:"1px solid rgba(255,255,255,0.15)",paddingTop:12,marginTop:4}}>
             {row("Sell Price (excl. GST)", fmt(result.sellPrice), true, true)}
             {row(`GST (${GST_RATE*100}%)`, fmt(result.gst))}
             <div style={{display:"flex",justifyContent:"space-between",padding:"12px 0 0",alignItems:"center"}}>
               <span style={{color:"#fff",fontWeight:700,fontSize:15}}>Total inc. GST</span>
-              <span style={{fontFamily:"'Syne',sans-serif",fontSize:24,fontWeight:800,color:"#f59e0b"}}>{fmt(result.total)}</span>
+              <Money value={fmt(result.total)} size={24} color="#f59e0b"/>
             </div>
           </div>
         </div>
@@ -1306,8 +1513,29 @@ function QuotePrintView({ project, customer, company, setView }) {
   )
 }
 
-function QuoteView({ project, customer, company }) {
+function QuoteView({ project, customer, company, asbestosOverride }) {
   const { currency, formatMoney: fmt } = useCurrency()   // ← currency-aware fmt + name
+  const [snapshotUrl, setSnapshotUrl] = useState(null)
+  const [hasAsbestosRisk, setHasAsbestosRisk] = useState(false)
+  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
+
+  // ← asbestosOverride is passed by the New Project wizard's live "Quote &
+  //   Save" preview (step 3), since that project hasn't been saved to the
+  //   backend yet — there's no project.id to fetch saved geometry for, so
+  //   it comes straight from the wizard's in-memory measurement state
+  //   instead. Already-saved projects (ProjectDetail/print view) leave this
+  //   undefined and fall back to the DB fetch below.
+  useEffect(()=>{
+    if(asbestosOverride !== undefined) return
+    if(!project?.id) return
+    let cancelled = false
+    estimatesApi.getGeometry(project.id)
+      .then(g => { if(!cancelled) { setSnapshotUrl(g?.snapshot_url || null); setHasAsbestosRisk(!!g?.asbestos) } })
+      .catch(()=>{ if(!cancelled) { setSnapshotUrl(null); setHasAsbestosRisk(false) } })
+    return () => { cancelled = true }
+  },[project?.id, asbestosOverride])
+
+  const showAsbestosWarning = asbestosOverride !== undefined ? !!asbestosOverride : hasAsbestosRisk
 
   if(!project||!customer) return <div style={{color:"#64748b",padding:20}}>No project selected.</div>
   const e = project.estimate
@@ -1327,10 +1555,13 @@ function QuoteView({ project, customer, company }) {
   return (
     <div style={{maxWidth:660,width:"100%",background:"#fff",border:"1px solid #e2e8f0",borderRadius:14,padding:32}} className="quote-view-responsive">
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:28,paddingBottom:22,borderBottom:"2px solid #e2e8f0",flexWrap:"wrap",gap:12}}>
-        <div>
-          <div style={{fontFamily:"'Syne',sans-serif",fontSize:24,fontWeight:800}}>{company.companyName}</div>
-          <div style={{fontSize:12,color:"#64748b",marginTop:5,lineHeight:1.9}}>
-            {company.companyAddress}<br/>{company.companyEmail} · {company.companyPhone}<br/>GST No: {company.companyGst}
+        <div style={{display:"flex",alignItems:"flex-start",gap:14}}>
+          {company.logoUrl && <img src={`${API_ORIGIN}${company.logoUrl}`} alt="" style={{width:56,height:56,objectFit:"contain",flexShrink:0}}/>}
+          <div>
+            <div style={{fontFamily:"'Syne',sans-serif",fontSize:24,fontWeight:800}}>{company.companyName}</div>
+            <div style={{fontSize:12,color:"#64748b",marginTop:5,lineHeight:1.9}}>
+              {company.companyAddress}<br/>{company.companyEmail} · {company.companyPhone}<br/>GST No: {company.companyGst}
+            </div>
           </div>
         </div>
         <div style={{textAlign:"right"}}>
@@ -1385,7 +1616,7 @@ function QuoteView({ project, customer, company }) {
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",paddingTop:14}}>
             <span style={{fontWeight:700,fontSize:15}}>Total inc. GST</span>
             <div style={{textAlign:"right"}}>
-              <div style={{fontFamily:"'Syne',sans-serif",fontSize:26,fontWeight:800}}>{fmt(e.total)}</div>
+              <Money value={fmt(e.total)} size={26}/>
               {/* ← shows active currency name instead of hardcoded "New Zealand Dollars" */}
               <div style={{fontSize:11,color:"#64748b"}}>{currency.name}</div>
             </div>
@@ -1395,11 +1626,41 @@ function QuoteView({ project, customer, company }) {
 
       <div style={{borderTop:"1px solid #e2e8f0",paddingTop:18,marginTop:18}}>
         <div style={{fontSize:11,color:"#94a3b8",lineHeight:2}}>
+          {showAsbestosWarning && (
+            /* <div style={{marginTop:18,paddingTop:14,borderTop:"1px solid #e2e8f0"}}> */
+              <div style={{fontSize:11,color:"#64748b",lineHeight:1.7}}>⚠️ <strong style={{color:"#0f172a"}}>Asbestos Warning:</strong> Existing roofing materials must not be disturbed. Where asbestos-containing materials (ACMs) are known or suspected, an asbestos assessment is required before any roofing work commences. Asbestos testing, removal, and disposal are excluded from this quotation unless expressly included.</div>
+            /*</div>*/
+          )}
+          <br/>
           <strong style={{color:"#64748b"}}>Terms:</strong> 50% deposit on acceptance. Balance on completion within 7 days of invoice.<br/>
           <strong style={{color:"#64748b"}}>Payment:</strong> Bank transfer to {company.companyName} — {company.companyBank}<br/>
           <strong style={{color:"#64748b"}}>Validity:</strong> This quote is valid for 30 days from date of issue. Subject to site inspection.
         </div>
       </div>
+
+      {(company.estimatorName || company.estimatorTitle) && (
+        <div style={{marginTop:24}}>
+          <div style={{fontSize:13,color:"#0f172a",lineHeight:1.8}}>
+            Ngā mihi,<br/>
+            <strong>{company.estimatorName}</strong><br/>
+            {company.estimatorTitle}<br/>
+            {company.companyName}
+          </div>
+        </div>
+      )}
+
+      {company.badgesUrl && (
+        <div style={{marginTop:16}}>
+          <img src={`${API_ORIGIN}${company.badgesUrl}`} alt="" style={{maxWidth:"100%",maxHeight:60,objectFit:"contain"}}/>
+        </div>
+      )}
+
+      {snapshotUrl && (
+        <div style={{marginTop:20,paddingTop:18,borderTop:"1px solid #e2e8f0"}}>
+          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:.5,color:"#64748b",marginBottom:10}}>Roof Measurement Plan</div>
+          <img src={`${API_ORIGIN}${snapshotUrl}`} alt="Roof measurement plan" style={{maxWidth:"100%",border:"1px solid #e2e8f0",borderRadius:8}}/>
+        </div>
+      )}
     </div>
   )
 }
@@ -1417,11 +1678,30 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
   const [isNewCust, setIsNewCust] = useState(false)
   const [area,      setArea]      = useState(existingProject?.area||null)
   const [estimate,  setEstimate]  = useState(existingProject?.estimate||null)
+  const [geometryFull, setGeometryFull] = useState(null)
+  const [geometryLoaded, setGeometryLoaded] = useState(!existingProject)
+  const [geometrySnapshotDataUrl, setGeometrySnapshotDataUrl] = useState(null)
+  const measurementToolRef = useRef(null)
 
   const [selectedJobId,       setSelectedJobId]       = useState(existingProject?.jobId||"")
   const [jobPhotos,           setJobPhotos]           = useState([])
   const [selectedJobPhotos,   setSelectedJobPhotos]   = useState([])
   const [activeMeasurePhotoUrl, setActiveMeasurePhotoUrl] = useState(null)
+
+  // ← When editing a saved project, load its previously-traced geometry
+  //   (sections/flashings/points/scale/asbestos) so the Measure step
+  //   reopens pre-populated instead of blank. Gated behind geometryLoaded
+  //   so MeasurementTool doesn't mount — and lazily seed itself from an
+  //   empty geometryFull — before this fetch resolves.
+  useEffect(()=>{
+    if(!existingProject) return
+    let cancelled = false
+    estimatesApi.getGeometry(existingProject.id)
+      .then(g => { if(!cancelled) setGeometryFull(g) })
+      .catch(()=>{})
+      .finally(()=>{ if(!cancelled) setGeometryLoaded(true) })
+    return () => { cancelled = true }
+  }, [existingProject?.id])
 
   useEffect(()=>{
     if(!selectedJobId) { setJobPhotos([]); setSelectedJobPhotos([]); return }
@@ -1459,6 +1739,11 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
       pendingNewCust = newCust
       cid = uid()
     }
+    // ← geometrySnapshotDataUrl is captured in stepNext() when leaving the
+    //   Measure step (MeasurementTool is unmounted by now, so its ref is no
+    //   longer usable here). If it's null (e.g. user never revisited Measure
+    //   this session), the backend preserves whatever snapshot was already
+    //   saved rather than clearing it.
     const project = {
       ...form,
       id: existingProject?.id || uid(),
@@ -1467,6 +1752,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
       jobPhotoIds: selectedJobPhotos,
       area: area||0,
       estimate,
+      geometry: geometryFull ? { ...geometryFull, snapshotDataUrl: geometrySnapshotDataUrl } : null,
       quoteNum:  existingProject?.quoteNum  || (estimate ? nextQuoteNum(projects) : ""),
       quoteDate: existingProject?.quoteDate || (estimate ? today() : ""),
       createdAt: existingProject?.createdAt || today(),
@@ -1482,14 +1768,24 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
     true, true, true,
   ]
 
-  const stepNext = () => setStep(n=>n+1)
+  // ← Captures the traced canvas as a PNG before leaving the Measure step,
+  //   since MeasurementTool only renders while step===1 — by the final
+  //   "Save Project" step it's already unmounted and measurementToolRef
+  //   would be null, so the snapshot has to be grabbed here instead.
+  const stepNext = () => {
+    if(step===1 && measureMethod==="upload") {
+      const snap = measurementToolRef.current?.getSnapshot?.()
+      if(snap) setGeometrySnapshotDataUrl(snap)
+    }
+    setStep(n=>n+1)
+  }
   const stepBack = () => setStep(n=>n-1)
 
   // ← Shared handler passed to whichever measurement component is active;
   //   all three (MeasurementTool, LiveCameraMeasurements, ARCameraMeasurement)
   //   report geometry with the same total_surface_m2 field, so the wizard
   //   doesn't need to know which method produced it.
-  const handleGeometryChange = g => setArea(g?.total_surface_m2 || 0)
+  const handleGeometryChange = g => { setArea(g?.total_surface_m2 || 0); setGeometryFull(g) }
 
   // ← Live camera only makes sense on a device with a built-in/rear camera
   //   the user is holding up to the roof — laptops/desktops have front-facing
@@ -1636,7 +1932,13 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
           </div>
 
           {measureMethod==="upload" && (
-            <MeasurementTool onGeometryChange={handleGeometryChange} photoUrl={activeMeasurePhotoUrl}/>
+            geometryLoaded ? (
+              <MeasurementTool ref={measurementToolRef} onGeometryChange={handleGeometryChange}
+                photoUrl={activeMeasurePhotoUrl || (geometryFull?.snapshot_url ? `${API_ORIGIN}${geometryFull.snapshot_url}` : null)}
+                initialGeometry={geometryFull}/>
+            ) : (
+              <div style={{padding:"48px 20px",textAlign:"center",color:"#64748b",fontSize:13}}>Loading previous measurement…</div>
+            )
           )}
           {measureMethod==="live" && (
             <LiveCameraMeasurements onGeometryChange={handleGeometryChange}/>
@@ -1660,6 +1962,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
               project={{...form,area,estimate,quoteNum:nextQuoteNum(projects),quoteDate:today()}}
               customer={isNewCust ? newCust : customers.find(c=>c.id===form.customerId)}
               company={company}
+              asbestosOverride={geometryFull?.asbestos}
             />
           </div>
           <div className="wizard-review-sidebar" style={{width:180,flexShrink:0}}>
@@ -1817,7 +2120,7 @@ function Pipeline({ projects, customers, setProjects, setView, setSelectedProjec
 
 // ─────────────────────────── PROJECTS LIST ───────────────────────────
 function ProjectsList({ projects, customers, setProjects, setView, setSelectedProject }) {
-  const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
+  const { formatMoney: fmt } = useCurrency()   // currency format
 
   const [search,       setSearch]       = useState("")
   const [filterStatus, setFilterStatus] = useState("All")
@@ -2078,6 +2381,16 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
   const e    = project.estimate
   const [showEmailModal, setShowEmailModal] = useState(false)
   const [copied,         setCopied]         = useState(false)
+  const [geometrySnapshotUrl, setGeometrySnapshotUrl] = useState(null)
+  const [hasAsbestosRisk,     setHasAsbestosRisk]     = useState(false)
+
+  useEffect(()=>{
+    let cancelled = false
+    estimatesApi.getGeometry(project.id)
+      .then(g => { if(!cancelled) { setGeometrySnapshotUrl(g?.snapshot_url || null); setHasAsbestosRisk(!!g?.asbestos) } })
+      .catch(()=>{ if(!cancelled) { setGeometrySnapshotUrl(null); setHasAsbestosRisk(false) } })
+    return () => { cancelled = true }
+  },[project.id])
 
   async function updateStatus(newStatus) {
     try {
@@ -2125,15 +2438,36 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
         <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;font-weight:500;">${fmt_local(li.total)}</td>
       </tr>`).join("")
 
+    // Email HTML gets pasted into external mail clients, so image src must
+    // be absolute (relative /uploads/... paths won't resolve there).
+    const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
+    const logoHTML   = co.logoUrl   ? `<img src="${API_ORIGIN}${co.logoUrl}" alt="" style="width:48px;height:48px;object-fit:contain;margin-right:14px;"/>` : ""
+    const badgesHTML = co.badgesUrl ? `<div style="margin-top:16px;"><img src="${API_ORIGIN}${co.badgesUrl}" alt="" style="max-width:100%;max-height:56px;object-fit:contain;"/></div>` : ""
+    const signOffHTML = (co.estimatorName || co.estimatorTitle) ? `
+      <div style="margin-top:24px;font-size:13px;color:#0f172a;line-height:1.8;">
+        Ngā mihi,<br/>
+        <strong>${co.estimatorName||""}</strong><br/>
+        ${co.estimatorTitle||""}<br/>
+        ${co.companyName||"DK Roofing"}
+      </div>` : ""
+    const snapshotHTML = geometrySnapshotUrl ? `
+      <div style="margin-top:20px;padding-top:18px;border-top:1px solid #e2e8f0;">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:#94a3b8;margin-bottom:10px;">Roof Measurement Plan</div>
+        <img src="${API_ORIGIN}${geometrySnapshotUrl}" alt="Roof measurement plan" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px;"/>
+      </div>` : ""
+
     return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"/></head>
 <body style="margin:0;padding:0;background:#f8fafc;font-family:'Helvetica Neue',Arial,sans-serif;">
 <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
   <div style="background:#0f172a;padding:28px 32px;display:flex;justify-content:space-between;align-items:flex-start;">
-    <div>
-      <div style="font-size:22px;font-weight:800;color:#ffffff;letter-spacing:-0.5px;">${co.companyName||"DK Roofing"}</div>
-      <div style="font-size:12px;color:#94a3b8;margin-top:6px;line-height:1.8;">
-        ${co.companyAddress||""}<br/>${co.companyEmail||""} &nbsp;·&nbsp; ${co.companyPhone||""}<br/>GST No: ${co.companyGst||""}
+    <div style="display:flex;align-items:flex-start;">
+      ${logoHTML}
+      <div>
+        <div style="font-size:22px;font-weight:800;color:#ffffff;letter-spacing:-0.5px;">${co.companyName||"DK Roofing"}</div>
+        <div style="font-size:12px;color:#94a3b8;margin-top:6px;line-height:1.8;">
+          ${co.companyAddress||""}<br/>${co.companyEmail||""} &nbsp;·&nbsp; ${co.companyPhone||""}<br/>GST No: ${co.companyGst||""}
+        </div>
       </div>
     </div>
     <div style="text-align:right;">
@@ -2172,11 +2506,15 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
         <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;"><span style="color:#64748b;">GST (${GST_RATE*100}%)</span><span style="font-weight:500;">${fmt_local(e.gst)}</span></div>
         <div style="background:#0f172a;border-radius:8px;padding:14px 16px;margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
           <span style="color:#fff;font-weight:700;font-size:14px;">Total inc. GST</span>
-          <span style="color:#f59e0b;font-size:24px;font-weight:800;">${fmt_local(e.total)}</span>
+          <span style="color:#f59e0b;font-family:'DM Sans',Arial,sans-serif;font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;">${fmt_local(e.total)}</span>
         </div>
       </div>
     </div>`:`
     <div style="padding:16px;background:#fef3c7;border-radius:8px;font-size:13px;color:#92400e;margin-bottom:24px;">⚠ Pricing to be confirmed — please contact us for a full estimate.</div>`}
+    ${hasAsbestosRisk ? `
+    <div style="margin-top:18px;padding-top:14px;border-top:1px solid #e2e8f0;">
+      <div style="font-size:11px;color:#64748b;line-height:1.7;">⚠️ <strong style="color:#0f172a;">Asbestos Warning:</strong> Existing roofing materials must not be disturbed. Where asbestos-containing materials (ACMs) are known or suspected, an asbestos assessment is required before any roofing work commences. Asbestos testing, removal, and disposal are excluded from this quotation unless expressly included.</div>
+    </div>` : ""}
     <div style="border-top:1px solid #e2e8f0;padding-top:20px;">
       <div style="font-size:11px;color:#94a3b8;line-height:2.1;">
         <strong style="color:#64748b;">Terms:</strong> 50% deposit on acceptance. Balance on completion within 7 days of invoice.<br/>
@@ -2184,6 +2522,9 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
         <strong style="color:#64748b;">Validity:</strong> This quote is valid for 30 days from date of issue. Subject to site inspection.
       </div>
     </div>
+    ${signOffHTML}
+    ${badgesHTML}
+    ${snapshotHTML}
   </div>
   <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 32px;text-align:center;">
     <div style="font-size:11px;color:#94a3b8;">${co.companyName||"DK Roofing"} &nbsp;·&nbsp; ${co.companyPhone||""} &nbsp;·&nbsp; ${co.companyEmail||""}</div>
@@ -2223,6 +2564,14 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
             ? <LinkedJobPhotos jobId={project.jobId}/>
             : <ProjectPhotos projectId={project.id}/>}
 
+          {geometrySnapshotUrl && (
+            <div style={{...s.card,marginTop:14}}>
+              <div style={{fontWeight:700,marginBottom:14}}>Measurement Plan</div>
+              <img src={`${window.location.protocol}//${window.location.hostname}:3001${geometrySnapshotUrl}`}
+                alt="Roof measurement plan" style={{maxWidth:"100%",border:"1px solid #e2e8f0",borderRadius:8}}/>
+            </div>
+          )}
+
           {e&&(
             <div style={{...s.card,marginTop:14}}>
               <div style={{fontWeight:700,marginBottom:14}}>Estimate Breakdown</div>
@@ -2241,7 +2590,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
               ))}
               <div style={{display:"flex",justifyContent:"space-between",paddingTop:14,alignItems:"center"}}>
                 <span style={{fontWeight:700}}>Total inc. GST</span>
-                <span style={{fontFamily:"'Syne',sans-serif",fontSize:22,fontWeight:800,color:"#f59e0b"}}>{formatMoney(e.total)}</span>
+                <Money value={formatMoney(e.total)} size={22} color="#f59e0b"/>
               </div>
             </div>
           )}
@@ -2871,6 +3220,9 @@ function Users({ currentUser }) {
 function Settings({ settings, onSave }) {
   const [form,  setForm]  = useState(settings)
   const [saved, setSaved] = useState(false)
+  const [uploadingLogo,   setUploadingLogo]   = useState(false)
+  const [uploadingBadges, setUploadingBadges] = useState(false)
+  const [uploadError,     setUploadError]     = useState("")
 
   const upd    = k => e => setForm(prev=>({...prev,[k]:e.target.value}))
   const updNum = k => e => setForm(prev=>({...prev,[k]:parseFloat(e.target.value)||0}))
@@ -2881,8 +3233,67 @@ function Settings({ settings, onSave }) {
     setTimeout(()=>setSaved(false), 2500)
   }
 
+  async function uploadImage(kind, file) {
+    if (!file) return
+    const setUploading = kind==="logo" ? setUploadingLogo : setUploadingBadges
+    const urlKey = kind==="logo" ? "logoUrl" : "badgesUrl"
+    setUploading(true); setUploadError("")
+    try {
+      const result = kind==="logo"
+        ? await companyProfileApi.uploadLogo(file)
+        : await companyProfileApi.uploadBadges(file)
+      setForm(prev=>({...prev, [urlKey]: result[urlKey]}))
+      onSave({ [urlKey]: result[urlKey] })
+    } catch (err) {
+      setUploadError(err.message || "Upload failed")
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
+
   return (
     <div style={{maxWidth:600}}>
+      <div style={{...s.card,marginBottom:16}}>
+        <div style={{fontWeight:700,marginBottom:4}}>Quotation Branding</div>
+        <div style={{fontSize:12,color:"#94a3b8",marginBottom:16}}>This is your own branding — every quote you generate uses these, separately from other users' accounts.</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}} className="grid2-responsive">
+          <div>
+            <label style={s.label}>Company Logo</label>
+            <div style={{border:"1px dashed #e2e8f0",borderRadius:8,padding:12,textAlign:"center",background:"#f8fafc"}}>
+              {form.logoUrl
+                ? <img src={`${API_ORIGIN}${form.logoUrl}`} alt="Logo" style={{maxHeight:60,maxWidth:"100%",objectFit:"contain",marginBottom:8}}/>
+                : <div style={{fontSize:11,color:"#94a3b8",marginBottom:8}}>No logo uploaded</div>}
+              <input type="file" accept="image/*" id="logo-upload" style={{display:"none"}}
+                onChange={e=>{ uploadImage("logo", e.target.files[0]); e.target.value="" }}/>
+              <Btn sm onClick={()=>document.getElementById("logo-upload").click()}>
+                {uploadingLogo ? "Uploading…" : form.logoUrl ? "Replace Logo" : "Upload Logo"}
+              </Btn>
+            </div>
+          </div>
+          <div>
+            <label style={s.label}>Accreditation / Badges Strip</label>
+            <div style={{border:"1px dashed #e2e8f0",borderRadius:8,padding:12,textAlign:"center",background:"#f8fafc"}}>
+              {form.badgesUrl
+                ? <img src={`${API_ORIGIN}${form.badgesUrl}`} alt="Badges" style={{maxHeight:60,maxWidth:"100%",objectFit:"contain",marginBottom:8}}/>
+                : <div style={{fontSize:11,color:"#94a3b8",marginBottom:8}}>Optional — e.g. LBP, industry association, awards</div>}
+              <input type="file" accept="image/*" id="badges-upload" style={{display:"none"}}
+                onChange={e=>{ uploadImage("badges", e.target.files[0]); e.target.value="" }}/>
+              <Btn sm onClick={()=>document.getElementById("badges-upload").click()}>
+                {uploadingBadges ? "Uploading…" : form.badgesUrl ? "Replace Badges" : "Upload Badges"}
+              </Btn>
+            </div>
+          </div>
+        </div>
+        {uploadError && <div style={{marginTop:10,fontSize:12,color:"#991b1b",background:"#fee2e2",borderRadius:8,padding:"8px 12px"}}>{uploadError}</div>}
+        <div style={{height:1,background:"#f1f5f9",margin:"16px 0"}}/>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
+          <FG label="Estimator Name"><input style={s.input} value={form.estimatorName}  onChange={upd("estimatorName")} placeholder="Jimson Betonio"/></FG>
+          <FG label="Estimator Title"><input style={s.input} value={form.estimatorTitle} onChange={upd("estimatorTitle")} placeholder="Estimator"/></FG>
+        </div>
+        <div style={{fontSize:11,color:"#94a3b8"}}>Printed as the sign-off block at the bottom of every quote (e.g. "Ngā mihi, / {form.estimatorName||"Your Name"} / {form.estimatorTitle||"Title"} / {form.companyName}").</div>
+      </div>
       <div style={{...s.card,marginBottom:16}}>
         <div style={{fontWeight:700,marginBottom:16}}>Company Profile</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
@@ -2940,10 +3351,11 @@ export default function App() {
 
   const { user, login, logout } = useAuth()
 
-  const [settings, setSettings] = useState(()=>{
-    try { return {...DEFAULT_SETTINGS,...JSON.parse(localStorage.getItem("atoproof_settings"))||{}} }
-    catch { return DEFAULT_SETTINGS }
-  })
+  // ← Quotation branding is now per-user, stored server-side in
+  //   company_profiles (was previously a single browser-localStorage blob
+  //   shared by whoever used that browser — not real per-account SaaS
+  //   settings). DEFAULT_SETTINGS is just the pre-fetch placeholder.
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS)
 
   useEffect(()=>{
     if (!user) {
@@ -2953,21 +3365,31 @@ export default function App() {
       setJobs([])
       return
     }
+    // ← Each resource is fetched independently (not a single Promise.all) so
+    //   one failing request — e.g. a slow company-profile fetch — can't wipe
+    //   out successfully-loaded real data for the others. Failures no longer
+    //   silently substitute fake seed_customers/seed_projects (non-UUID ids
+    //   like "c1") into live state, since any write against that fake data
+    //   fails server-side with a confusing "invalid input syntax for uuid"
+    //   error — a failed load now surfaces a toast instead.
     async function loadData() {
-      try {
-        const [rawProjects, rawCustomers, rawJobs] = await Promise.all([
-          projectsApi.getAll(),
-          customersApi.getAll(),
-          jobsApi.getAll(),
-        ])
-        setProjects(rawProjects.map(normalizeProject))
-        setCustomers(rawCustomers.map(normalizeKeys))
-        setJobs(rawJobs)
-      } catch(err) {
-        console.warn("Backend not available, using seed data:", err.message)
-        setProjects(seed_projects)
-        setCustomers(seed_customers)
-        setJobs([])
+      const results = await Promise.allSettled([
+        projectsApi.getAll(),
+        customersApi.getAll(),
+        jobsApi.getAll(),
+        companyProfileApi.get(),
+      ])
+      const [projectsResult, customersResult, jobsResult, profileResult] = results
+
+      if (projectsResult.status === "fulfilled") setProjects(projectsResult.value.map(normalizeProject))
+      if (customersResult.status === "fulfilled") setCustomers(customersResult.value.map(normalizeKeys))
+      if (jobsResult.status === "fulfilled") setJobs(jobsResult.value)
+      if (profileResult.status === "fulfilled") setSettings({...DEFAULT_SETTINGS,...profileResult.value})
+
+      const failed = results.some(r => r.status === "rejected")
+      if (failed) {
+        results.forEach(r => { if (r.status === "rejected") console.error("Failed to load data:", r.reason) })
+        setToast("Couldn't load some data — check your connection and refresh")
       }
       setLoaded(true)
     }
@@ -2977,10 +3399,10 @@ export default function App() {
   // Early returns AFTER all hooks
   if (!user) return <LoginPage onLogin={login} />
 
-  function saveSettings(updates) {
+  async function saveSettings(updates) {
     const merged = {...settings,...updates}
     setSettings(merged)
-    try { localStorage.setItem("atoproof_settings", JSON.stringify(merged)) } catch {}
+    try { await companyProfileApi.update(merged) } catch(err) { console.error("Failed to save company profile:", err) }
   }
 
   const PAGE_TITLES = {
@@ -3032,6 +3454,14 @@ export default function App() {
         }).catch(err => console.error("Quote history save failed:", err))
       }
 
+      // Persist the traced measurement geometry + canvas snapshot (used to
+      // embed the roof plan image in the generated quote) now that we know
+      // the real backend-assigned project id.
+      if (project.geometry) {
+        estimatesApi.saveGeometry(savedProject.id, project.geometry)
+          .catch(err => console.error("Geometry snapshot save failed:", err))
+      }
+
       setShowWizard(false)
       setEditingProject(null)
       setSelectedProject(savedProject)
@@ -3050,10 +3480,10 @@ export default function App() {
     : null
 
   if(!loaded) return (
-    <div style={{...s.app,alignItems:"center",justifyContent:"center"}}>
-      <div style={{textAlign:"center"}}>
-        <img src="/aTopRoof.png" alt="aTopRoof" style={{width:220,marginBottom:12}}/>
-        <div style={{color:"#64748b",marginTop:8,fontSize:13}}>Loading your workspace…</div>
+    <div className="flex h-screen items-center justify-center font-sans bg-slate-50">
+      <div className="text-center">
+        <img src="/aTopRoof.png" alt="aTopRoof" className="w-[220px] mb-3"/>
+        <div className="text-slate-500 mt-2 text-[13px]">Loading your workspace…</div>
       </div>
     </div>
   )
@@ -3062,151 +3492,19 @@ export default function App() {
   //     components can call useCurrency() safely. ───────────────────
   return (
     <CurrencyProvider user={user}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=Syne:wght@700;800&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        input, select, textarea { font-family: 'DM Sans', sans-serif; }
-        input:focus, select:focus, textarea:focus { outline: none; border-color: #f59e0b !important; }
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 3px; }
-        tr:hover td { background: #f8fafc; }
-        button { font-family: 'DM Sans', sans-serif; }
-
-        @media print {
-          [data-sidebar], [data-topbar] { display: none !important; }
-          .print-hide { display: none !important; }
-          body, html { height:auto!important; width:100%!important; overflow:visible!important; background:#fff!important; margin:0!important; padding:0!important; }
-          div[style*="display:flex"][style*="height:100vh"],
-          div[style*="display: flex"][style*="height: 100vh"] { display:block!important; height:auto!important; overflow:visible!important; }
-          [data-main-content], [data-main-content] > * { display:block!important; overflow:visible!important; height:auto!important; width:100%!important; max-width:100%!important; padding:0!important; margin:0!important; flex:none!important; }
-          [data-quote-content] { display:block!important; width:100%!important; max-width:100%!important; padding:0!important; margin:0!important; }
-          [data-quote-content] > div { max-width:100%!important; width:100%!important; border:none!important; border-radius:0!important; box-shadow:none!important; padding:0!important; }
-          @page { size: A4; margin: 12mm 14mm; }
-        }
-
-        /* ── Responsive modal (Bootstrap-like, mobile-first) ── */
-        .responsive-modal {
-          margin: 24px auto;
-          border-radius: 14px;
-        }
-        @media (max-width: 992px) {
-          .responsive-modal { max-width: 92vw !important; }
-        }
-        @media (max-width: 640px) {
-          .responsive-modal {
-            margin: 0;
-            width: 100vw !important;
-            max-width: 100vw !important;
-            height: 100vh !important;
-            max-height: 100vh !important;
-            border-radius: 0;
-          }
-          .responsive-modal-body { padding: 14px !important; }
-        }
-
-        /* ── Wizard step layout ── */
-        .wizard-step-grid { display:grid; gap:10px; }
-        .wizard-review-grid { display:flex; gap:20px; align-items:flex-start; }
-        @media (max-width: 900px) {
-          .wizard-review-grid { flex-direction: column; }
-          .wizard-review-sidebar { width:100% !important; }
-        }
-        .wizard-steps-row { flex-wrap: wrap; row-gap: 10px; }
-        @media (max-width: 640px) {
-          .wizard-step-label { display: none; }
-        }
-
-        /* ── Measurement tool responsive grid ── */
-        .mt-grid {
-          display:grid;
-          grid-template-columns: 1fr 250px;
-          gap:12px;
-        }
-        @media (max-width: 900px) {
-          .mt-grid { grid-template-columns: 1fr; }
-          .mt-sidepanel { max-height: 340px; }
-        }
-        .mt-canvas-wrap {
-          position: relative;
-          width: 100%;
-          aspect-ratio: 490 / 330;
-        }
-        .mt-canvas-wrap canvas {
-          position: absolute;
-          top:0; left:0;
-          width: 100% !important;
-          height: 100% !important;
-          display:block;
-          touch-action: none;
-        }
-        .mt-toolbar { flex-wrap: wrap; }
-
-        /* ── General responsive grids ── */
-        @media (max-width: 800px) {
-          .grid2-responsive  { grid-template-columns: 1fr !important; }
-          .grid2r-responsive { grid-template-columns: 1fr !important; }
-        }
-        @media (max-width: 900px) {
-          .grid4-responsive { grid-template-columns: repeat(2,1fr) !important; }
-        }
-        @media (max-width: 480px) {
-          .grid4-responsive { grid-template-columns: 1fr !important; }
-        }
-
-        /* ── Quote view padding on small screens ── */
-        @media (max-width: 640px) {
-          .quote-view-responsive { padding: 18px !important; }
-        }
-
-        /* ── App shell: sidebar collapses to a top drawer on mobile ── */
-        @media (max-width: 768px) {
-          .app-shell { flex-direction: column !important; height: 100vh !important; }
-          .app-sidebar {
-            width: 100% !important;
-            min-width: 0 !important;
-            height: auto !important;
-            flex-direction: row !important;
-            align-items: center !important;
-            padding: 8px 12px !important;
-          }
-          .app-sidebar .app-sidebar-logo { display:none !important; }
-          .app-sidebar .app-sidebar-nav {
-            display: none !important;
-          }
-          .app-sidebar.nav-open .app-sidebar-nav {
-            display: flex !important;
-            position: fixed;
-            top: 56px; left: 0; right: 0; bottom: 0;
-            background: #0f172a;
-            flex-direction: column !important;
-            padding: 16px;
-            z-index: 999;
-            overflow-y: auto;
-          }
-          .app-sidebar .app-sidebar-user { display:none !important; }
-          .mobile-menu-btn { display:flex !important; }
-          .app-topbar { flex-wrap: wrap; row-gap: 8px; padding: 10px 14px !important; }
-          .app-topbar-title { font-size: 15px !important; }
-          .app-content { padding: 14px !important; }
-        }
-        .mobile-menu-btn { display:none; }
-      `}</style>
-
-      <div className="app-shell" style={s.app}>
-        <div data-sidebar className={"app-sidebar"+(mobileNavOpen?" nav-open":"")} style={s.sidebar}>
+      <div className="app-shell flex h-screen overflow-hidden font-sans text-[14px] text-slate-900 bg-slate-50">
+        <div data-sidebar className={"app-sidebar w-[220px] min-w-[220px] bg-navy flex flex-col h-full"+(mobileNavOpen?" nav-open":"")}>
           <button
-            className="mobile-menu-btn"
+            className="mobile-menu-btn items-center justify-center w-9 h-9 border-none bg-white/10 rounded-lg text-white text-lg cursor-pointer shrink-0 mr-2.5"
             onClick={()=>setMobileNavOpen(o=>!o)}
-            style={{display:"none",alignItems:"center",justifyContent:"center",width:36,height:36,border:"none",background:"rgba(255,255,255,0.08)",borderRadius:8,color:"#fff",fontSize:18,cursor:"pointer",flexShrink:0,marginRight:10}}
           >
             {mobileNavOpen ? "✕" : "☰"}
           </button>
-          <div className="app-sidebar-logo" style={s.logo}>
-            <img src="/aTopRoof.png" alt="aTopRoof" style={{width:"100%",maxWidth:164,display:"block",background:"#ffffff",borderRadius:10,padding:"8px 12px",boxShadow:"0 1px 4px rgba(0,0,0,0.25)"}}/>
-            <div style={{fontSize:10,color:"#f59e0b",letterSpacing:1,textTransform:"uppercase",marginTop:8,fontWeight:600}}>Elevate Your Roofing Business</div>
+          <div className="app-sidebar-logo px-5 pt-5 pb-4 border-b border-white/10">
+            <img src="/aTopRoof.png" alt="aTopRoof" className="w-full max-w-[164px] block bg-white rounded-[10px] px-3 py-2 shadow-md"/>
+            <div className="text-[10px] text-accent tracking-widest uppercase mt-2 font-semibold">Elevate Your Roofing Business</div>
           </div>
-          <nav className="app-sidebar-nav" style={s.nav}>
+          <nav className="app-sidebar-nav flex-1 px-2.5 py-3 flex flex-col gap-0.5 overflow-y-auto">
             {[
               { key:"dashboard",  label:"Dashboard",   icon:"⬛" },
               { key:"new",        label:"New Project", icon:"📸", primary:true },
@@ -3219,45 +3517,44 @@ export default function App() {
               { key:"users",      label:"Users",       icon:"🔑" },
               { key:"settings",   label:"Settings",    icon:"⚙" },
             ].map((item,i)=> item===null
-              ? <div key={i} style={{height:1,background:"rgba(255,255,255,0.06)",margin:"8px 0"}}/>
+              ? <div key={i} className="h-px bg-white/[.06] my-2"/>
               : (
                 <div key={item.key}
                   onClick={()=>handleNav(item.key)}
-                  style={{...s.navItem,
-                    ...(view===item.key ? {background:"rgba(245,158,11,0.15)",color:"#f59e0b"} : {}),
-                    ...(item.primary ? {marginTop:4,background:"rgba(245,158,11,0.1)",color:"#f59e0b",border:"1px solid rgba(245,158,11,0.2)"} : {})
-                  }}
+                  className={`flex items-center gap-2.5 px-2.5 py-2.5 rounded-lg cursor-pointer text-slate-300 text-[13px] font-medium transition-colors select-none hover:bg-white/5
+                    ${view===item.key ? "!bg-accent/15 !text-accent" : ""}
+                    ${item.primary ? "mt-1 bg-accent/10 text-accent border border-accent/20" : ""}`}
                 >
-                  <span style={{fontSize:14}}>{item.icon}</span>
+                  <span className="text-sm">{item.icon}</span>
                   <span>{item.label}</span>
-                  {item.badge && <span style={{marginLeft:"auto",background:"#f59e0b",color:"#000",fontSize:10,fontWeight:700,padding:"1px 7px",borderRadius:20}}>{item.badge}</span>}
+                  {item.badge && <span className="ml-auto bg-accent text-slate-900 text-[10px] font-bold px-1.5 py-px rounded-full">{item.badge}</span>}
                 </div>
               )
             )}
           </nav>
-          <div className="app-sidebar-user" style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginTop:12,padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,0.04)"}}>
-            <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
-              <div style={{width:28,height:28,borderRadius:"50%",background:"linear-gradient(135deg,#f59e0b,#f97316)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#000",flexShrink:0}}>
+          <div className="app-sidebar-user flex items-center justify-between gap-2 mt-3 mx-2 mb-2 px-2.5 py-2 rounded-lg bg-white/[.04]">
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="w-7 h-7 rounded-full bg-gradient-to-br from-accent to-orange-500 flex items-center justify-center text-[11px] font-bold text-slate-900 shrink-0">
                 {user?.name?.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}
               </div>
-              <div style={{minWidth:0}}>
-                <div style={{fontSize:12,color:"#fff",fontWeight:500,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user?.name}</div>
-                <div style={{fontSize:10,color:"#475569"}}>aTopRoof CRM</div>
+              <div className="min-w-0">
+                <div className="text-xs text-white font-medium whitespace-nowrap overflow-hidden text-ellipsis">{user?.name}</div>
+                <div className="text-[10px] text-slate-500">aTopRoof CRM</div>
               </div>
             </div>
-            <button onClick={logout} title="Sign out" style={{background:"none",border:"none",cursor:"pointer",color:"#475569",fontSize:16,padding:4,lineHeight:1,flexShrink:0}}>⏻</button>
+            <button onClick={logout} title="Sign out" className="bg-transparent border-none cursor-pointer text-slate-500 hover:text-slate-300 text-base p-1 leading-none shrink-0">⏻</button>
           </div>
         </div>
-        <div style={s.main}>
-          <div data-topbar className="app-topbar" style={s.topbar}>
-            <div className="app-topbar-title" style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800}}>
+        <div className="flex-1 flex flex-col overflow-hidden">
+          <div data-topbar className="app-topbar flex items-center justify-between px-6 py-3.5 border-b border-slate-200 bg-white shrink-0">
+            <div className="app-topbar-title font-display text-lg font-extrabold">
               {view==="project"&&currentProject
                 ? (customers.find(c=>c.id===currentProject.customerId)?.name||"Project Detail")
                 : PAGE_TITLES[view]||view}
             </div>
-            <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+            <div className="flex gap-2.5 items-center flex-wrap">
               {view==="project"&&currentProject&&<StatusBadge status={currentProject.status}/>}
-              {view==="projects"&&<span style={{fontSize:13,color:"#64748b"}}>{projects.length} total</span>}
+              {view==="projects"&&<span className="text-[13px] text-slate-500">{projects.length} total</span>}
               {/* ← Currency selector lives here, always visible in the topbar */}
               <CurrencySelector />
               <Btn onClick={()=>{ setEditingProject(null); setShowWizard(true) }} primary>
@@ -3266,7 +3563,7 @@ export default function App() {
             </div>
           </div>
 
-          <div data-main-content className="app-content" style={s.content}>
+          <div data-main-content className="app-content flex-1 overflow-y-auto p-6">
             {view==="dashboard"&&(
               <Dashboard
                 projects={projects} customers={customers}

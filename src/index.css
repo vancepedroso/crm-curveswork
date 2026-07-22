@@ -1,0 +1,151 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'DM Sans', ui-sans-serif, sans-serif;
+  --font-display: 'Syne', ui-sans-serif, sans-serif;
+
+  /* Amber-on-navy accent palette, kept as the single source of truth for
+     both Tailwind utilities (bg-accent, text-navy, ...) and any remaining
+     inline styles during the phased migration. */
+  --color-accent: #f59e0b;
+  --color-accent-dark: #d97706;
+  --color-navy: #0f172a;
+  --color-navy-soft: #1e293b;
+}
+
+@layer base {
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--font-sans); }
+  input, select, textarea, button { font-family: var(--font-sans); }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--color-accent) !important; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 3px; }
+}
+
+@layer components {
+  tr:hover td { background: #f8fafc; }
+
+  /* ── Responsive modal (mobile-first) ── */
+  .responsive-modal {
+    margin: 24px auto;
+    border-radius: 14px;
+  }
+  @media (max-width: 992px) {
+    .responsive-modal { max-width: 92vw !important; }
+  }
+  @media (max-width: 640px) {
+    .responsive-modal {
+      margin: 0;
+      width: 100vw !important;
+      max-width: 100vw !important;
+      height: 100vh !important;
+      max-height: 100vh !important;
+      border-radius: 0;
+    }
+    .responsive-modal-body { padding: 14px !important; }
+  }
+
+  /* ── Wizard step layout ── */
+  .wizard-step-grid { display:grid; gap:10px; }
+  .wizard-review-grid { display:flex; gap:20px; align-items:flex-start; }
+  @media (max-width: 900px) {
+    .wizard-review-grid { flex-direction: column; }
+    .wizard-review-sidebar { width:100% !important; }
+  }
+  .wizard-steps-row { flex-wrap: wrap; row-gap: 10px; }
+  @media (max-width: 640px) {
+    .wizard-step-label { display: none; }
+  }
+
+  /* ── Measurement tool responsive grid ── */
+  .mt-grid {
+    display:grid;
+    grid-template-columns: 1fr 250px;
+    gap:12px;
+  }
+  @media (max-width: 900px) {
+    .mt-grid { grid-template-columns: 1fr; }
+    .mt-sidepanel { max-height: 340px; }
+  }
+  .mt-canvas-wrap {
+    position: relative;
+    width: 100%;
+    max-width: 700px;
+    aspect-ratio: 490 / 330;
+  }
+  .mt-canvas-wrap canvas {
+    position: absolute;
+    top:0; left:0;
+    width: 100% !important;
+    height: 100% !important;
+    display:block;
+    touch-action: none;
+  }
+  .mt-toolbar { flex-wrap: wrap; }
+
+  /* ── General responsive grids ── */
+  @media (max-width: 800px) {
+    .grid2-responsive  { grid-template-columns: 1fr !important; }
+    .grid2r-responsive { grid-template-columns: 1fr !important; }
+  }
+  @media (max-width: 900px) {
+    .grid4-responsive { grid-template-columns: repeat(2,1fr) !important; }
+  }
+  @media (max-width: 480px) {
+    .grid4-responsive { grid-template-columns: 1fr !important; }
+  }
+
+  /* ── Quote view padding on small screens ── */
+  @media (max-width: 640px) {
+    .quote-view-responsive { padding: 18px !important; }
+  }
+
+  /* ── App shell: sidebar collapses to a top drawer on mobile ── */
+  @media (max-width: 768px) {
+    .app-shell { flex-direction: column !important; height: 100vh !important; }
+    .app-sidebar {
+      width: 100% !important;
+      min-width: 0 !important;
+      height: auto !important;
+      flex-direction: row !important;
+      align-items: center !important;
+      padding: 8px 12px !important;
+    }
+    .app-sidebar .app-sidebar-logo { display:none !important; }
+    .app-sidebar .app-sidebar-nav {
+      display: none !important;
+    }
+    .app-sidebar.nav-open .app-sidebar-nav {
+      display: flex !important;
+      position: fixed;
+      top: 56px; left: 0; right: 0; bottom: 0;
+      background: var(--color-navy);
+      flex-direction: column !important;
+      padding: 16px;
+      z-index: 999;
+      overflow-y: auto;
+    }
+    .app-sidebar .app-sidebar-user { display:none !important; }
+    .mobile-menu-btn { display:flex !important; }
+    .app-topbar { flex-wrap: wrap; row-gap: 8px; padding: 10px 14px !important; }
+    .app-topbar-title { font-size: 15px !important; }
+    .app-content { padding: 14px !important; }
+  }
+  .mobile-menu-btn { display:none; }
+}
+
+@media print {
+  [data-sidebar], [data-topbar] { display: none !important; }
+  .print-hide { display: none !important; }
+  body, html { height:auto!important; width:100%!important; overflow:visible!important; background:#fff!important; margin:0!important; padding:0!important; }
+  /* ← was a brittle `div[style*="display:flex"]...` attribute selector
+       matching against literal inline-style strings; .app-shell is the
+       same element and already carries this className, so target it
+       directly instead. */
+  .app-shell { display:block!important; height:auto!important; overflow:visible!important; }
+  [data-main-content], [data-main-content] > * { display:block!important; overflow:visible!important; height:auto!important; width:100%!important; max-width:100%!important; padding:0!important; margin:0!important; flex:none!important; }
+  [data-quote-content] { display:block!important; width:100%!important; max-width:100%!important; padding:0!important; margin:0!important; }
+  [data-quote-content] > div { max-width:100%!important; width:100%!important; border:none!important; border-radius:0!important; box-shadow:none!important; padding:0!important; }
+  @page { size: A4; margin: 12mm 14mm; }
+}

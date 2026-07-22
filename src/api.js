@@ -144,6 +144,22 @@ export const materialsApi = {
 };
 
 // ---------------------------------------------------------------------------
+// Company profile (per-user quotation branding)
+// ---------------------------------------------------------------------------
+export const companyProfileApi = {
+  get:    ()     => get("/company-profile"),
+  update: (data) => put("/company-profile", data),
+  uploadLogo:   (file) => {
+    const form = new FormData(); form.append("image", file);
+    return request("/company-profile/logo", { method: "POST", body: form });
+  },
+  uploadBadges: (file) => {
+    const form = new FormData(); form.append("image", file);
+    return request("/company-profile/badges", { method: "POST", body: form });
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Quote history
 // ---------------------------------------------------------------------------
 export const quotesApi = {
