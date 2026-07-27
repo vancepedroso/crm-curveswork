@@ -1,8 +1,12 @@
 import { useState, useEffect, useRef, useCallback, useMemo, Fragment, forwardRef, useImperativeHandle } from "react"
+import { createPortal } from "react-dom"
+import { loadStripe } from "@stripe/stripe-js"
+import { Elements, CardNumberElement, CardExpiryElement, CardCvcElement, useStripe, useElements } from "@stripe/react-stripe-js"
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts"
-import { customersApi, projectsApi, usersApi, photosApi, quotesApi, jobsApi, jobPhotosApi, materialsApi, companyProfileApi, estimatesApi } from "./api"
+import { customersApi, projectsApi, usersApi, photosApi, quotesApi, jobsApi, jobPhotosApi, materialsApi, companyProfileApi, estimatesApi, complexityLevelsApi, organizationApi, billingApi, platformAdminApi } from "./api"
 import { useAuth } from "./AuthContext"
 import LoginPage   from "./LoginPage"
+import SignupPage  from "./SignupPage"
 import { CurrencyProvider, useCurrency } from "./CurrencyContext"
 import jsPDF from "jspdf"
 import html2canvas from "html2canvas"
@@ -33,7 +37,7 @@ const PITCHES = [
   { label:"Very Steep >45°",  factor:1.4  },
 ]
 
-const RATES = { flashings: 28, guttering: 45, downpipe: 35, underlayment: 8 }
+const RATES = { flashings: 28, guttering: 45, downpipe: 35, drain: 40, penetration: 65, underlayment: 8 }
 const GST_RATE = 0.15
 
 const DEFAULT_SETTINGS = {
@@ -73,30 +77,62 @@ const normalizeProject = raw => {
   return p
 }
 
-// Labour-cost multiplier by job complexity — access, roof shape/cutting,
-// and safety requirements all drive labour time up independent of raw m².
-const COMPLEXITY_LEVELS = [
-  { key:"low",          label:"Low",          factor:1.0,  desc:"Simple gable/mono roof, easy access" },
-  { key:"medium",       label:"Medium",       factor:1.15, desc:"Standard hip roof, normal access" },
-  { key:"high",         label:"High",         factor:1.3,  desc:"Multiple planes, steep pitch or restricted access" },
-  { key:"complex",      label:"Complex",      factor:1.5,  desc:"Heavy cutting, valleys/dormers, height/safety gear" },
-  { key:"very_complex", label:"Very Complex", factor:1.75, desc:"Highly irregular roof, difficult access, specialist crew" },
-]
-const complexityFactor = key => COMPLEXITY_LEVELS.find(c=>c.key===key)?.factor || 1
+// Labour-cost multiplier by job complexity (Low/Medium/High/Complex/Very
+// Complex) — access, roof shape/cutting, and safety requirements all drive
+// labour time up independent of raw m². Used to be hardcoded here; now a
+// global, editable list (Job Complexity settings page) fetched at runtime
+// — EstimateEngine resolves the current factor for e.complexity and passes
+// it in as e.complexityFactor, so calcEst itself stays a pure function with
+// no dependency on the fetched list.
 
 function calcEst(e) {
   if(!e) return null
-  const adjArea   = e.area * e.pitch * (1 + (e.waste||0)/100)
-  const matCost   = adjArea * e.materialRate
-  const flashCost = (e.flashings||0) * RATES.flashings
-  const gutCost   = (e.guttering||0) * RATES.guttering
-  const labCost   = (e.dayRate||850) * (e.days||0) * complexityFactor(e.complexity)
-  const sub       = matCost + flashCost + gutCost + labCost
+  // Wastage % also covers the lap/overlap allowance every flashing and
+  // gutter join needs — traced/entered lengths are the raw run, not what
+  // gets ordered.
+  const wasteFactor = 1 + (e.waste||0)/100
+  // ← Each traced roof section can carry its own brand/rate (assigned right
+  //   after tracing it, adjustable here) — sums replace the old single
+  //   global area×rate. Falls back to the flat area/pitch/rate fields when
+  //   there are no sections (manual entry / estimates predating this).
+  const sectionList = e.sections?.length ? e.sections : null
+  const adjArea   = sectionList
+    ? sectionList.reduce((a,s)=>a+(s.surface_m2||0),0) * wasteFactor
+    : e.area * e.pitch * wasteFactor
+  const matCost   = sectionList
+    ? sectionList.reduce((a,s)=>a+(s.surface_m2||0)*wasteFactor*(s.rate||0),0)
+    : adjArea * e.materialRate
+  // ← Named flashing runs (ridge cap, valley, etc.), each with its own
+  //   traced length + supplier rate, replace the old single flat-rate
+  //   flashings number. Falls back to the flat rate when there are no
+  //   runs (old saved estimates / seed data predating this feature).
+  const flashCost = (e.flashingRuns?.length ? e.flashingRuns : null)
+    ?.reduce((a,r)=>a+(r.length_m||0)*wasteFactor*(r.rate||0),0)
+    ?? (e.flashings||0) * wasteFactor * RATES.flashings
+  // ← Same pattern as sections/flashing runs: each traced gutter run,
+  //   downpipe, drain, and penetration can carry its own picked brand/rate
+  //   (assigned right after tracing it) — sums replace the old flat
+  //   count/length × one global rate. Falls back to the flat fields when
+  //   there's nothing traced (manual entry / estimates predating this).
+  const gutCost = (e.gutterRuns?.length ? e.gutterRuns : null)
+    ?.reduce((a,g)=>a+(g.length_m||0)*wasteFactor*(g.rate||0),0)
+    ?? (e.guttering||0) * wasteFactor * RATES.guttering
+  const downpipeCost = (e.downpipeItems?.length ? e.downpipeItems : null)
+    ?.reduce((a,d)=>a+(d.rate||0),0)
+    ?? (e.downpipes||0) * RATES.downpipe
+  const drainCost = (e.drainItems?.length ? e.drainItems : null)
+    ?.reduce((a,d)=>a+(d.rate||0),0)
+    ?? (e.drains||0) * RATES.drain
+  const penetrationCost = (e.penetrationItems?.length ? e.penetrationItems : null)
+    ?.reduce((a,p)=>a+(p.rate||0),0)
+    ?? (e.penetrations||0) * RATES.penetration
+  const labCost   = (e.dayRate||850) * (e.days||0) * (e.complexityFactor||1)
+  const sub       = matCost + flashCost + gutCost + downpipeCost + drainCost + penetrationCost + labCost
   const marginAmt = sub * ((e.margin||0)/100)
   const sellPrice = sub + marginAmt
   const gst       = sellPrice * GST_RATE
   const total     = sellPrice + gst
-  return { ...e, adjArea, matCost, flashCost, gutCost, labCost, marginAmt, sellPrice, gst, total }
+  return { ...e, adjArea, matCost, flashCost, gutCost, downpipeCost, drainCost, penetrationCost, labCost, marginAmt, sellPrice, gst, total }
 }
 
 function nextQuoteNum(projects) {
@@ -210,6 +246,55 @@ function CurrencySelector() {
   )
 }
 
+// ─── Billing status banner — past-due payment or seat limit reached.
+//     Rendered under the topbar, visible across every view when relevant.
+function BillingBanner({ user }) {
+  const [org, setOrg] = useState(null)
+  const [redirecting, setRedirecting] = useState(false)
+
+  useEffect(()=>{
+    organizationApi.get().then(setOrg).catch(()=>{})
+  },[])
+
+  if (!org) return null
+  const atSeatLimit = org.activeUserCount >= org.seatLimit
+  const pastDue = org.status === "past_due"
+  if (!pastDue && !atSeatLimit) return null
+
+  async function openBillingPortal() {
+    setRedirecting(true)
+    try {
+      const { url } = await billingApi.getPortalUrl()
+      window.location.href = url
+    } catch (err) {
+      alert(err.message || "Couldn't open billing portal")
+      setRedirecting(false)
+    }
+  }
+
+  return (
+    <div style={{
+      display:"flex", alignItems:"center", justifyContent:"space-between", gap:12,
+      padding:"9px 20px", fontSize:12.5, fontWeight:500,
+      background: pastDue ? "#fee2e2" : "#fffbeb",
+      color: pastDue ? "#991b1b" : "#92400e",
+      borderBottom: `1px solid ${pastDue ? "#fca5a5" : "#fde68a"}`,
+    }}>
+      <span>
+        {pastDue
+          ? "⚠️ There's a problem with your last payment — update your billing details to avoid losing access."
+          : `⚠️ Seat limit reached (${org.activeUserCount}/${org.seatLimit}) — upgrade your plan to add more people.`}
+      </span>
+      {(org.myRole === "owner" || org.myRole === "admin") && (
+        <button onClick={openBillingPortal} disabled={redirecting}
+          style={{padding:"5px 12px",borderRadius:6,border:"1px solid currentColor",background:"transparent",color:"inherit",fontSize:12,fontWeight:600,cursor:redirecting?"not-allowed":"pointer",fontFamily:"inherit",whiteSpace:"nowrap"}}>
+          {redirecting ? "Opening…" : "Manage Billing"}
+        </button>
+      )}
+    </div>
+  )
+}
+
 // ─── Big money display: a single formal sans-serif weight for the whole
 //     amount (no display/heading font on numerals — that's what read as
 //     playful/"AI-generated" rather than an invoice), tabular figures so
@@ -223,10 +308,11 @@ function Money({ value, size=24, weight=700, color="inherit" }) {
   )
 }
 
-function FG({ label, children, half }) {
+function FG({ label, children, half, error }) {
   return <div className={`mb-3.5 ${half?"col-span-1":""}`}>
     <label className="block text-xs text-slate-500 mb-1.5 font-medium">{label}</label>
     {children}
+    {error && <div className="text-xs text-red-600 mt-1">{error}</div>}
   </div>
 }
 
@@ -400,11 +486,62 @@ function Dashboard({ projects, customers, setView, setSelectedProject, onNewProj
 // ─────────────────────────── MODULE 1: ROOF MEASUREMENT TOOL (MVP) ───────────────────────────
 // Assisted (non-AI) measurement: upload a photo, trace the roof outline with points,
 // enter one known real-world measurement, and the tool scales everything proportionally.
-// Includes zoom (wheel / buttons), pan (Space+drag, middle-mouse, or the Pan tool),
+// Includes zoom (buttons), pan (Space+drag, middle-mouse, or the Pan tool),
 // and editable points — every placed point can be dragged to reposition it later.
 const SEC_COLORS = ["#3b82f6","#10b981","#8b5cf6","#f59e0b","#ef4444","#06b6d4","#f97316","#84cc16","#ec4899","#14b8a6"]
 const PEN_TYPES  = ["skylight","pipe","flue","vent","other"]
 const PEN_COLORS = { skylight:"#f59e0b", pipe:"#94a3b8", flue:"#ef4444", vent:"#10b981", other:"#8b5cf6" }
+
+// Named flashing runs, matching how a real roofing quote's scope-of-works
+// lists them (ridge cap, hip cap, valley, etc.) rather than one generic
+// "flashing" bucket — each gets its own traced length + supplier rate.
+const FLASHING_TYPES = [
+  { key:"ridge_cap",  label:"Ridge Cap"   },
+  { key:"hip_cap",    label:"Hip Cap"     },
+  { key:"head_apron", label:"Head Apron"  },
+  { key:"side_apron", label:"Side Apron"  },
+  { key:"barge",      label:"Barge"       },
+  { key:"valley",     label:"Valley"      },
+  { key:"eaves",      label:"Eaves"       },
+  { key:"backtray",   label:"Backtray"    },
+]
+const flashingLabel = key => FLASHING_TYPES.find(f=>f.key===key)?.label || "Flashing"
+
+// Units offered when calibrating the scale line — covers both metric and
+// imperial so the tool reads like a proper survey/civil measurement app,
+// not just "metres". Every unit converts to metres (the internal unit all
+// geometry math is done in) via `toM`.
+const CALIB_UNITS = [
+  { key:"mm", label:"mm", toM:0.001,   placeholder:"e.g. 3000" },
+  { key:"cm", label:"cm", toM:0.01,    placeholder:"e.g. 300"  },
+  { key:"m",  label:"m",  toM:1,       placeholder:"e.g. 3"    },
+  { key:"km", label:"km", toM:1000,    placeholder:"e.g. 0.003"},
+  { key:"in", label:"in", toM:0.0254,  placeholder:"e.g. 120"  },
+  { key:"ft", label:"ft", toM:0.3048,  placeholder:"e.g. 10"   },
+  { key:"yd", label:"yd", toM:0.9144,  placeholder:"e.g. 3.3"  },
+]
+
+// Brand-picker popup shown right after drawing a gutter run, downpipe,
+// roof drain, or penetration — mirrors the roof section popup so every
+// traced item that carries its own materialLabel/rate gets assigned one
+// on the spot instead of only in the Estimate step. `group` matches
+// roof_materials.product_group (migrations/13, /14).
+// `unit` picks how MaterialPicker.pick() derives a rate; `catalogUnit`
+// filters results to rows priced that way in the catalog's own `unit`
+// column — e.g. without it, a gutter run (priced per metre) could match an
+// "ea" bracket/clip that happens to share the same product_group as the
+// actual per-metre spouting product.
+const ACCESSORY_MODAL_CONFIG = {
+  // Title/prompt are overridden with the specific subtype name (Ridge Cap,
+  // Valley, etc.) where the modal is rendered — a flashing run's brand
+  // applies to every traced segment of that same subtype, not just the one
+  // just drawn, since the Estimate step prices per-subtype, not per-line.
+  flashing:    { title:"Flashing Brand",            group:"flashing",    unit:"lm",   catalogUnit:"LM", prompt:"What product will this flashing use?" },
+  gutter:      { title:"Guttering Brand",           group:"gutter",      unit:"lm",   catalogUnit:"LM", prompt:"What guttering product will this run use?" },
+  downpipe:    { title:"Downpipe Brand",            group:"downpipe",    unit:"each", catalogUnit:"ea", prompt:"What downpipe product is this?" },
+  drain:       { title:"Roof Drain Brand",          group:"drain",       unit:"each", catalogUnit:"ea", prompt:"What roof drain product is this?" },
+  penetration: { title:"Penetration Flashing Brand",group:"penetration", unit:"each", catalogUnit:"ea", prompt:"What penetration flashing/boot will seal this?" },
+}
 
 function parsePitch(str) {
   if(!str||str==="") return 1.0
@@ -424,6 +561,13 @@ function linelenPx(pts) {
   let l=0
   for(let i=0;i<pts.length-1;i++) l+=Math.sqrt((pts[i+1].x-pts[i].x)**2+(pts[i+1].y-pts[i].y)**2)
   return l
+}
+function distToSegment(pt, a, b) {
+  const dx=b.x-a.x, dy=b.y-a.y
+  const lenSq = dx*dx+dy*dy
+  if(lenSq===0) return Math.hypot(pt.x-a.x, pt.y-a.y)
+  const t = Math.max(0, Math.min(1, ((pt.x-a.x)*dx+(pt.y-a.y)*dy)/lenSq))
+  return Math.hypot(pt.x-(a.x+t*dx), pt.y-(a.y+t*dy))
 }
 
 // Fixed internal drawing resolution (world / image space). Zoom & pan are
@@ -446,25 +590,19 @@ function initialSectionsFrom(g) {
     id: sec.id || uid(), name: sec.name || `Section ${i+1}`,
     pts: sec.shape_points || [], closed: true,
     pitch: sec.pitch || "1.15", color: SEC_COLORS[i % SEC_COLORS.length],
+    materialLabel: sec.materialLabel || "", rate: sec.rate || 0,
   }))
 }
 function initialLineItemsFrom(g) {
   const flashings = g?.accessories?.flashings || []
   const gutters    = g?.accessories?.gutters   || []
-  return [...flashings, ...gutters].map(l => ({ id: l.id || uid(), type: l.type, pts: l.pts || [] }))
+  return [...flashings, ...gutters].map(l => ({ id: l.id || uid(), type: l.type, subtype: l.subtype, pts: l.pts || [] }))
 }
 function initialPtItemsFrom(g) {
   const downpipes = g?.accessories?.downpipes   || []
   const drains     = g?.accessories?.drains     || []
   const pens       = g?.accessories?.penetrations || []
   return [...downpipes, ...drains, ...pens].map(p => ({ ...p, id: p.id || uid() }))
-}
-function initialScaleLineFrom(g) {
-  // Exact original calibration line position isn't stored — only the
-  // resolved ratio (scale_m_per_px) — so a synthetic 100px line reproduces
-  // the same ratio; only its on-canvas position is arbitrary (cosmetic).
-  if(!g?.scale_m_per_px) return null
-  return { p1:{x:100,y:280}, p2:{x:200,y:280} }
 }
 function initialKnownMFrom(g) {
   return g?.scale_m_per_px ? parseFloat((g.scale_m_per_px*100).toFixed(4)) : 10
@@ -475,16 +613,41 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   const imgRef      = useRef(null)
   const [imgSrc,    setImgSrc]    = useState(null)
   const [sections,  setSections]  = useState(() => initialSectionsFrom(initialGeometry))
+  // ← id of a just-closed section awaiting its "pick a roof sheet brand"
+  //   popup — prompted immediately on close rather than only in Estimate.
+  const [sectionMaterialModalId, setSectionMaterialModalId] = useState(null)
+  // ← Picked-but-not-yet-saved brand for that popup — only committed to the
+  //   section when "Save" is clicked, not the instant a result is picked,
+  //   so browsing/searching doesn't accidentally close the popup early.
+  const [pendingSectionMaterial, setPendingSectionMaterial] = useState(null)
+  // ← Same "pick a brand right after drawing it" popup as roof sections,
+  //   generalized to the other traced items that also carry their own
+  //   materialLabel/rate: gutters, downpipes, roof drains, penetrations.
+  //   {kind, id} of whichever one is awaiting its popup, kind matching
+  //   ACCESSORY_MODAL_CONFIG below.
+  const [accessoryModal, setAccessoryModal] = useState(null)
+  const [pendingAccessoryMaterial, setPendingAccessoryMaterial] = useState(null)
   const [lineItems, setLineItems] = useState(() => initialLineItemsFrom(initialGeometry))
   const [ptItems,   setPtItems]   = useState(() => initialPtItemsFrom(initialGeometry))
-  const [scaleLine, setScaleLine] = useState(() => initialScaleLineFrom(initialGeometry))
+  // ← No on-canvas scale line is fabricated when restoring a saved project —
+  //   only the resolved ratio is known, not where the original line sat, and
+  //   drawing a fake one made it look like a real, editable scale line the
+  //   user never drew. The ratio itself is kept as a silent fallback (below)
+  //   so restored section areas stay correct until/unless the user redraws
+  //   their own scale line, which then takes over.
+  const [scaleLine, setScaleLine] = useState(null)
   const [knownM,    setKnownM]    = useState(() => initialKnownMFrom(initialGeometry))
+  // ← Postgres DECIMAL columns come back as strings (e.g. "0.05000000"), not
+  //   numbers — without parseFloat here, downstream math like sf.toFixed()
+  //   throws since sf would be a string.
+  const restoredMPerPx = useRef(initialGeometry?.scale_m_per_px ? parseFloat(initialGeometry.scale_m_per_px) : null).current
   const [calibModalOpen, setCalibModalOpen] = useState(false)
   const [calibUnit,      setCalibUnit]      = useState("m")
   const [calibInput,     setCalibInput]     = useState("")
   const [asbestos,  setAsbestos]  = useState(() => !!initialGeometry?.asbestos)
   const [activeTool,setActiveTool]= useState("section")
   const [penSub,    setPenSub]    = useState("pipe")
+  const [flashSub,  setFlashSub]  = useState("ridge_cap")
   const [drawPts,   setDrawPts]   = useState([])
   const [hoverPt,   setHoverPt]   = useState(null)
 
@@ -496,7 +659,43 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 
   // ── Editable points ─────────────────────────────────────────────────
   const dragRef = useRef(null) // { kind, id, idx? } currently-dragged point
+  const clickStartRef = useRef(null) // {x,y} client coords at mousedown — tells an actual drag apart from a stationary click that happened to land on an existing point
   const [editMode, setEditMode] = useState(false)
+
+  // ── Undo / Redo (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z or Ctrl+Y) ──────────────
+  // A snapshot is pushed before every mutating action (adding a point to
+  // a line, finishing a shape, deleting, dragging, calibrating scale), so
+  // undo works one click/point at a time — not just whole-shape at a time.
+  const historyRef = useRef([])
+  const redoRef = useRef([]) // states popped by undo, so redo can restore them — cleared on any new action
+  const dragPushedRef = useRef(false) // whether the current drag gesture has already pushed its pre-drag snapshot
+  function snapshot(){
+    return { sections, lineItems, ptItems, scaleLine, knownM, asbestos, drawPts }
+  }
+  function applySnapshot(snap){
+    setSections(snap.sections); setLineItems(snap.lineItems); setPtItems(snap.ptItems)
+    setScaleLine(snap.scaleLine); setKnownM(snap.knownM); setAsbestos(snap.asbestos)
+    setDrawPts(snap.drawPts)
+  }
+  function pushHistory(){
+    historyRef.current.push(snapshot())
+    if(historyRef.current.length>50) historyRef.current.shift()
+    redoRef.current = [] // a fresh action invalidates whatever was redo-able
+  }
+  function undo(){
+    const prev = historyRef.current.pop()
+    if(!prev) return
+    redoRef.current.push(snapshot())
+    if(redoRef.current.length>50) redoRef.current.shift()
+    applySnapshot(prev)
+  }
+  function redo(){
+    const next = redoRef.current.pop()
+    if(!next) return
+    historyRef.current.push(snapshot())
+    if(historyRef.current.length>50) historyRef.current.shift()
+    applySnapshot(next)
+  }
 
   // ── Marquee select (Photoshop-style drag-a-box, then Delete) ────────
   const [selectBox, setSelectBox] = useState(null) // {start:{x,y}, current:{x,y}} while dragging
@@ -510,10 +709,12 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   }))
 
   const mPerPx = useMemo(()=>{
-    if(!scaleLine?.p1||!scaleLine?.p2) return null
-    const px=Math.sqrt((scaleLine.p2.x-scaleLine.p1.x)**2+(scaleLine.p2.y-scaleLine.p1.y)**2)
-    return px>0 ? knownM/px : null
-  },[scaleLine, knownM])
+    if(scaleLine?.p1 && scaleLine?.p2){
+      const px=Math.sqrt((scaleLine.p2.x-scaleLine.p1.x)**2+(scaleLine.p2.y-scaleLine.p1.y)**2)
+      return px>0 ? knownM/px : null
+    }
+    return restoredMPerPx // fallback for a restored project until the user redraws their own line
+  },[scaleLine, knownM, restoredMPerPx])
 
   const geometry = useMemo(()=>{
     const sf = mPerPx || 0.05
@@ -527,6 +728,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         footprint_m2: parseFloat(fp.toFixed(2)),
         surface_m2:   parseFloat((fp*fac).toFixed(2)),
         pitchFactor:  parseFloat(fac.toFixed(3)),
+        materialLabel: sec.materialLabel||"", rate: sec.rate||0,
         edges:[]
       }
     })
@@ -535,9 +737,24 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     const downpipes = ptItems.filter(p=>p.type==="downpipe")
     const drains    = ptItems.filter(p=>p.type==="drain")
     const pens      = ptItems.filter(p=>p.type==="penetration")
+    // ← Grouped by named run (ridge cap, valley, etc.) so each traced
+    //   subtype can get its own length + supplier rate in the Estimate
+    //   step, instead of one flat "flashings" total.
+    const flashingBySubtype = {}
+    const flashingMaterialBySubtype = {}
+    flashings.forEach(f=>{
+      const key = f.subtype || "other"
+      flashingBySubtype[key] = parseFloat(((flashingBySubtype[key]||0) + f.length_m).toFixed(2))
+      // ← First non-empty pick for this subtype wins as the "traced"
+      //   default — all segments of the same subtype get the same brand
+      //   applied via the popup anyway, so they should already agree.
+      if(f.materialLabel && !flashingMaterialBySubtype[key]) flashingMaterialBySubtype[key] = { materialLabel:f.materialLabel, rate:f.rate||0 }
+    })
     return {
       sections: processedSections,
       accessories:{ flashings, gutters, downpipes, drains, penetrations:pens },
+      flashingBySubtype,
+      flashingMaterialBySubtype,
       asbestos,
       scale_m_per_px: parseFloat(sf.toFixed(6)),
       total_footprint_m2: parseFloat(processedSections.reduce((a,sec)=>a+sec.footprint_m2,0).toFixed(2)),
@@ -601,6 +818,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   const isPanMode = activeTool==="pan" || spaceDown
 
   function deleteSelected() {
+    pushHistory()
     if(selection.sections.length) setSections(prev=>prev.filter(s=>!selection.sections.includes(s.id)))
     if(selection.lines.length)    setLineItems(prev=>prev.filter(l=>!selection.lines.includes(l.id)))
     if(selection.points.length)   setPtItems(prev=>prev.filter(p=>!selection.points.includes(p.id)))
@@ -618,6 +836,25 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     window.addEventListener("keydown", onKeyDown)
     return ()=>window.removeEventListener("keydown", onKeyDown)
   },[activeTool, selection])
+
+  // Ctrl/Cmd+Z undoes the last point/line/action; Ctrl/Cmd+Shift+Z or
+  // Ctrl+Y redoes it — skipped while typing in a field (e.g. the
+  // scale-calibration input) so native text-undo still works there.
+  useEffect(()=>{
+    function onKeyDown(e){
+      const tag = e.target?.tagName
+      if(tag==="INPUT" || tag==="TEXTAREA" || tag==="SELECT") return
+      const key = e.key.toLowerCase()
+      if((e.ctrlKey||e.metaKey) && key==="z"){
+        e.preventDefault()
+        if(e.shiftKey) redo(); else undo()
+      } else if((e.ctrlKey||e.metaKey) && key==="y"){
+        e.preventDefault(); redo()
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return ()=>window.removeEventListener("keydown", onKeyDown)
+  },[])
 
   const drawCanvas = useCallback(()=>{
     const cv=canvasRef.current; if(!cv)return
@@ -658,12 +895,46 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       if(sec.closed){
         const cx=sec.pts.reduce((a,p)=>a+p.x,0)/sec.pts.length
         const cy=sec.pts.reduce((a,p)=>a+p.y,0)/sec.pts.length
+        // ← Once a brand is picked, sec.name is the full supplier/product
+        //   string (can be long) instead of "Section N" — word-wrapped onto
+        //   several smaller lines (canvas text doesn't wrap on its own) so
+        //   the whole name stays readable instead of being cut short with
+        //   "…". Box grows to fit the wrapped lines, capped at maxLines with
+        //   only that last line ellipsized as a safety net for one very
+        //   long unbroken word that still can't fit.
+        const fontPx = 9/view.zoom
+        ctx.font=`bold ${fontPx}px DM Sans`; ctx.textAlign="center"
+        const label = sec.name||`Sec ${idx+1}`
+        const maxTextW = lw(110)
+        const maxLines = 3
+        const words = label.split(" ")
+        const lines = []
+        let current = ""
+        words.forEach(word=>{
+          const test = current ? current+" "+word : word
+          if(current && ctx.measureText(test).width>maxTextW){ lines.push(current); current = word }
+          else current = test
+        })
+        if(current) lines.push(current)
+        if(lines.length>maxLines){
+          lines.length = maxLines
+          let last = lines[maxLines-1]
+          while(last.length>1 && ctx.measureText(last+"…").width>maxTextW) last = last.slice(0,-1)
+          lines[maxLines-1] = last+"…"
+        }
+        const lineH = lw(11)
+        const boxW = Math.max(lw(72), Math.max(...lines.map(l=>ctx.measureText(l).width))+lw(16))
+        const boxH = lines.length*lineH + lw(8)
         ctx.fillStyle="rgba(0,0,0,0.6)"; ctx.beginPath()
-        ctx.roundRect&&ctx.roundRect(cx-lw(36),cy-lw(14),lw(72),lw(28),lw(4)); ctx.fill()
-        ctx.fillStyle="#fff"; ctx.font=`bold ${11/view.zoom}px DM Sans`; ctx.textAlign="center"
-        ctx.fillText(sec.name||`Sec ${idx+1}`,cx,cy-lw(2))
+        try{ ctx.roundRect(cx-boxW/2,cy-boxH/2,boxW,boxH,lw(4)); ctx.fill() }
+        catch{ ctx.fillRect(cx-boxW/2,cy-boxH/2,boxW,boxH) }
+        ctx.fillStyle="#fff"
+        ctx.textBaseline="middle"
+        const firstLineY = cy-boxH/2+lineH/2
+        lines.forEach((line,li)=>ctx.fillText(line,cx,firstLineY+li*lineH))
+        ctx.textBaseline="alphabetic"
         const gs=geometry.sections[idx]
-        if(gs?.surface_m2){ctx.font=`${9/view.zoom}px DM Sans`;ctx.fillStyle=col;ctx.fillText(gs.surface_m2+" m²",cx,cy+lw(12))}
+        if(gs?.surface_m2){ctx.font=`${9/view.zoom}px DM Sans`;ctx.fillStyle="#040404";ctx.fillText(gs.surface_m2+" m²",cx,cy+boxH/2+lw(11))}
       }
     })
 
@@ -756,7 +1027,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         ctx.fillStyle="#10b981"
         try{ctx.beginPath();ctx.roundRect(mx-lw(22),my-lw(10),lw(44),lw(16),lw(4));ctx.fill()}catch{ctx.fillRect(mx-lw(22),my-lw(10),lw(44),lw(16))}
         ctx.fillStyle="#fff"; ctx.font=`bold ${10/view.zoom}px DM Sans`; ctx.textAlign="center"
-        ctx.fillText(knownM+"m",mx,my+lw(1))
+        // While the calibration modal is still open, knownM is last
+        // session's value, not this line's — show a placeholder instead of
+        // a number that looks like it's already been measured/confirmed.
+        ctx.fillText(calibModalOpen ? "? m" : knownM+"m",mx,my+lw(1))
       }
     }
 
@@ -803,7 +1077,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
 
     ctx.restore()
-  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,knownM,geometry,imgSrc,view,editMode,selection,selectionCount,selectBox])
+  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,knownM,calibModalOpen,geometry,imgSrc,view,editMode,selection,selectionCount,selectBox])
 
   useEffect(()=>{ drawCanvas() },[drawCanvas])
 
@@ -827,6 +1101,28 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     return null
   }
 
+  // Edit Points mode only — clicking an edge (not an existing vertex) of an
+  // already-traced section/line inserts a new point right there, so a
+  // previously-measured roof area can be reshaped/extended instead of only
+  // ever being re-traced from scratch. Area recalculates automatically
+  // since it's derived from these same points (geometry useMemo), and that
+  // flows into the Estimate step the same way any other re-trace does.
+  function findEdgeHit(pt) {
+    for(const sec of sections){
+      if(!sec.closed || sec.pts.length<2) continue
+      const n = sec.pts.length
+      for(let i=0;i<n;i++){
+        if(distToSegment(pt, sec.pts[i], sec.pts[(i+1)%n]) <= HIT_RADIUS) return { kind:"section", id:sec.id, insertIdx:i+1 }
+      }
+    }
+    for(const li of lineItems){
+      for(let i=0;i<li.pts.length-1;i++){
+        if(distToSegment(pt, li.pts[i], li.pts[i+1]) <= HIT_RADIUS) return { kind:"line", id:li.id, insertIdx:i+1 }
+      }
+    }
+    return null
+  }
+
   function moveHit(hit, pt) {
     if(hit.kind==="section"){
       setSections(prev=>prev.map(sec=> sec.id!==hit.id ? sec : { ...sec, pts: sec.pts.map((p,i)=> i===hit.idx ? pt : p) }))
@@ -845,32 +1141,74 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       return
     }
     const pt = getWorldPt(e.clientX, e.clientY)
+    // Point/edge hit-testing runs before the Select tool's marquee-box —
+    // otherwise having Select active (a natural choice when trying to click
+    // on an existing shape) while Edit Points is on silently swallowed every
+    // click into a selection drag instead of ever offering to edit anything.
+    const hit = findHit(pt)
+    if(hit){
+      dragRef.current = hit
+      dragPushedRef.current = false
+      clickStartRef.current = { x:e.clientX, y:e.clientY }
+      return
+    }
+    // Clicking an edge inserts a point there — either explicitly via Edit
+    // Points, or directly with the Section/Flashing/Gutter/Select tool as
+    // long as nothing is currently being traced. Left off for the
+    // downpipe/drain/penetration/scale tools, where a click has its own
+    // fixed meaning (place a marker exactly here) that shouldn't be
+    // hijacked just because it happens to land near an old line.
+    const canEdgeInsert = editMode || (drawPts.length===0 && ["section","flashing","gutter","select"].includes(activeTool))
+    if(canEdgeInsert){
+      const edgeHit = findEdgeHit(pt)
+      if(edgeHit){
+        pushHistory()
+        if(edgeHit.kind==="section"){
+          setSections(prev=>prev.map(s=>s.id!==edgeHit.id?s:{...s,pts:[...s.pts.slice(0,edgeHit.insertIdx),pt,...s.pts.slice(edgeHit.insertIdx)]}))
+        } else {
+          setLineItems(prev=>prev.map(l=>l.id!==edgeHit.id?l:{...l,pts:[...l.pts.slice(0,edgeHit.insertIdx),pt,...l.pts.slice(edgeHit.insertIdx)]}))
+        }
+        // Arm the freshly-inserted point for dragging in the same gesture,
+        // so it can be fine-tuned immediately instead of landing exactly on
+        // the old straight edge (where it'd have zero effect until moved).
+        dragRef.current = { kind:edgeHit.kind, id:edgeHit.id, idx:edgeHit.insertIdx }
+        dragPushedRef.current = true // history already captured above, before the insert
+        clickStartRef.current = { x:e.clientX, y:e.clientY }
+        return
+      }
+    }
     if(activeTool==="select"){
       setSelectBox({ start:pt, current:pt })
       return
     }
-    const hit = findHit(pt)
-    if(hit){ dragRef.current = hit; return }
     if(editMode) return // in edit mode, empty-space clicks don't start new geometry
     handleClick(pt)
   }
 
   function handleMouseMove(e){
     if(panRef.current){
-      const dx = e.clientX - panRef.current.startX
-      const dy = e.clientY - panRef.current.startY
+      const { startX, startY, startOffX, startOffY } = panRef.current
+      const dx = e.clientX - startX
+      const dy = e.clientY - startY
       const cv = canvasRef.current
       const r = cv.getBoundingClientRect()
       const scaleX = MT_CANVAS_W / r.width, scaleY = MT_CANVAS_H / r.height
-      setView(v=>clampView({ ...v, offX: panRef.current.startOffX + dx*scaleX, offY: panRef.current.startOffY + dy*scaleY }))
+      setView(v=>clampView({ ...v, offX: startOffX + dx*scaleX, offY: startOffY + dy*scaleY }))
       return
     }
     const pt = getWorldPt(e.clientX, e.clientY)
     if(selectBox){ setSelectBox(prev=>({ ...prev, current:pt })); return }
-    if(dragRef.current){ moveHit(dragRef.current, pt); return }
+    if(dragRef.current){
+      // Push the pre-drag snapshot once, on the first real movement — not
+      // on mousedown, so a plain click that lands on a point (no drag)
+      // doesn't waste an undo step, and not on every mousemove tick either.
+      if(!dragPushedRef.current){ pushHistory(); dragPushedRef.current = true }
+      moveHit(dragRef.current, pt)
+      return
+    }
     setHoverPt(pt)
   }
-  function handleMouseUp(){
+  function handleMouseUp(e){
     if(selectBox){
       const x1=Math.min(selectBox.start.x,selectBox.current.x), x2=Math.max(selectBox.start.x,selectBox.current.x)
       const y1=Math.min(selectBox.start.y,selectBox.current.y), y2=Math.max(selectBox.start.y,selectBox.current.y)
@@ -889,40 +1227,51 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       }
       setSelectBox(null)
     }
-    panRef.current = null; dragRef.current = null
+    // A grabbed point that never actually moved was just a click, not a
+    // drag — most likely the user was placing a NEW point for the active
+    // tool that happened to land near an existing one (e.g. a section
+    // corner traced close to the scale line), so fall through to adding it
+    // instead of silently doing nothing. Real drags (mouse moved) still
+    // just reposition the existing point, same as before.
+    if(dragRef.current && !editMode && clickStartRef.current && e){
+      const moved = Math.hypot(e.clientX-clickStartRef.current.x, e.clientY-clickStartRef.current.y)
+      if(moved < 4) handleClick(getWorldPt(e.clientX, e.clientY))
+    }
+    panRef.current = null; dragRef.current = null; clickStartRef.current = null
   }
-  function handleMouseLeave(){ panRef.current = null; dragRef.current = null; setSelectBox(null); setHoverPt(null) }
-
-  function handleWheel(e){
-    e.preventDefault()
-    const cv = canvasRef.current
-    const r = cv.getBoundingClientRect()
-    const scaleX = MT_CANVAS_W / r.width, scaleY = MT_CANVAS_H / r.height
-    const cvX = (e.clientX - r.left) * scaleX
-    const cvY = (e.clientY - r.top) * scaleY
-    zoomAt(cvX, cvY, e.deltaY < 0 ? 1.15 : 1/1.15)
-  }
+  function handleMouseLeave(){ panRef.current = null; dragRef.current = null; clickStartRef.current = null; setSelectBox(null); setHoverPt(null) }
 
   function handleClick(pt){
+    pushHistory()
     if(activeTool==="section"){
       if(drawPts.length>=3){
         const fp=drawPts[0], d=Math.hypot(pt.x-fp.x,pt.y-fp.y)
         if(d<15){
-          setSections(prev=>[...prev,{id:uid(),name:`Section ${prev.length+1}`,pts:drawPts,closed:true,pitch:"1.15",color:SEC_COLORS[prev.length%SEC_COLORS.length]}])
-          setDrawPts([]); return
+          const newId = uid()
+          setSections(prev=>[...prev,{id:newId,name:`Section ${prev.length+1}`,pts:drawPts,closed:true,pitch:"1.15",color:SEC_COLORS[prev.length%SEC_COLORS.length],materialLabel:"",rate:0}])
+          setDrawPts([])
+          // ← Prompt for this section's roof sheet brand right away, while
+          //   the roofer is still looking at it, instead of making them
+          //   remember to assign it later in the Estimate step for every
+          //   section (rate can still be changed there afterwards).
+          setSectionMaterialModalId(newId)
+          return
         }
       }
       setDrawPts(prev=>[...prev,pt])
     }
     else if(activeTool==="flashing"||activeTool==="gutter"){ setDrawPts(prev=>[...prev,pt]) }
-    else if(activeTool==="downpipe")    { setPtItems(prev=>[...prev,{id:uid(),type:"downpipe",   x:pt.x,y:pt.y}]) }
-    else if(activeTool==="drain")       { setPtItems(prev=>[...prev,{id:uid(),type:"drain",      x:pt.x,y:pt.y}]) }
-    else if(activeTool==="penetration") { setPtItems(prev=>[...prev,{id:uid(),type:"penetration",subtype:penSub,x:pt.x,y:pt.y}]) }
+    else if(activeTool==="downpipe")    { const id=uid(); setPtItems(prev=>[...prev,{id,type:"downpipe",   materialLabel:"",rate:0,x:pt.x,y:pt.y}]); setAccessoryModal({kind:"downpipe",   id}) }
+    else if(activeTool==="drain")       { const id=uid(); setPtItems(prev=>[...prev,{id,type:"drain",      materialLabel:"",rate:0,x:pt.x,y:pt.y}]); setAccessoryModal({kind:"drain",      id}) }
+    else if(activeTool==="penetration") { const id=uid(); setPtItems(prev=>[...prev,{id,type:"penetration",subtype:penSub,materialLabel:"",rate:0,x:pt.x,y:pt.y}]); setAccessoryModal({kind:"penetration",id}) }
     else if(activeTool==="scale"){
       if(!scaleLine?.p1)       setScaleLine({p1:pt,p2:null})
       else if(!scaleLine?.p2){
         setScaleLine(prev=>({...prev,p2:pt}))
-        setCalibInput(String(knownM))
+        // ← Blank, not the previous scale's value — the user is about to
+        //   measure a brand new reference line and should type its actual
+        //   real-world length, not see an old number that looks pre-confirmed.
+        setCalibInput("")
         setCalibModalOpen(true)
       }
     }
@@ -948,11 +1297,22 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   }
 
   function finishLine(){
-    if(drawPts.length>=2) setLineItems(prev=>[...prev,{id:uid(),type:activeTool,pts:drawPts}])
+    pushHistory()
+    if(drawPts.length>=2){
+      const id = uid()
+      setLineItems(prev=>[...prev,{id,type:activeTool,subtype:activeTool==="flashing"?flashSub:undefined,materialLabel:"",rate:0,pts:drawPts}])
+      if(activeTool==="gutter") setAccessoryModal({kind:"gutter", id})
+      // ← Flashing is priced per-subtype in the Estimate step (one rate for
+      //   all Ridge Cap segments together, not one per traced line), so the
+      //   popup asks once per subtype and its pick applies to every segment
+      //   of that subtype — not just the one just drawn.
+      else if(activeTool==="flashing") setAccessoryModal({kind:"flashing", id, subtype:flashSub})
+    }
     setDrawPts([])
   }
 
   function clearAll(){
+    pushHistory()
     setSections([]); setLineItems([]); setPtItems([])
     setScaleLine(null); setDrawPts([]); setAsbestos(false)
     setSelection({sections:[],lines:[],points:[],scale:false}); setSelectBox(null)
@@ -962,13 +1322,25 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   function applyCalibration(){
     const raw = parseFloat(calibInput)
     if(!raw || raw<=0) return
-    setKnownM(calibUnit==="mm" ? raw/1000 : raw)
+    pushHistory()
+    const toM = CALIB_UNITS.find(u=>u.key===calibUnit)?.toM ?? 1
+    setKnownM(raw*toM)
     setCalibModalOpen(false)
   }
 
   function cancelCalibration(){
     setScaleLine(null)
     setCalibModalOpen(false)
+  }
+
+  function saveAccessoryMaterial(){
+    if(!pendingAccessoryMaterial || !accessoryModal) return
+    const { kind, id, subtype } = accessoryModal
+    const { label, rate } = pendingAccessoryMaterial
+    if(kind==="gutter") setLineItems(prev=>prev.map(li=>li.id===id?{...li,materialLabel:label,rate}:li))
+    else if(kind==="flashing") setLineItems(prev=>prev.map(li=>li.type==="flashing"&&li.subtype===subtype?{...li,materialLabel:label,rate}:li))
+    else setPtItems(prev=>prev.map(pi=>pi.id===id?{...pi,materialLabel:label,rate}:pi))
+    setAccessoryModal(null); setPendingAccessoryMaterial(null)
   }
 
   function loadImage(file){
@@ -1019,7 +1391,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       </div>
 
       <div className="mt-grid">
-        <div style={{border:"1px solid #334155",borderRadius:12,overflow:"hidden"}}>
+        <div style={{border:"1px solid #334155",borderRadius:12,overflow:"hidden",background:"#0f172a"}}>
           <div className="mt-toolbar" style={{display:"flex",alignItems:"center",gap:5,padding:"8px 10px",background:"#1e293b",flexWrap:"wrap"}}>
             {TOOLS.map(t=>(
               <button key={t.key}
@@ -1053,6 +1425,8 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               <button onClick={()=>zoomButton(1/1.3)} title="Zoom out" style={{width:26,height:26,borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#94a3b8",fontSize:14,cursor:"pointer",fontFamily:"inherit"}}>−</button>
               <span style={{fontSize:10,color:"#64748b",width:34,textAlign:"center"}}>{Math.round(view.zoom*100)}%</span>
               <button onClick={()=>zoomButton(1.3)} title="Zoom in" style={{width:26,height:26,borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#94a3b8",fontSize:14,cursor:"pointer",fontFamily:"inherit"}}>+</button>
+              <button onClick={undo} title="Undo last point/action (Ctrl+Z)" style={{padding:"5px 9px",borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#64748b",fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>↶ Undo</button>
+              <button onClick={redo} title="Redo (Ctrl+Shift+Z / Ctrl+Y)" style={{padding:"5px 9px",borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#64748b",fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>↷ Redo</button>
               <button onClick={resetView} title="Reset zoom/pan" style={{padding:"5px 9px",borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#64748b",fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>Reset View</button>
               <button onClick={clearAll} style={{padding:"5px 10px",borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#64748b",fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>
                 Clear All
@@ -1061,7 +1435,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           </div>
 
           <div style={{padding:"5px 12px",background:"#0f172a",fontSize:11,color:"#475569",display:"flex",alignItems:"center",justifyContent:"space-between",minHeight:28,flexWrap:"wrap",gap:6}}>
-            <span>{tip}{editMode && !isPanMode ? " · Edit mode: drag any highlighted point" : ""}</span>
+            <span>{tip}{editMode && !isPanMode ? " · Edit mode: drag any highlighted point, or click a line to add a point" : ""}</span>
             <div style={{display:"flex",alignItems:"center",gap:8}}>
               {activeTool==="select"&&selectionCount>0&&(
                 <button onClick={deleteSelected}
@@ -1081,6 +1455,18 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                   ))}
                 </div>
               )}
+              {activeTool==="flashing"&&(
+                <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                  {FLASHING_TYPES.map(f=>(
+                    <button key={f.key} onClick={()=>setFlashSub(f.key)}
+                      style={{padding:"1px 7px",borderRadius:4,border:`1px solid ${flashSub===f.key?"#f59e0b":"rgba(255,255,255,0.1)"}`,
+                        background:flashSub===f.key?"#f59e0b33":"transparent",color:flashSub===f.key?"#f59e0b":"#64748b",
+                        fontSize:10,cursor:"pointer",fontFamily:"inherit"}}>
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
 
@@ -1091,7 +1477,6 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp}
               onMouseLeave={handleMouseLeave}
-              onWheel={handleWheel}
               onContextMenu={handleContextMenu}/>
           </div>
 
@@ -1198,11 +1583,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               type="number" min="0.001" step="any" autoFocus value={calibInput}
               onChange={e=>setCalibInput(e.target.value)}
               onKeyDown={e=>{ if(e.key==="Enter") applyCalibration(); if(e.key==="Escape") cancelCalibration() }}
-              placeholder={calibUnit==="mm"?"e.g. 3000":"e.g. 3"}
+              placeholder={CALIB_UNITS.find(u=>u.key===calibUnit)?.placeholder || "e.g. 3"}
               style={{...s.input,flex:1}}/>
             <select value={calibUnit} onChange={e=>setCalibUnit(e.target.value)} style={{...s.input,width:80}}>
-              <option value="m">m</option>
-              <option value="mm">mm</option>
+              {CALIB_UNITS.map(u=><option key={u.key} value={u.key}>{u.label}</option>)}
             </select>
           </div>
           <div style={{display:"flex",justifyContent:"flex-end",gap:10}}>
@@ -1211,6 +1595,63 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           </div>
         </Modal>
       )}
+
+      {sectionMaterialModalId && (
+        <Modal title="Roof Sheet Brand" onClose={()=>{ setSectionMaterialModalId(null); setPendingSectionMaterial(null) }} width={420}>
+          <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
+            What roof sheet will <strong>{sections.find(s=>s.id===sectionMaterialModalId)?.name}</strong> be covered in?
+            You can change this later in the Estimate step.
+          </div>
+          <MaterialPicker
+            group="roof_sheet"
+            value={pendingSectionMaterial?.label ?? sections.find(s=>s.id===sectionMaterialModalId)?.materialLabel ?? ""}
+            onSelect={({label,rate})=>setPendingSectionMaterial({label,rate})}
+          />
+          <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:16}}>
+            <Btn primary style={{opacity:pendingSectionMaterial?1:.5}} onClick={()=>{
+              if(!pendingSectionMaterial) return
+              const id = sectionMaterialModalId
+              // ← Section is renamed to the brand picked (was "Section N")
+              //   so it reads meaningfully everywhere — sidebar, canvas
+              //   label, and the Estimate step's per-section list — instead
+              //   of a generic number no one can tell apart.
+              setSections(prev=>prev.map(s=>s.id===id?{...s,name:pendingSectionMaterial.label,materialLabel:pendingSectionMaterial.label,rate:pendingSectionMaterial.rate}:s))
+              setSectionMaterialModalId(null); setPendingSectionMaterial(null)
+            }}>Save</Btn>
+          </div>
+        </Modal>
+      )}
+
+      {accessoryModal && (() => {
+        const cfg = ACCESSORY_MODAL_CONFIG[accessoryModal.kind]
+        const subLabel = accessoryModal.kind==="flashing" ? flashingLabel(accessoryModal.subtype) : ""
+        // ← A subtype may already have a brand from an earlier segment (this
+        //   is at least its 2nd traced Ridge Cap, say) — pre-fill with that
+        //   instead of blank, so re-tracing the same subtype doesn't look
+        //   like it forgot what you already picked.
+        const existingLabel = accessoryModal.kind==="flashing"
+          ? lineItems.find(li=>li.type==="flashing"&&li.subtype===accessoryModal.subtype&&li.materialLabel)?.materialLabel ?? ""
+          : ""
+        return (
+        <Modal title={subLabel ? `${subLabel} Flashing Brand` : cfg.title}
+          onClose={()=>{ setAccessoryModal(null); setPendingAccessoryMaterial(null) }} width={420}>
+          <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
+            {subLabel ? `What product will the ${subLabel} flashing use?` : cfg.prompt}
+            {" "}You can change this later in the Estimate step.
+          </div>
+          <MaterialPicker
+            group={cfg.group}
+            unit={cfg.unit}
+            catalogUnit={cfg.catalogUnit}
+            value={pendingAccessoryMaterial?.label ?? existingLabel}
+            onSelect={({label,rate})=>setPendingAccessoryMaterial({label,rate})}
+          />
+          <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:16}}>
+            <Btn primary style={{opacity:pendingAccessoryMaterial?1:.5}} onClick={saveAccessoryMaterial}>Save</Btn>
+          </div>
+        </Modal>
+        )
+      })()}
     </div>
   )
 });
@@ -1218,14 +1659,29 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 // ─────────────────────────── ESTIMATE ENGINE ───────────────────────────
 // ─── Searchable combobox over the supplier material price catalog ───────────
 // Debounces server-side search (min 2 chars) instead of shipping the whole
-// multi-thousand-row catalog to the client.
-function MaterialPicker({ value, onSelect }) {
+// multi-thousand-row catalog to the client. `group` (roof_sheet/flashing)
+// restricts results to that product family server-side — the catalog's
+// `type` column otherwise mixes cladding profiles with unrelated hardware
+// (gutters, downpipes, sealant, fixings...), see product_group on
+// roof_materials (migrations/13_add_material_product_group.sql).
+// Matches backend/routes/materials.js's NO_SUPPLIER sentinel — some catalog
+// rows (generic gutter brackets, downpipes, etc.) have no supplier at all,
+// so "supplier = ''" can't be used to mean "explicitly generic" the way it
+// normally means "nothing selected yet"; this sentinel disambiguates it.
+const NO_SUPPLIER = "__no_supplier__"
+
+function MaterialPicker({ value, onSelect, unit="m2", group="", catalogUnit="" }) {
+  const { currency } = useCurrency()
+  const cs = currency?.symbol || "$"
   const [query,   setQuery]   = useState(value || "")
   const [results, setResults] = useState([])
   const [open,    setOpen]    = useState(false)
   const [loading, setLoading] = useState(false)
   const debounceRef = useRef(null)
   const boxRef = useRef(null)
+  const inputRef = useRef(null)
+  const menuRef = useRef(null)
+  const [menuStyle, setMenuStyle] = useState(null)
 
   // ── Cascading Supplier → Type → Material dropdowns ──────────────────
   const [suppliers,       setSuppliers]       = useState([])
@@ -1234,20 +1690,46 @@ function MaterialPicker({ value, onSelect }) {
   const [supplier,        setSupplier]        = useState("")
   const [type,            setType]            = useState("")
   const [materialId,      setMaterialId]      = useState("")
+  // ← Target {supplier,type,materialId} we're trying to populate the
+  //   cascade with, resolved from an already-picked `value` (e.g. reopening
+  //   a section/run that already has a material saved) — without this the
+  //   dropdowns stayed blank even though the search box showed the value.
+  const restoreRef = useRef(null)
 
   useEffect(()=>{ materialsApi.getSuppliers().then(setSuppliers).catch(()=>setSuppliers([])) },[])
 
   useEffect(()=>{
-    setType(""); setMaterialId(""); setByTypeMaterials([])
-    if(!supplier){ setTypes([]); return }
-    materialsApi.getTypes(supplier).then(setTypes).catch(()=>setTypes([]))
-  },[supplier])
+    if(!value || supplier) return
+    materialsApi.search(value, group, catalogUnit).then(rows=>{
+      const m = rows.find(r=>(r.supplier?`${r.supplier} — ${r.description}`:r.description)===value) || rows[0]
+      if(!m) return
+      const sup = m.supplier || NO_SUPPLIER
+      restoreRef.current = { supplier:sup, type:m.type||"", materialId:m.id }
+      setSupplier(sup)
+    }).catch(()=>{})
+  },[value])
 
   useEffect(()=>{
-    setMaterialId("")
+    const restoring = restoreRef.current?.supplier===supplier
+    if(!restoring){ setType(""); setMaterialId(""); setByTypeMaterials([]); restoreRef.current=null }
+    if(!supplier){ setTypes([]); return }
+    materialsApi.getTypes(supplier, group, catalogUnit)
+      .then(rows=>{
+        setTypes(rows)
+        if(restoreRef.current?.supplier===supplier) setType(restoreRef.current.type)
+      })
+      .catch(()=>setTypes([]))
+  },[supplier, group, catalogUnit])
+
+  useEffect(()=>{
+    const restoring = restoreRef.current?.supplier===supplier && restoreRef.current?.type===type
+    if(!restoring) setMaterialId("")
     if(!supplier || !type){ setByTypeMaterials([]); return }
-    materialsApi.getByType(supplier, type).then(setByTypeMaterials).catch(()=>setByTypeMaterials([]))
-  },[supplier, type])
+    materialsApi.getByType(supplier, type, group, catalogUnit).then(rows=>{
+      setByTypeMaterials(rows)
+      if(restoring){ setMaterialId(restoreRef.current.materialId); restoreRef.current=null }
+    }).catch(()=>setByTypeMaterials([]))
+  },[supplier, type, group, catalogUnit])
 
   function pickFromDropdown(id) {
     setMaterialId(id)
@@ -1258,10 +1740,51 @@ function MaterialPicker({ value, onSelect }) {
   useEffect(()=>{ setQuery(value || "") },[value])
 
   useEffect(()=>{
-    function onDocClick(e){ if(boxRef.current && !boxRef.current.contains(e.target)) setOpen(false) }
+    function onDocClick(e){
+      const insideBox  = boxRef.current  && boxRef.current.contains(e.target)
+      const insideMenu = menuRef.current && menuRef.current.contains(e.target)
+      if(!insideBox && !insideMenu) setOpen(false)
+    }
     document.addEventListener("mousedown", onDocClick)
     return ()=>document.removeEventListener("mousedown", onDocClick)
   },[])
+
+  // The dropdown is portaled to <body> (see render below) so it can't be
+  // clipped by the modal body's `overflow-y:auto` — without this, results
+  // past the modal's visible edge were rendered but invisible, cut off
+  // mid-row (reported: search results "cut off" in the roof sheet/flashing/
+  // gutter/drain/penetration material pickers, all of which share this
+  // component). Position is computed from the input's own bounding rect
+  // in viewport (fixed) coordinates, and flips upward when there isn't
+  // room below — recalculated on scroll/resize since the modal body itself
+  // scrolls independently of the window.
+  useEffect(()=>{
+    if(!open || query.trim().length<2){ setMenuStyle(null); return }
+    function updatePosition() {
+      const el = inputRef.current
+      if(!el) return
+      const rect = el.getBoundingClientRect()
+      const spaceBelow = window.innerHeight - rect.bottom
+      const spaceAbove = rect.top
+      const openUp = spaceBelow < 160 && spaceAbove > spaceBelow
+      setMenuStyle({
+        position: "fixed",
+        left: rect.left,
+        width: rect.width,
+        zIndex: 2000,
+        ...(openUp
+          ? { bottom: window.innerHeight - rect.top + 4, maxHeight: Math.max(120, Math.min(280, spaceAbove - 12)) }
+          : { top: rect.bottom + 4, maxHeight: Math.max(120, Math.min(280, spaceBelow - 12)) }),
+      })
+    }
+    updatePosition()
+    window.addEventListener("scroll", updatePosition, true)
+    window.addEventListener("resize", updatePosition)
+    return ()=>{
+      window.removeEventListener("scroll", updatePosition, true)
+      window.removeEventListener("resize", updatePosition)
+    }
+  },[open, query])
 
   function handleChange(v) {
     setQuery(v)
@@ -1270,19 +1793,34 @@ function MaterialPicker({ value, onSelect }) {
     if(v.trim().length < 2){ setResults([]); return }
     setLoading(true)
     debounceRef.current = setTimeout(()=>{
-      materialsApi.search(v.trim())
-        .then(rows=>setResults(rows))
+      materialsApi.search(v.trim(), group, catalogUnit)
+        .then(setResults)
         .catch(()=>setResults([]))
         .finally(()=>setLoading(false))
     }, 300)
   }
 
+  // Flashing/gutter SKUs are already priced per lineal metre by the
+  // supplier — reusing the m² cladding conversion (rate_lm ÷ cover_width)
+  // on them produces the wrong unit. "each"-priced fittings (downpipes,
+  // drains, penetration boots) store the same flat price in both rate
+  // columns (confirmed against the catalog), so neither needs conversion —
+  // the three picker modes derive rate differently.
   function pick(m) {
     const label = m.supplier ? `${m.supplier} — ${m.description}` : m.description
-    const rate  = m.rateM2 ?? (m.rateLm && m.coverWidth ? m.rateLm / (m.coverWidth/1000) : 0)
+    const rate  = unit==="each" ? (m.rateLm ?? m.rateM2 ?? 0)
+      : unit==="lm" ? (m.rateLm ?? (m.rateM2 && m.coverWidth ? m.rateM2 * (m.coverWidth/1000) : 0))
+      : (m.rateM2 ?? (m.rateLm && m.coverWidth ? m.rateLm / (m.coverWidth/1000) : 0))
     onSelect({ label, rate: parseFloat(rate.toFixed(2)) })
     setQuery(label)
     setOpen(false)
+  }
+
+  // Mirrors pick()'s unit preference so the displayed rate always matches what gets applied.
+  function displayRate(m) {
+    if(unit==="each") return m.rateLm ? `${cs}${m.rateLm.toFixed(2)} ea` : m.rateM2 ? `${cs}${m.rateM2.toFixed(2)} ea` : "no rate"
+    if(unit==="lm") return m.rateLm ? `${cs}${m.rateLm.toFixed(2)}/lm` : m.rateM2 ? `${cs}${m.rateM2.toFixed(2)}/m²` : "no rate"
+    return m.rateM2 ? `${cs}${m.rateM2.toFixed(2)}/m²` : m.rateLm ? `${cs}${m.rateLm.toFixed(2)}/lm` : "no rate"
   }
 
   return (
@@ -1290,6 +1828,7 @@ function MaterialPicker({ value, onSelect }) {
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}} className="grid2-responsive">
         <select style={s.input} value={supplier} onChange={ev=>setSupplier(ev.target.value)}>
           <option value="">— Supplier —</option>
+          <option value={NO_SUPPLIER}>— No Supplier / Generic —</option>
           {suppliers.map(sup=><option key={sup} value={sup}>{sup}</option>)}
         </select>
         <select style={s.input} value={type} onChange={ev=>setType(ev.target.value)} disabled={!supplier}>
@@ -1300,7 +1839,7 @@ function MaterialPicker({ value, onSelect }) {
           <option value="">{type?"— Material —":"Pick a type first"}</option>
           {byTypeMaterials.map(m=>
             <option key={m.id} value={m.id}>
-              {m.description}{m.rateM2?` — $${m.rateM2.toFixed(2)}/m²`:m.rateLm?` — $${m.rateLm.toFixed(2)}/lm`:""}
+              {m.description}{(m.rateM2||m.rateLm)?` — ${displayRate(m)}`:""}
             </option>
           )}
         </select>
@@ -1308,14 +1847,15 @@ function MaterialPicker({ value, onSelect }) {
       <div style={{fontSize:11,color:"#94a3b8",margin:"2px 0 8px"}}>or search by keyword instead:</div>
       <div ref={boxRef} style={{position:"relative"}}>
       <input
+        ref={inputRef}
         style={s.input}
         value={query}
         placeholder="Search supplier catalog — e.g. Dimond corrugate, Metalcraft flashing…"
         onChange={e=>handleChange(e.target.value)}
         onFocus={()=>setOpen(true)}
       />
-      {open && (query.trim().length>=2) && (
-        <div style={{position:"absolute",top:"100%",left:0,right:0,zIndex:20,background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,marginTop:4,maxHeight:280,overflowY:"auto",boxShadow:"0 8px 24px rgba(0,0,0,0.12)"}}>
+      {open && (query.trim().length>=2) && menuStyle && createPortal(
+        <div ref={menuRef} style={{...menuStyle,background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,overflowY:"auto",boxShadow:"0 8px 24px rgba(0,0,0,0.12)"}}>
           {loading && <div style={{padding:"10px 14px",fontSize:12,color:"#94a3b8"}}>Searching…</div>}
           {!loading && results.length===0 && <div style={{padding:"10px 14px",fontSize:12,color:"#94a3b8"}}>No matches in supplier catalog</div>}
           {!loading && results.map(m=>(
@@ -1329,29 +1869,116 @@ function MaterialPicker({ value, onSelect }) {
                 {m.coating && <span>{m.coating} · </span>}
                 {m.sku && <span>{m.sku} · </span>}
                 <span style={{color:"#f59e0b",fontWeight:600}}>
-                  {m.rateM2 ? `$${m.rateM2.toFixed(2)}/m²` : m.rateLm ? `$${m.rateLm.toFixed(2)}/lm` : "no rate"}
+                  {displayRate(m)}
                 </span>
               </div>
             </div>
           ))}
-        </div>
+        </div>,
+        document.body
       )}
       </div>
     </div>
   )
 }
 
-function EstimateEngine({ initialArea, onEstimateChange }) {
-  const { formatMoney: fmt } = useCurrency()   // ← currency-aware fmt
+function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstimateChange }) {
+  const { formatMoney: fmt, currency } = useCurrency()   // ← currency-aware fmt
+  const cs = currency?.symbol || "$"   // ← for labels/inline strings fmt() can't be used on (not a full money value)
 
-  const [e, setE] = useState({
-    area:initialArea||0, pitch:1.15, waste:10,
-    materialRate:55, materialLabel:"Long Run Steel",
-    flashings:0, guttering:0, dayRate:850, days:2, margin:20, complexity:"medium",
+  // ← Job Complexity multipliers are a global, editable list now (Job
+  //   Complexity settings page) instead of a hardcoded constant — fetched
+  //   once here rather than re-derived from anything baked into the build.
+  const [complexityLevels, setComplexityLevels] = useState([])
+  useEffect(()=>{ complexityLevelsApi.getAll().then(setComplexityLevels).catch(()=>setComplexityLevels([])) },[])
+
+  // ← Traced flashing runs (ridge cap, valley, etc.), the gutter total, and
+  //   accessory counts (downpipes/drains/penetrations) come straight from
+  //   the Measure step instead of starting at 0. When editing a project,
+  //   initialEstimate (the previously-saved values) wins for anything the
+  //   user could have typed/chosen by hand — material, pitch, waste,
+  //   labour, margin, and each flashing run's assigned material/rate —
+  //   otherwise reopening a project to edit silently reset all of it.
+  //   Flashing/accessory lengths & counts still always refresh from the
+  //   latest trace in case the roof was re-measured.
+  const [e, setE] = useState(() => {
+    const savedRuns = new Map((initialEstimate?.flashingRuns||[]).map(r=>[r.subtype,r]))
+    // ← Matched by section/item id, not index, so re-tracing/reordering
+    //   doesn't scramble which saved rate belongs to which one.
+    const savedSections = new Map((initialEstimate?.sections||[]).map(sec=>[sec.id,sec]))
+    const savedGutterRuns      = new Map((initialEstimate?.gutterRuns||[]).map(g=>[g.id,g]))
+    const savedDownpipeItems   = new Map((initialEstimate?.downpipeItems||[]).map(d=>[d.id,d]))
+    const savedDrainItems      = new Map((initialEstimate?.drainItems||[]).map(d=>[d.id,d]))
+    const savedPenetrationItems= new Map((initialEstimate?.penetrationItems||[]).map(p=>[p.id,p]))
+    return {
+      area: initialEstimate?.area ?? initialArea ?? 0,
+      pitch: initialEstimate?.pitch ?? 1.15,
+      waste: initialEstimate?.waste ?? 10,
+      materialRate: initialEstimate?.materialRate ?? 55,
+      materialLabel: initialEstimate?.materialLabel ?? "Long Run Steel",
+      sections: (initialGeometry?.sections||[]).map(sec=>{
+        const prev = savedSections.get(sec.id)
+        return {
+          id: sec.id, name: sec.name, surface_m2: sec.surface_m2,
+          materialLabel: prev?.materialLabel ?? sec.materialLabel ?? "",
+          rate: prev?.rate ?? sec.rate ?? 0,
+        }
+      }),
+      flashings: initialEstimate?.flashings ?? 0,
+      guttering: initialEstimate?.guttering ?? initialGeometry?.total_gutter_m ?? 0,
+      downpipes: initialEstimate?.downpipes ?? initialGeometry?.accessories?.downpipes?.length ?? 0,
+      drains: initialEstimate?.drains ?? initialGeometry?.accessories?.drains?.length ?? 0,
+      penetrations: initialEstimate?.penetrations ?? initialGeometry?.accessories?.penetrations?.length ?? 0,
+      dayRate: initialEstimate?.dayRate ?? 850,
+      days: initialEstimate?.days ?? 2,
+      margin: initialEstimate?.margin ?? 20,
+      complexity: initialEstimate?.complexity ?? "medium",
+      flashingRuns: Object.entries(initialGeometry?.flashingBySubtype||{}).map(([subtype,length_m])=>{
+        const prev = savedRuns.get(subtype)
+        const traced = initialGeometry?.flashingMaterialBySubtype?.[subtype]
+        return { subtype, label:flashingLabel(subtype), length_m,
+          materialLabel: prev?.materialLabel ?? traced?.materialLabel ?? "",
+          rate: prev?.rate ?? traced?.rate ?? 0 }
+      }),
+      gutterRuns: (initialGeometry?.accessories?.gutters||[]).map(g=>{
+        const prev = savedGutterRuns.get(g.id)
+        return { id:g.id, length_m:g.length_m, materialLabel:prev?.materialLabel ?? g.materialLabel ?? "", rate:prev?.rate ?? g.rate ?? 0 }
+      }),
+      downpipeItems: (initialGeometry?.accessories?.downpipes||[]).map(d=>{
+        const prev = savedDownpipeItems.get(d.id)
+        return { id:d.id, materialLabel:prev?.materialLabel ?? d.materialLabel ?? "", rate:prev?.rate ?? d.rate ?? 0 }
+      }),
+      drainItems: (initialGeometry?.accessories?.drains||[]).map(d=>{
+        const prev = savedDrainItems.get(d.id)
+        return { id:d.id, materialLabel:prev?.materialLabel ?? d.materialLabel ?? "", rate:prev?.rate ?? d.rate ?? 0 }
+      }),
+      penetrationItems: (initialGeometry?.accessories?.penetrations||[]).map(p=>{
+        const prev = savedPenetrationItems.get(p.id)
+        return { id:p.id, subtype:p.subtype, materialLabel:prev?.materialLabel ?? p.materialLabel ?? "", rate:prev?.rate ?? p.rate ?? 0 }
+      }),
+    }
   })
 
-  const result = useMemo(()=>calcEst(e),[e])
+  // ← Resolved live against the current global list every render, same as
+  //   any other rate in this app (RATES.*) — not pinned to whatever the
+  //   factor was when this estimate was first created.
+  const complexityFactorValue = complexityLevels.find(c=>c.key===e.complexity)?.factor ?? 1
+  const result = useMemo(()=>calcEst({...e, complexityFactor:complexityFactorValue}),[e, complexityFactorValue])
   useEffect(()=>{ onEstimateChange?.(result) },[result, onEstimateChange])
+
+  // Same wastage % calcEst applies to flashing/gutter cost — recomputed
+  // here so the displayed length matches what's actually being costed.
+  const wasteFactor = 1 + (e.waste||0)/100
+
+  // ← Whether each accessory was actually traced/saved at all, checked once
+  //   against the props that seeded `e` (not the live `e` value) — so the
+  //   field disappears when nothing was measured, but doesn't vanish out
+  //   from under you just because you type it down to 0 while editing.
+  const hasFlashingFallback = e.flashings>0 || (initialEstimate?.flashings??0)>0
+  const hasGuttering    = e.gutterRuns.length>0      || e.guttering>0    || (initialEstimate?.guttering??0)>0
+  const hasDownpipes    = e.downpipeItems.length>0   || e.downpipes>0
+  const hasDrains       = e.drainItems.length>0      || e.drains>0
+  const hasPenetrations = e.penetrationItems.length>0|| e.penetrations>0
 
   const upd = k => v => setE(prev=>({...prev,[k]:typeof v==="number"?v:parseFloat(v)||0}))
 
@@ -1367,48 +1994,134 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
       <div>
         <div style={{...s.card,marginBottom:14}}>
           <div style={{fontWeight:700,marginBottom:14}}>Roof Dimensions</div>
-          <FG label="Roof Area (m²)"><input style={s.input} type="number" value={e.area} onChange={ev=>upd("area")(ev.target.value)}/></FG>
-          <FG label="Roof Pitch">
-            <select style={s.input} value={e.pitch} onChange={ev=>upd("pitch")(ev.target.value)}>
-              {PITCHES.map(p=><option key={p.factor} value={p.factor}>{p.label} — ×{p.factor}</option>)}
-            </select>
-          </FG>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-            <FG label="Wastage %"><input style={s.input} type="number" value={e.waste} onChange={ev=>upd("waste")(ev.target.value)}/></FG>
-            <FG label="Adjusted Area"><input style={{...s.input,background:"#f8fafc",color:"#64748b"}} readOnly value={result.adjArea.toFixed(1)+" m²"}/></FG>
-          </div>
+          {e.sections.length>0 ? (
+            <>
+              <FG label="Wastage %"><input style={s.input} type="number" value={e.waste} onChange={ev=>upd("waste")(ev.target.value)}/></FG>
+              <FG label="Adjusted Area"><input style={{...s.input,background:"#f8fafc",color:"#64748b"}} readOnly value={`${result.adjArea.toFixed(1)} m² across ${e.sections.length} section${e.sections.length===1?"":"s"}`}/></FG>
+            </>
+          ) : (
+            <>
+              <FG label="Roof Area (m²)"><input style={s.input} type="number" value={e.area} onChange={ev=>upd("area")(ev.target.value)}/></FG>
+              <FG label="Roof Pitch">
+                <select style={s.input} value={e.pitch} onChange={ev=>upd("pitch")(ev.target.value)}>
+                  {PITCHES.map(p=><option key={p.factor} value={p.factor}>{p.label} — ×{p.factor}</option>)}
+                </select>
+              </FG>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                <FG label="Wastage %"><input style={s.input} type="number" value={e.waste} onChange={ev=>upd("waste")(ev.target.value)}/></FG>
+                <FG label="Adjusted Area"><input style={{...s.input,background:"#f8fafc",color:"#64748b"}} readOnly value={result.adjArea.toFixed(1)+" m²"}/></FG>
+              </div>
+            </>
+          )}
         </div>
         <div style={{...s.card,marginBottom:14}}>
           <div style={{fontWeight:700,marginBottom:14}}>Materials</div>
-          <FG label="Material Type">
-            <MaterialPicker
-              value={e.materialLabel}
-              onSelect={({label,rate})=>setE(prev=>({...prev,materialLabel:label,materialRate:rate}))}
-            />
-          </FG>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-            <FG label="Material Rate ($/m²)"><input style={s.input} type="number" value={e.materialRate} onChange={ev=>upd("materialRate")(ev.target.value)}/></FG>
-            <FG label="Or pick from the 5 common defaults">
-              <select style={s.input} onChange={ev=>{
-                const m=MATERIALS.find(x=>x.label===ev.target.value)
-                if(m) setE(prev=>({...prev,materialLabel:m.label,materialRate:m.rate}))
-              }} value="">
-                <option value="">— quick pick —</option>
-                {MATERIALS.map(m=><option key={m.label} value={m.label}>{m.label} — ${m.rate}/m²</option>)}
-              </select>
-            </FG>
-          </div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-            <FG label={`Flashings (m) @ $${RATES.flashings}/m`}><input style={s.input} type="number" value={e.flashings} onChange={ev=>upd("flashings")(ev.target.value)}/></FG>
-            <FG label={`Guttering (m) @ $${RATES.guttering}/m`}><input style={s.input} type="number" value={e.guttering} onChange={ev=>upd("guttering")(ev.target.value)}/></FG>
-          </div>
+          {e.sections.length>0 ? (
+            <div style={{marginBottom:14}}>
+              <label style={s.label}>Roof Sections (traced on photo)</label>
+              {e.sections.map((sec,i)=>(
+                <div key={sec.id} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:10,marginBottom:8}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                    <span style={{fontSize:13,fontWeight:600}}>{sec.name}</span>
+                    <span style={{fontSize:12,color:"#64748b"}}>{sec.surface_m2} m²</span>
+                  </div>
+                  <MaterialPicker
+                    group="roof_sheet"
+                    value={sec.materialLabel}
+                    onSelect={({label,rate})=>setE(prev=>({...prev,sections:prev.sections.map((s,si)=>si===i?{...s,name:label,materialLabel:label,rate}:s)}))}
+                  />
+                  {sec.rate>0 && <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>{(sec.surface_m2*wasteFactor).toFixed(2)}m² (incl. {e.waste||0}% waste) × {cs}{sec.rate}/m² = {cs}{(sec.surface_m2*wasteFactor*sec.rate).toFixed(2)}</div>}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <>
+              <FG label="Material Type">
+                <MaterialPicker
+                  group="roof_sheet"
+                  value={e.materialLabel}
+                  onSelect={({label,rate})=>setE(prev=>({...prev,materialLabel:label,materialRate:rate}))}
+                />
+              </FG>
+              <FG label={`Material Rate (${cs}/m²)`}><input style={s.input} type="number" value={e.materialRate} onChange={ev=>upd("materialRate")(ev.target.value)}/></FG>
+            </>
+          )}
+          {e.flashingRuns.length>0 ? (
+            <div style={{marginBottom:14}}>
+              <label style={s.label}>Flashing Runs (traced on photo)</label>
+              {e.flashingRuns.map((run,i)=>(
+                <div key={run.subtype} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:10,marginBottom:8}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                    <span style={{fontSize:13,fontWeight:600}}>{run.label}</span>
+                    <span style={{fontSize:12,color:"#64748b"}}>{run.length_m} m</span>
+                  </div>
+                  <MaterialPicker
+                    unit="lm"
+                    group="flashing"
+                    value={run.materialLabel}
+                    onSelect={({label,rate})=>setE(prev=>({...prev,flashingRuns:prev.flashingRuns.map((r,ri)=>ri===i?{...r,materialLabel:label,rate}:r)}))}
+                  />
+                  {run.rate>0 && <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>{(run.length_m*wasteFactor).toFixed(2)}m (incl. {e.waste||0}% waste) × {cs}{run.rate}/m = {cs}{(run.length_m*wasteFactor*run.rate).toFixed(2)}</div>}
+                </div>
+              ))}
+            </div>
+          ) : hasFlashingFallback ? (
+            <FG label={`Flashings (m) @ ${cs}${RATES.flashings}/m`}><input style={s.input} type="number" value={e.flashings} onChange={ev=>upd("flashings")(ev.target.value)}/></FG>
+          ) : null}
+          {e.gutterRuns.length>0 ? (
+            <div style={{marginBottom:14}}>
+              <label style={s.label}>Guttering (traced on photo)</label>
+              {e.gutterRuns.map((g,i)=>(
+                <div key={g.id} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:10,marginBottom:8}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                    <span style={{fontSize:13,fontWeight:600}}>Gutter run</span>
+                    <span style={{fontSize:12,color:"#64748b"}}>{g.length_m} m</span>
+                  </div>
+                  <MaterialPicker
+                    unit="lm" group="gutter" catalogUnit="LM"
+                    value={g.materialLabel}
+                    onSelect={({label,rate})=>setE(prev=>({...prev,gutterRuns:prev.gutterRuns.map((r,ri)=>ri===i?{...r,materialLabel:label,rate}:r)}))}
+                  />
+                  {g.rate>0 && <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>{(g.length_m*wasteFactor).toFixed(2)}m (incl. {e.waste||0}% waste) × {cs}{g.rate}/m = {cs}{(g.length_m*wasteFactor*g.rate).toFixed(2)}</div>}
+                </div>
+              ))}
+            </div>
+          ) : hasGuttering ? (
+            <FG label={`Guttering (m) @ ${cs}${RATES.guttering}/m`}><input style={s.input} type="number" value={e.guttering} onChange={ev=>upd("guttering")(ev.target.value)}/></FG>
+          ) : null}
+          {[
+            { key:"downpipeItems", has:hasDownpipes,    label:"Downpipes", group:"downpipe" },
+            { key:"drainItems",    has:hasDrains,       label:"Drains",    group:"drain" },
+            { key:"penetrationItems", has:hasPenetrations, label:"Penetrations", group:"penetration" },
+          ].filter(sec=>sec.has && e[sec.key].length>0).map(sec=>(
+            <div key={sec.key} style={{marginBottom:14}}>
+              <label style={s.label}>{sec.label} (traced on photo)</label>
+              {e[sec.key].map((it,i)=>(
+                <div key={it.id} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:10,marginBottom:8}}>
+                  <MaterialPicker
+                    unit="each" group={sec.group} catalogUnit="ea"
+                    value={it.materialLabel}
+                    onSelect={({label,rate})=>setE(prev=>({...prev,[sec.key]:prev[sec.key].map((r,ri)=>ri===i?{...r,materialLabel:label,rate}:r)}))}
+                  />
+                  {it.rate>0 && <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>{cs}{it.rate} each</div>}
+                </div>
+              ))}
+            </div>
+          ))}
+          {(hasDownpipes && e.downpipeItems.length===0 || hasDrains && e.drainItems.length===0 || hasPenetrations && e.penetrationItems.length===0) && (
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}} className="grid2-responsive">
+              {hasDownpipes && e.downpipeItems.length===0 && <FG label={`Downpipes (each) @ ${cs}${RATES.downpipe}`}><input style={s.input} type="number" value={e.downpipes} onChange={ev=>upd("downpipes")(ev.target.value)}/></FG>}
+              {hasDrains && e.drainItems.length===0 && <FG label={`Drains (each) @ ${cs}${RATES.drain}`}><input style={s.input} type="number" value={e.drains} onChange={ev=>upd("drains")(ev.target.value)}/></FG>}
+              {hasPenetrations && e.penetrationItems.length===0 && <FG label={`Penetrations (each) @ ${cs}${RATES.penetration}`}><input style={s.input} type="number" value={e.penetrations} onChange={ev=>upd("penetrations")(ev.target.value)}/></FG>}
+            </div>
+          )}
         </div>
         <div style={s.card}>
           <div style={{fontWeight:700,marginBottom:14}}>Labour & Margin</div>
           <FG label="Job Complexity">
             <div style={{display:"flex",flexWrap:"wrap",gap:14}}>
-              {COMPLEXITY_LEVELS.map(c=>(
-                <label key={c.key} style={{display:"flex",alignItems:"center",gap:5,cursor:"pointer",fontSize:13}}>
+              {complexityLevels.map(c=>(
+                <label key={c.key} style={{display:"flex",alignItems:"center",gap:5,cursor:"pointer",fontSize:13}} title={c.desc}>
                   <input type="radio" name="complexity" value={c.key} checked={e.complexity===c.key}
                     onChange={()=>setE(prev=>({...prev,complexity:c.key}))}/>
                   {c.label}
@@ -1417,7 +2130,7 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
             </div>
           </FG>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-            <FG label="Day Rate ($)"><input style={s.input} type="number" value={e.dayRate} onChange={ev=>upd("dayRate")(ev.target.value)}/></FG>
+            <FG label={`Day Rate (${cs})`}><input style={s.input} type="number" value={e.dayRate} onChange={ev=>upd("dayRate")(ev.target.value)}/></FG>
             <FG label="Est. Days"><input style={s.input} type="number" step="0.5" value={e.days} onChange={ev=>upd("days")(ev.target.value)}/></FG>
           </div>
           <FG label="Margin %"><input style={s.input} type="number" value={e.margin} onChange={ev=>upd("margin")(ev.target.value)}/></FG>
@@ -1427,10 +2140,25 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
       <div>
         <div style={{background:"#0f172a",borderRadius:12,padding:20,color:"#fff"}}>
           <div style={{fontFamily:"'Syne',sans-serif",fontSize:15,fontWeight:800,marginBottom:16,color:"#f59e0b"}}>Cost Breakdown</div>
-          {row(`Material (${result.adjArea.toFixed(1)} m² × $${e.materialRate})`, fmt(result.matCost))}
-          {row(`Flashings (${e.flashings}m × $${RATES.flashings})`, fmt(result.flashCost))}
-          {row(`Guttering (${e.guttering}m × $${RATES.guttering})`, fmt(result.gutCost))}
-          {row(`Labour (${e.days} days × $${e.dayRate} × ${complexityFactor(e.complexity)} ${COMPLEXITY_LEVELS.find(c=>c.key===e.complexity)?.label})`, fmt(result.labCost))}
+          {e.sections.length>0
+            ? e.sections.map(sec=>sec.rate>0 && row(`${sec.name} (${(sec.surface_m2*wasteFactor).toFixed(2)}m² incl. ${e.waste||0}% waste × ${cs}${sec.rate})`, fmt(sec.surface_m2*wasteFactor*sec.rate)))
+            : row(`Material (${result.adjArea.toFixed(1)} m² × ${cs}${e.materialRate})`, fmt(result.matCost))}
+          {e.flashingRuns.length>0
+            ? e.flashingRuns.map(r=>row(`${r.label} (${(r.length_m*wasteFactor).toFixed(2)}m incl. ${e.waste||0}% waste × ${cs}${r.rate||0})`, fmt(r.length_m*wasteFactor*(r.rate||0))))
+            : e.flashings>0 && row(`Flashings (${(e.flashings*wasteFactor).toFixed(1)}m incl. ${e.waste||0}% waste × ${cs}${RATES.flashings})`, fmt(result.flashCost))}
+          {e.gutterRuns.length>0
+            ? e.gutterRuns.map(g=>row(`Gutter run (${(g.length_m*wasteFactor).toFixed(2)}m incl. ${e.waste||0}% waste × ${cs}${g.rate||0})`, fmt(g.length_m*wasteFactor*(g.rate||0))))
+            : e.guttering>0 && row(`Guttering (${(e.guttering*wasteFactor).toFixed(1)}m incl. ${e.waste||0}% waste × ${cs}${RATES.guttering})`, fmt(result.gutCost))}
+          {e.downpipeItems.length>0
+            ? e.downpipeItems.map((d,i)=>row(`Downpipe #${i+1} (× ${cs}${d.rate||0})`, fmt(d.rate||0)))
+            : e.downpipes>0 && row(`Downpipes (${e.downpipes} × ${cs}${RATES.downpipe})`, fmt(result.downpipeCost))}
+          {e.drainItems.length>0
+            ? e.drainItems.map((d,i)=>row(`Drain #${i+1} (× ${cs}${d.rate||0})`, fmt(d.rate||0)))
+            : e.drains>0 && row(`Drains (${e.drains} × ${cs}${RATES.drain})`, fmt(result.drainCost))}
+          {e.penetrationItems.length>0
+            ? e.penetrationItems.map((p,i)=>row(`Penetration #${i+1} (× ${cs}${p.rate||0})`, fmt(p.rate||0)))
+            : e.penetrations>0 && row(`Penetrations (${e.penetrations} × ${cs}${RATES.penetration})`, fmt(result.penetrationCost))}
+          {row(`Labour (${e.days} days × ${cs}${e.dayRate} × ${complexityFactorValue} ${complexityLevels.find(c=>c.key===e.complexity)?.label||""})`, fmt(result.labCost))}
           {row(`Margin (${e.margin}%)`, fmt(result.marginAmt))}
           <div style={{borderTop:"1px solid rgba(255,255,255,0.15)",paddingTop:12,marginTop:4}}>
             {row("Sell Price (excl. GST)", fmt(result.sellPrice), true, true)}
@@ -1445,10 +2173,25 @@ function EstimateEngine({ initialArea, onEstimateChange }) {
           <div style={{fontWeight:600,fontSize:13,marginBottom:10}}>Material Summary</div>
           <div style={{fontSize:12,color:"#64748b",lineHeight:2}}>
             <div>Adjusted area: <strong style={{color:"#0f172a"}}>{result.adjArea.toFixed(1)} m²</strong></div>
-            <div>Material: <strong style={{color:"#0f172a"}}>{e.materialLabel} @ ${e.materialRate}/m²</strong></div>
-            <div>Flashings: <strong style={{color:"#0f172a"}}>{e.flashings}m @ ${RATES.flashings}/m</strong></div>
-            <div>Guttering: <strong style={{color:"#0f172a"}}>{e.guttering}m @ ${RATES.guttering}/m</strong></div>
-            <div>Labour: <strong style={{color:"#0f172a"}}>{e.days} days @ ${e.dayRate}/day</strong></div>
+            {e.sections.length>0
+              ? e.sections.map(sec=><div key={sec.id}>{sec.name}: <strong style={{color:"#0f172a"}}>{sec.surface_m2}m²{sec.rate?` @ ${cs}${sec.rate}/m²`:" — no material chosen yet"}</strong></div>)
+              : <div>Material: <strong style={{color:"#0f172a"}}>{e.materialLabel} @ {cs}{e.materialRate}/m²</strong></div>}
+            {e.flashingRuns.length>0
+              ? e.flashingRuns.map(r=><div key={r.subtype}>{r.label}: <strong style={{color:"#0f172a"}}>{r.length_m}m{r.rate?` @ ${cs}${r.rate}/m`:""}</strong></div>)
+              : e.flashings>0 && <div>Flashings: <strong style={{color:"#0f172a"}}>{e.flashings}m @ {cs}{RATES.flashings}/m</strong></div>}
+            {e.gutterRuns.length>0
+              ? e.gutterRuns.map(g=><div key={g.id}>Guttering: <strong style={{color:"#0f172a"}}>{g.length_m}m{g.rate?` @ ${cs}${g.rate}/m`:" — no material chosen yet"}</strong></div>)
+              : e.guttering>0 && <div>Guttering: <strong style={{color:"#0f172a"}}>{e.guttering}m @ {cs}{RATES.guttering}/m</strong></div>}
+            {e.downpipeItems.length>0
+              ? <div>Downpipes: <strong style={{color:"#0f172a"}}>{e.downpipeItems.length} placed{e.downpipeItems.some(d=>d.rate)?`, ${cs}${e.downpipeItems.reduce((a,d)=>a+(d.rate||0),0).toFixed(2)} total`:" — no material chosen yet"}</strong></div>
+              : e.downpipes>0 && <div>Downpipes: <strong style={{color:"#0f172a"}}>{e.downpipes} @ {cs}{RATES.downpipe} each</strong></div>}
+            {e.drainItems.length>0
+              ? <div>Drains: <strong style={{color:"#0f172a"}}>{e.drainItems.length} placed{e.drainItems.some(d=>d.rate)?`, ${cs}${e.drainItems.reduce((a,d)=>a+(d.rate||0),0).toFixed(2)} total`:" — no material chosen yet"}</strong></div>
+              : e.drains>0 && <div>Drains: <strong style={{color:"#0f172a"}}>{e.drains} @ {cs}{RATES.drain} each</strong></div>}
+            {e.penetrationItems.length>0
+              ? <div>Penetrations: <strong style={{color:"#0f172a"}}>{e.penetrationItems.length} placed{e.penetrationItems.some(p=>p.rate)?`, ${cs}${e.penetrationItems.reduce((a,p)=>a+(p.rate||0),0).toFixed(2)} total`:" — no material chosen yet"}</strong></div>
+              : e.penetrations>0 && <div>Penetrations: <strong style={{color:"#0f172a"}}>{e.penetrations} @ {cs}{RATES.penetration} each</strong></div>}
+            <div>Labour: <strong style={{color:"#0f172a"}}>{e.days} days @ {cs}{e.dayRate}/day</strong></div>
           </div>
         </div>
       </div>
@@ -1515,6 +2258,7 @@ function QuotePrintView({ project, customer, company, setView }) {
 
 function QuoteView({ project, customer, company, asbestosOverride }) {
   const { currency, formatMoney: fmt } = useCurrency()   // ← currency-aware fmt + name
+  const cs = currency?.symbol || "$"
   const [snapshotUrl, setSnapshotUrl] = useState(null)
   const [hasAsbestosRisk, setHasAsbestosRisk] = useState(false)
   const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
@@ -1545,10 +2289,45 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
   const qd  = project.quoteDate || today()
   const exp = new Date(new Date(qd.slice(0,10)+"T12:00:00").getTime()+30*86400000).toISOString().slice(0,10)
 
+  // Same wastage % calcEst applied to flashing/gutter cost — recomputed
+  // here so the shown qty × rate always equals the shown total.
+  const wasteFactor = 1 + (e.waste||0)/100
+
+  const flashingLines = e.flashingRuns?.length
+    ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel} — supply & install`:`${r.label} flashing — supply & install`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0) }))
+    : [{ desc:"Flashings — ridge/hip/valley", qty:`${(e.flashings*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.flashings}/m`, total:e.flashCost }]
+
+  // ← Each traced roof section gets its own line (brand/name + its own
+  //   area × rate), same as flashing runs — replaces the single generic
+  //   "materialLabel roofing" line, which never showed which brand/product
+  //   was actually picked per section.
+  const materialLines = e.sections?.length
+    ? e.sections.map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0) }))
+    : [{ desc:`${e.materialLabel} roofing — supply & install`, qty:`${e.adjArea?.toFixed(1)} m²`, unit:`${cs}${e.materialRate}`, total:e.matCost }]
+
+  // ← Same fix as flashing above: show the actual product picked
+  //   (materialLabel, supplier included) instead of a generic "Guttering"/
+  //   "Downpipe #1" line with no indication of what was actually quoted.
+  const gutterLines = e.gutterRuns?.length
+    ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel} — supply & install`:"Guttering — supply & install", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0) }))
+    : [{ desc:"Guttering", qty:`${(e.guttering*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.guttering}/m`, total:e.gutCost }]
+  const downpipeLines = e.downpipeItems?.length
+    ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel} — supply & install`:`Downpipe #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0 }))
+    : [{ desc:"Downpipes", qty:`${e.downpipes||0} each`, unit:`${cs}${RATES.downpipe}/each`, total:e.downpipeCost||0 }]
+  const drainLines = e.drainItems?.length
+    ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel} — supply & install`:`Drain #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0 }))
+    : [{ desc:"Drains", qty:`${e.drains||0} each`, unit:`${cs}${RATES.drain}/each`, total:e.drainCost||0 }]
+  const penetrationLines = e.penetrationItems?.length
+    ? e.penetrationItems.map((p,i)=>({ desc:p.materialLabel?`Penetration #${i+1} — ${p.materialLabel} — supply & seal`:`Penetration #${i+1} — supply & seal`, qty:"1 each", unit:`${cs}${p.rate||0}`, total:p.rate||0 }))
+    : [{ desc:"Penetrations", qty:`${e.penetrations||0} each`, unit:`${cs}${RATES.penetration}/each`, total:e.penetrationCost||0 }]
+
   const quoteLines = [
-    { desc:`${e.materialLabel} roofing — supply & install`, qty:`${e.adjArea?.toFixed(1)} m²`, unit:`$${e.materialRate}`,    total:e.matCost   },
-    { desc:"Flashings — ridge/hip/valley",                  qty:`${e.flashings}m`,              unit:`$${RATES.flashings}/m`, total:e.flashCost },
-    { desc:"Guttering & downpipes",                         qty:`${e.guttering}m`,              unit:`$${RATES.guttering}/m`, total:e.gutCost   },
+    ...materialLines,
+    ...flashingLines,
+    ...gutterLines,
+    ...downpipeLines,
+    ...drainLines,
+    ...penetrationLines,
     { desc:`Labour — installation (${e.days} days)`,        qty:"—",                            unit:"—",                     total:e.labCost   },
   ].filter(l=>l.total>0)
 
@@ -1763,8 +2542,15 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
 
   const upd = k => v => setForm(prev=>({...prev,[k]:v}))
 
+  // ← Errors only surface after a failed Next/Skip attempt (not on first
+  //   render), so the user isn't greeted with a wall of red on a blank form.
+  const [showErrors, setShowErrors] = useState(false)
+
   const canNext = [
-    (isNewCust ? newCust.name && newCust.phone : form.customerId) && form.address.trim(),
+    (isNewCust
+      ? newCust.name.trim() && newCust.phone.trim() && newCust.email.trim() && newCust.address.trim()
+      : form.customerId
+    ) && form.address.trim() && form.notes.trim(),
     true, true, true,
   ]
 
@@ -1773,6 +2559,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
   //   "Save Project" step it's already unmounted and measurementToolRef
   //   would be null, so the snapshot has to be grabbed here instead.
   const stepNext = () => {
+    if(!canNext[step]) { setShowErrors(true); return }
     if(step===1 && measureMethod==="upload") {
       const snap = measurementToolRef.current?.getSnapshot?.()
       if(snap) setGeometrySnapshotDataUrl(snap)
@@ -1786,6 +2573,58 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
   //   report geometry with the same total_surface_m2 field, so the wizard
   //   doesn't need to know which method produced it.
   const handleGeometryChange = g => { setArea(g?.total_surface_m2 || 0); setGeometryFull(g) }
+
+  // ← EstimateEngine keeps its own copy of `sections` (seeded once from
+  //   geometryFull on mount) so it can edit materialLabel/rate/name locally.
+  //   Without this, picking a different brand in the Estimate step never
+  //   made it back into geometryFull — so going back to the Measure step
+  //   (which re-seeds MeasurementTool from geometryFull on remount) still
+  //   showed the old brand name. Merge section edits back by id whenever
+  //   the estimate changes, keeping both steps in sync either direction.
+  const handleEstimateChange = result => {
+    setEstimate(result)
+    setGeometryFull(prev => {
+      if(!prev) return prev
+      let next = prev
+      if(result?.sections?.length && prev.sections?.length){
+        const edited = new Map(result.sections.map(s=>[s.id,s]))
+        next = { ...next, sections: next.sections.map(s=>{
+          const m = edited.get(s.id)
+          return m ? { ...s, name:m.name, materialLabel:m.materialLabel, rate:m.rate } : s
+        })}
+      }
+      // ← Flashing brand is picked per subtype (Ridge Cap, Valley, etc.),
+      //   not per traced line — apply the Estimate step's edit to every
+      //   segment sharing that subtype, same as the popup does.
+      if(result?.flashingRuns?.length && prev.accessories?.flashings?.length){
+        const editedRuns = new Map(result.flashingRuns.map(r=>[r.subtype,r]))
+        next = { ...next, accessories: { ...next.accessories, flashings: next.accessories.flashings.map(f=>{
+          const m = editedRuns.get(f.subtype)
+          return m ? { ...f, materialLabel:m.materialLabel, rate:m.rate } : f
+        })}}
+      }
+      // ← Same fix, generalized: gutter runs and downpipe/drain/penetration
+      //   points each carry their own materialLabel/rate too now, and each
+      //   gets its own popup right after tracing — so editing any of them
+      //   in the Estimate step needs to sync back by id the same way.
+      ;[
+        { resultKey:"gutterRuns",       geomKey:"gutters" },
+        { resultKey:"downpipeItems",    geomKey:"downpipes" },
+        { resultKey:"drainItems",       geomKey:"drains" },
+        { resultKey:"penetrationItems", geomKey:"penetrations" },
+      ].forEach(({resultKey,geomKey})=>{
+        const edits = result?.[resultKey]
+        if(edits?.length && next.accessories?.[geomKey]?.length){
+          const edited = new Map(edits.map(it=>[it.id,it]))
+          next = { ...next, accessories: { ...next.accessories, [geomKey]: next.accessories[geomKey].map(it=>{
+            const m = edited.get(it.id)
+            return m ? { ...it, materialLabel:m.materialLabel, rate:m.rate } : it
+          })}}
+        }
+      })
+      return next
+    })
+  }
 
   // ← Live camera only makes sense on a device with a built-in/rear camera
   //   the user is holding up to the roof — laptops/desktops have front-facing
@@ -1829,12 +2668,12 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
       {step===0 && (
         <div>
           <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap"}}>
-            <Btn onClick={()=>setIsNewCust(false)} style={{border:!isNewCust?"2px solid #f59e0b":"1px solid #e2e8f0",background:!isNewCust?"#fef3c7":""}}>Existing Customer</Btn>
-            <Btn onClick={()=>setIsNewCust(true)}  style={{border:isNewCust?"2px solid #f59e0b":"1px solid #e2e8f0",background:isNewCust?"#fef3c7":""}}>+ New Customer</Btn>
+            <Btn onClick={()=>{ setIsNewCust(false); setShowErrors(false) }} style={{border:!isNewCust?"2px solid #f59e0b":"1px solid #e2e8f0",background:!isNewCust?"#fef3c7":""}}>Existing Customer</Btn>
+            <Btn onClick={()=>{ setIsNewCust(true); setShowErrors(false) }}  style={{border:isNewCust?"2px solid #f59e0b":"1px solid #e2e8f0",background:isNewCust?"#fef3c7":""}}>+ New Customer</Btn>
           </div>
           {!isNewCust ? (
             <>
-              <FG label="Select Customer">
+              <FG label="Select Customer *" error={showErrors && !form.customerId ? "Please select a customer" : null}>
                 <select style={s.input} value={form.customerId} onChange={e=>{ upd("customerId")(e.target.value); setSelectedJobId(""); }}>
                   <option value="">— Choose customer —</option>
                   {customers.map(c=><option key={c.id} value={c.id}>{c.name} · {c.phone}</option>)}
@@ -1853,14 +2692,19 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
             </>
           ):(
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
-              <FG label="Full Name"><input style={s.input} value={newCust.name}    onChange={e=>setNewCust(p=>({...p,name:e.target.value}))}    placeholder="Sarah Thompson"/></FG>
-              <FG label="Phone">   <input style={s.input} value={newCust.phone}   onChange={e=>setNewCust(p=>({...p,phone:e.target.value}))}   placeholder="021 999 0000"/></FG>
-              <FG label="Email">   <input style={s.input} value={newCust.email}   onChange={e=>setNewCust(p=>({...p,email:e.target.value}))}   placeholder="sarah@email.com"/></FG>
-              <FG label="Address"> <input style={s.input} value={newCust.address} onChange={e=>setNewCust(p=>({...p,address:e.target.value}))} placeholder="123 Main St, Auckland"/></FG>
+              <FG label="Full Name *" error={showErrors && !newCust.name.trim() ? "This field is required" : null}>
+                <input style={s.input} value={newCust.name}    onChange={e=>setNewCust(p=>({...p,name:e.target.value}))}    placeholder="Sarah Thompson"/></FG>
+              <FG label="Phone *" error={showErrors && !newCust.phone.trim() ? "This field is required" : null}>
+                <input style={s.input} value={newCust.phone}   onChange={e=>setNewCust(p=>({...p,phone:e.target.value}))}   placeholder="021 999 0000"/></FG>
+              <FG label="Email *" error={showErrors && !newCust.email.trim() ? "This field is required" : null}>
+                <input style={s.input} value={newCust.email}   onChange={e=>setNewCust(p=>({...p,email:e.target.value}))}   placeholder="sarah@email.com"/></FG>
+              <FG label="Address *" error={showErrors && !newCust.address.trim() ? "This field is required" : null}>
+                <input style={s.input} value={newCust.address} onChange={e=>setNewCust(p=>({...p,address:e.target.value}))} placeholder="123 Main St, Auckland"/></FG>
             </div>
           )}
           <div style={{height:1,background:"#e2e8f0",margin:"18px 0"}}/>
-          <FG label="Job Address"><input style={s.input} value={form.address} onChange={e=>upd("address")(e.target.value)} placeholder="47 Ridgeline Ave, Titirangi, Auckland"/></FG>
+          <FG label="Job Address *" error={showErrors && !form.address.trim() ? "This field is required" : null}>
+            <input style={s.input} value={form.address} onChange={e=>upd("address")(e.target.value)} placeholder="47 Ridgeline Ave, Titirangi, Auckland"/></FG>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
             <FG label="Roof Type">
               <select style={s.input} value={form.roofType} onChange={e=>upd("roofType")(e.target.value)}>
@@ -1873,7 +2717,8 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
               </select>
             </FG>
           </div>
-          <FG label="Notes"><textarea style={{...s.input,resize:"vertical"}} rows={3} value={form.notes} onChange={e=>upd("notes")(e.target.value)} placeholder="Site notes, access details, special requirements..."/></FG>
+          <FG label="Notes *" error={showErrors && !form.notes.trim() ? "This field is required" : null}>
+            <textarea style={{...s.input,resize:"vertical"}} rows={3} value={form.notes} onChange={e=>upd("notes")(e.target.value)} placeholder="Site notes, access details, special requirements..."/></FG>
         </div>
       )}
 
@@ -1953,7 +2798,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
         </div>
       )}
 
-      {step===2 && <EstimateEngine initialArea={area||0} onEstimateChange={setEstimate}/>}
+      {step===2 && <EstimateEngine initialArea={area||0} initialGeometry={geometryFull} initialEstimate={existingProject?.estimate} onEstimateChange={handleEstimateChange}/>}
 
       {step===3 && (
         <div className="wizard-review-grid">
@@ -1985,10 +2830,10 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
         <Btn onClick={step===0?onCancel:stepBack}>{step===0?"Cancel":"← Back"}</Btn>
         <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
           {step<STEPS.length-1 && (
-            <Btn onClick={stepNext} style={{opacity:canNext[step]?1:.5,pointerEvents:canNext[step]?"auto":"none"}}>Skip →</Btn>
+            <Btn onClick={stepNext}>Skip →</Btn>
           )}
           {step<STEPS.length-1
-            ? <Btn primary onClick={()=>canNext[step]&&stepNext()}>Next →</Btn>
+            ? <Btn primary onClick={stepNext}>Next →</Btn>
             : <Btn primary onClick={save}>{saving?"Saving…":(isEdit?"Update Project":"Save Project ✓")}</Btn>
           }
         </div>
@@ -2163,7 +3008,7 @@ function ProjectsList({ projects, customers, setProjects, setView, setSelectedPr
         <div style={{overflowX:"auto"}}>
           <table style={{width:"100%",borderCollapse:"collapse",minWidth:640}}>
             <thead>
-              <tr>{["Customer","Address","Roof Area","Value","Status","Date","",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
+              <tr>{["Customer","Address","Roof Area","Value","Status","Date","",""].map((h,i)=><th key={i} style={s.th}>{h}</th>)}</tr>
             </thead>
             <tbody>
               {filtered.map(p=>{
@@ -2374,7 +3219,8 @@ function QuoteHistory({ projectId }) {
 }
 
 function ProjectDetail({ project, customers, setProjects, setView, onEdit, company }) {
-  const { formatMoney } = useCurrency()   // ← currency-aware formatter
+  const { formatMoney, currency } = useCurrency()   // ← currency-aware formatter
+  const cs = currency?.symbol || "$"
 
   if(!project) return null
   const cust = customers.find(c=>c.id===project.customerId)
@@ -2423,10 +3269,38 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
     // ← use currency-aware formatter instead of hardcoded "$"
     const fmt_local = formatMoney
 
+    // Same wastage % calcEst applied to flashing/gutter cost — recomputed
+    // here so the shown qty × rate always equals the shown total.
+    const wasteFactor = 1 + (e?.waste||0)/100
+
+    const flashingLines = e?.flashingRuns?.length
+      ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel} — supply & install`:`${r.label} flashing — supply & install`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0) }))
+      : [{ desc:"Flashings — ridge/hip/valley", qty:`${((e?.flashings||0)*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.flashings}/m`, total:e?.flashCost||0 }]
+
+    const materialLines = e?.sections?.length
+      ? e.sections.map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0) }))
+      : [{ desc:`${e?.materialLabel} roofing — supply & install`, qty:`${e?.adjArea?.toFixed(1)} m²`, unit:`${cs}${e?.materialRate}/m²`, total:e?.matCost||0 }]
+
+    const gutterLines = e?.gutterRuns?.length
+      ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel} — supply & install`:"Guttering — supply & install", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0) }))
+      : [{ desc:"Guttering", qty:`${((e?.guttering||0)*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.guttering}/m`, total:e?.gutCost||0 }]
+    const downpipeLines = e?.downpipeItems?.length
+      ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel} — supply & install`:`Downpipe #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0 }))
+      : [{ desc:"Downpipes", qty:`${e?.downpipes||0} each`, unit:`${cs}${RATES.downpipe}/each`, total:e?.downpipeCost||0 }]
+    const drainLines = e?.drainItems?.length
+      ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel} — supply & install`:`Drain #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0 }))
+      : [{ desc:"Drains", qty:`${e?.drains||0} each`, unit:`${cs}${RATES.drain}/each`, total:e?.drainCost||0 }]
+    const penetrationLines = e?.penetrationItems?.length
+      ? e.penetrationItems.map((p,i)=>({ desc:p.materialLabel?`Penetration #${i+1} — ${p.materialLabel} — supply & seal`:`Penetration #${i+1} — supply & seal`, qty:"1 each", unit:`${cs}${p.rate||0}`, total:p.rate||0 }))
+      : [{ desc:"Penetrations", qty:`${e?.penetrations||0} each`, unit:`${cs}${RATES.penetration}/each`, total:e?.penetrationCost||0 }]
+
     const quoteLines = e ? [
-      { desc:`${e.materialLabel} roofing — supply & install`, qty:`${e.adjArea?.toFixed(1)} m²`, unit:`$${e.materialRate}/m²`, total:e.matCost  },
-      { desc:"Flashings — ridge/hip/valley",                  qty:`${e.flashings}m`,             unit:`$${RATES.flashings}/m`, total:e.flashCost },
-      { desc:"Guttering & downpipes",                         qty:`${e.guttering}m`,             unit:`$${RATES.guttering}/m`, total:e.gutCost   },
+      ...materialLines,
+      ...flashingLines,
+      ...gutterLines,
+      ...downpipeLines,
+      ...drainLines,
+      ...penetrationLines,
       { desc:`Labour — installation (${e.days} days)`,        qty:"—",                           unit:"—",                     total:e.labCost   },
     ].filter(l => l.total > 0) : []
 
@@ -3070,6 +3944,7 @@ function Jobs({ jobs, setJobs, customers }) {
 // ─────────────────────────── USERS ───────────────────────────
 function Users({ currentUser }) {
   const [users,      setUsers]      = useState([])
+  const [org,        setOrg]        = useState(null) // { seatLimit, activeUserCount, planKey, status }
   const [loading,    setLoading]    = useState(true)
   const [showModal,  setShowModal]  = useState(false)
   const [editUser,   setEditUser]   = useState(null)
@@ -3078,7 +3953,19 @@ function Users({ currentUser }) {
   const [form,       setForm]       = useState({ name:"", email:"", password:"" })
   const [formErr,    setFormErr]    = useState("")
 
-  useEffect(()=>{ loadUsers() },[])
+  // ← Only owner/admin manage the team — a plain "member" sees the roster
+  //   read-only, matching the roles Phase 1/2 introduced on the backend.
+  //   Looked up from the freshly-fetched roster (`users`), not
+  //   currentUser.role — that's a claim baked into the login token at sign-in
+  //   time, so it goes stale the moment a role changes server-side (e.g. an
+  //   owner promotes someone) until that person logs out and back in. The
+  //   roster is fetched fresh on every visit to this page, so using it here
+  //   makes a role change take effect immediately instead of silently
+  //   hiding the controls until a re-login.
+  const me = users.find(u => u.id === currentUser?.id)
+  const canManage = me?.role === "owner" || me?.role === "admin"
+
+  useEffect(()=>{ loadUsers(); loadOrg() },[])
 
   async function loadUsers() {
     setLoading(true)
@@ -3089,9 +3976,26 @@ function Users({ currentUser }) {
     finally      { setLoading(false) }
   }
 
+  async function loadOrg() {
+    try { setOrg(await organizationApi.get()) }
+    catch(err) { console.error("Failed to load organization:", err) }
+  }
+
+  const atSeatLimit = org && org.activeUserCount >= org.seatLimit
+
   function openNew()  { setForm({name:"",email:"",password:""}); setFormErr(""); setEditUser(null); setShowModal(true) }
   function openEdit(u){ setForm({name:u.name,email:u.email,password:""}); setFormErr(""); setEditUser(u); setShowModal(true) }
   function closeModal(){ setShowModal(false); setEditUser(null); setFormErr("") }
+
+  // Both invite and reactivate can come back with this — same 403 shape,
+  // same message, since the backend enforces the identical seat check for
+  // either action.
+  function seatLimitMessage(err) {
+    if (err?.body?.error === "seat_limit_exceeded") {
+      return `Seat limit reached (${err.body.currentCount}/${err.body.seatLimit}). Upgrade your plan to add more people.`
+    }
+    return null
+  }
 
   async function save() {
     if (!form.name.trim() || !form.email.trim()) { setFormErr("Name and email are required."); return }
@@ -3104,9 +4008,10 @@ function Users({ currentUser }) {
       } else {
         const raw = await usersApi.create(form)
         setUsers(prev => [...prev, normalizeKeys(raw)])
+        loadOrg()
       }
       closeModal()
-    } catch(err) { setFormErr(err.message || "Save failed.") }
+    } catch(err) { setFormErr(seatLimitMessage(err) || err.message || "Save failed.") }
     finally      { setSaving(false) }
   }
 
@@ -3116,7 +4021,12 @@ function Users({ currentUser }) {
     try {
       const raw = await usersApi.setActive(u.id, !u.isActive)
       setUsers(prev => prev.map(x => x.id===u.id ? normalizeKeys(raw) : x))
-    } catch(err) { console.error("Toggle failed:", err) }
+      loadOrg()
+    } catch(err) {
+      const msg = seatLimitMessage(err)
+      if (msg) alert(msg) // reactivation blocked by the seat limit — no inline form to show this in
+      console.error("Toggle failed:", err)
+    }
     finally      { setTogglingId(null) }
   }
 
@@ -3125,8 +4035,21 @@ function Users({ currentUser }) {
   return (
     <div style={{width:"100%"}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:10}}>
-        <div style={{fontSize:13,color:"#64748b"}}>Manage who has access to aTopRoof CRM.</div>
-        <Btn primary onClick={openNew}>+ Add User</Btn>
+        <div>
+          {org && <div style={{fontSize:11,color:"#94a3b8",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.03em",marginBottom:2}}>{org.name}</div>}
+          <div style={{fontSize:13,color:"#64748b"}}>Manage who has access to aTopRoof CRM.</div>
+          {org && (
+            <div style={{fontSize:12,color:atSeatLimit?"#b91c1c":"#94a3b8",marginTop:4,fontWeight:atSeatLimit?600:400}}>
+              {org.activeUserCount} / {org.seatLimit} seats used
+              {atSeatLimit && " — upgrade your plan to add more people"}
+            </div>
+          )}
+        </div>
+        {canManage && (
+          <Btn primary onClick={()=>{ if(!atSeatLimit) openNew() }} style={{opacity:atSeatLimit?0.5:1,cursor:atSeatLimit?"not-allowed":"pointer"}}>
+            + Add User
+          </Btn>
+        )}
       </div>
 
       <div style={{...s.card,padding:0,overflow:"hidden"}}>
@@ -3136,7 +4059,7 @@ function Users({ currentUser }) {
           <div style={{overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse",minWidth:560}}>
               <thead>
-                <tr>{["User","Email","Status","Joined",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
+                <tr>{["User","Email","Role","Status","Joined",canManage?"":null].filter(h=>h!==null).map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
               </thead>
               <tbody>
                 {users.map(u => {
@@ -3158,6 +4081,7 @@ function Users({ currentUser }) {
                         </div>
                       </td>
                       <td style={{...s.td,color:"#3b82f6",fontSize:12}}>{u.email}</td>
+                      <td style={{...s.td,fontSize:12,color:"#64748b",textTransform:"capitalize"}}>{u.role || "member"}</td>
                       <td style={s.td}>
                         <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,background:active?"#d1fae5":"#fee2e2",color:active?"#065f46":"#991b1b"}}>
                           <span style={{width:6,height:6,borderRadius:"50%",background:active?"#10b981":"#ef4444"}}/>
@@ -3165,21 +4089,23 @@ function Users({ currentUser }) {
                         </span>
                       </td>
                       <td style={{...s.td,fontSize:12,color:"#64748b"}}>{fmtD(u.createdAt)}</td>
-                      <td style={s.td}>
-                        <div style={{display:"flex",gap:6,justifyContent:"flex-end"}}>
-                          <Btn sm onClick={()=>openEdit(u)}>Edit</Btn>
-                          {!isMe && (
-                            <button onClick={()=>toggleActive(u)} disabled={togglingId===u.id}
-                              style={{padding:"6px 12px",borderRadius:8,fontSize:12,fontWeight:500,cursor:togglingId===u.id?"not-allowed":"pointer",border:"1px solid",fontFamily:"inherit",transition:"all .15s",opacity:togglingId===u.id?0.6:1,background:active?"#fee2e2":"#d1fae5",color:active?"#b91c1c":"#065f46",borderColor:active?"#fca5a5":"#6ee7b7"}}>
-                              {togglingId===u.id ? "…" : active ? "Disable" : "Enable"}
-                            </button>
-                          )}
-                        </div>
-                      </td>
+                      {canManage && (
+                        <td style={s.td}>
+                          <div style={{display:"flex",gap:6,justifyContent:"flex-end"}}>
+                            <Btn sm onClick={()=>openEdit(u)}>Edit</Btn>
+                            {!isMe && (
+                              <button onClick={()=>toggleActive(u)} disabled={togglingId===u.id}
+                                style={{padding:"6px 12px",borderRadius:8,fontSize:12,fontWeight:500,cursor:togglingId===u.id?"not-allowed":"pointer",border:"1px solid",fontFamily:"inherit",transition:"all .15s",opacity:togglingId===u.id?0.6:1,background:active?"#fee2e2":"#d1fae5",color:active?"#b91c1c":"#065f46",borderColor:active?"#fca5a5":"#6ee7b7"}}>
+                                {togglingId===u.id ? "…" : active ? "Disable" : "Enable"}
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      )}
                     </tr>
                   )
                 })}
-                {users.length===0&&<tr><td colSpan={5} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No users found</td></tr>}
+                {users.length===0&&<tr><td colSpan={canManage?6:5} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No users found</td></tr>}
               </tbody>
             </table>
           </div>
@@ -3216,8 +4142,59 @@ function Users({ currentUser }) {
   )
 }
 
+// ─────────────────────────── MY PROFILE ───────────────────────────
+// Self-service name/email/password — available to every user regardless of
+// role, unlike the Team page's Edit button (owner/admin, for editing OTHER
+// people). Backend enforces this same self-vs-others distinction
+// independently (backend/routes/users.js) — this UI isn't the only guard.
+function MyProfileModal({ user, onClose, onSaved }) {
+  const [form,    setForm]    = useState({ name: user?.name||"", email: user?.email||"", password: "" })
+  const [saving,  setSaving]  = useState(false)
+  const [error,   setError]   = useState("")
+  const [saved,   setSaved]   = useState(false)
+
+  const upd = k => e => setForm(prev=>({...prev,[k]:e.target.value}))
+
+  async function save() {
+    if (!form.name.trim() || !form.email.trim()) { setError("Name and email are required."); return }
+    setSaving(true); setError("")
+    try {
+      const raw = await usersApi.update(user.id, form)
+      const updated = normalizeKeys(raw)
+      onSaved({ name: updated.name, email: updated.email })
+      setSaved(true)
+      setForm(prev=>({...prev, password:""}))
+      setTimeout(()=>setSaved(false), 2000)
+    } catch(err) { setError(err.message || "Save failed.") }
+    finally      { setSaving(false) }
+  }
+
+  return (
+    <Modal title="My Profile" onClose={onClose} width={440}>
+      <div style={{fontSize:12,color:"#94a3b8",marginBottom:16}}>
+        Update your own name, email, or password. Role and organization membership are managed by your workspace owner.
+      </div>
+      <FG label="Full Name *"><input style={s.input} value={form.name}  onChange={upd("name")}/></FG>
+      <FG label="Email *">    <input style={s.input} type="email" value={form.email} onChange={upd("email")}/></FG>
+      <FG label="New Password (leave blank to keep current)">
+        <input style={s.input} type="password" value={form.password} onChange={upd("password")} placeholder="Min 6 characters"/>
+      </FG>
+      {error && (
+        <div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#b91c1c",marginBottom:4}}>{error}</div>
+      )}
+      <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:20,alignItems:"center"}}>
+        {saved && <span style={{fontSize:13,color:"#10b981"}}>✓ Saved</span>}
+        <Btn onClick={onClose}>Close</Btn>
+        <Btn primary onClick={save} style={{opacity:saving?0.6:1}}>{saving ? "Saving…" : "Save Changes"}</Btn>
+      </div>
+    </Modal>
+  )
+}
+
 // ─────────────────────────── SETTINGS ───────────────────────────
 function Settings({ settings, onSave }) {
+  const { currency } = useCurrency()
+  const cs = currency?.symbol || "$"
   const [form,  setForm]  = useState(settings)
   const [saved, setSaved] = useState(false)
   const [uploadingLogo,   setUploadingLogo]   = useState(false)
@@ -3308,7 +4285,7 @@ function Settings({ settings, onSave }) {
       <div style={{...s.card,marginBottom:16}}>
         <div style={{fontWeight:700,marginBottom:16}}>Default Pricing</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
-          <FG label="Default Day Rate ($)"><input style={s.input} type="number" value={form.dayRate}  onChange={updNum("dayRate")}/></FG>
+          <FG label={`Default Day Rate (${cs})`}><input style={s.input} type="number" value={form.dayRate}  onChange={updNum("dayRate")}/></FG>
           <FG label="Default Margin %">   <input style={s.input} type="number" value={form.margin}   onChange={updNum("margin")}/></FG>
           <FG label="GST Rate %">         <input style={{...s.input,background:"#f8fafc",color:"#64748b"}} type="number" value={GST_RATE*100} readOnly/></FG>
           <FG label="Default Wastage %">  <input style={s.input} type="number" value={form.wastage}  onChange={updNum("wastage")}/></FG>
@@ -3317,10 +4294,12 @@ function Settings({ settings, onSave }) {
       <div style={{...s.card,marginBottom:16}}>
         <div style={{fontWeight:700,marginBottom:14}}>Accessory Rates</div>
         {[
-          ["Flashings",    `$${RATES.flashings}/m`],
-          ["Guttering",    `$${RATES.guttering}/m`],
-          ["Downpipes",    `$${RATES.downpipe}/each`],
-          ["Underlayment", `$${RATES.underlayment}/m²`],
+          ["Flashings",    `${cs}${RATES.flashings}/m`],
+          ["Guttering",    `${cs}${RATES.guttering}/m`],
+          ["Downpipes",    `${cs}${RATES.downpipe}/each`],
+          ["Drains",       `${cs}${RATES.drain}/each`],
+          ["Penetrations", `${cs}${RATES.penetration}/each`],
+          ["Underlayment", `${cs}${RATES.underlayment}/m²`],
         ].map(([l,v])=>(
           <div key={l} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 0",borderBottom:"1px solid #f1f5f9",fontSize:13}}>
             <span>{l}</span><span style={{fontWeight:500,color:"#64748b"}}>{v}</span>
@@ -3332,6 +4311,826 @@ function Settings({ settings, onSave }) {
         {saved && <span style={{fontSize:13,color:"#10b981",alignSelf:"center"}}>✓ Saved</span>}
         <Btn primary onClick={save}>Save Changes</Btn>
       </div>
+    </div>
+  )
+}
+
+// ─────────────────────────── JOB COMPLEXITY SETTINGS ───────────────────────
+// Was a hardcoded COMPLEXITY_LEVELS constant — now a global, editable list
+// (same for every user quoting, not per-user like company profile) stored
+// via complexityLevelsApi, backed by the app_settings key/value table.
+function JobComplexitySettings() {
+  const [levels, setLevels] = useState(null) // null = still loading
+  const [saving, setSaving] = useState(false)
+  const [saved,  setSaved]  = useState(false)
+  const [error,  setError]  = useState("")
+
+  useEffect(()=>{ complexityLevelsApi.getAll().then(setLevels).catch(()=>setLevels([])) },[])
+
+  const updateField = (i,field) => e => setLevels(prev=>prev.map((l,li)=>li===i?{...l,[field]:e.target.value}:l))
+
+  function addLevel() {
+    setLevels(prev=>[...prev, { key:`level_${uid()}`, label:"New Level", factor:1, desc:"" }])
+  }
+  function removeLevel(i) {
+    setLevels(prev=>prev.filter((_,li)=>li!==i))
+  }
+
+  async function save() {
+    setError(""); setSaving(true)
+    try {
+      const cleaned = levels.map(l=>({ ...l, factor:parseFloat(l.factor)||1 }))
+      const result = await complexityLevelsApi.save(cleaned)
+      setLevels(result)
+      setSaved(true); setTimeout(()=>setSaved(false), 2500)
+    } catch(err) {
+      setError(err.message || "Failed to save")
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if(levels===null) return <div style={{color:"#64748b",padding:20}}>Loading…</div>
+
+  return (
+    <div style={{maxWidth:700}}>
+      <div style={{...s.card,marginBottom:16}}>
+        <div style={{fontWeight:700,marginBottom:4}}>Job Complexity Multipliers</div>
+        <div style={{fontSize:12,color:"#94a3b8",marginBottom:16}}>
+          These are the labour-cost multipliers offered on every estimate's "Job Complexity"
+          selector — global, not per-user. Changing a factor here applies to any estimate
+          still being worked on using that level; quotes already sent aren't retroactively changed.
+        </div>
+        {levels.map((l,i)=>(
+          <div key={l.key} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:12,marginBottom:10}}>
+            <div style={{display:"grid",gridTemplateColumns:"1.3fr 0.7fr auto",gap:10,marginBottom:8,alignItems:"end"}} className="grid2-responsive">
+              <FG label="Label"><input style={s.input} value={l.label} onChange={updateField(i,"label")}/></FG>
+              <FG label="Multiplier (×)"><input style={s.input} type="number" step="0.01" min="0.1" value={l.factor} onChange={updateField(i,"factor")}/></FG>
+              <Btn danger sm onClick={()=>removeLevel(i)}>Remove</Btn>
+            </div>
+            <FG label="Description (shown as a tooltip on the estimate)">
+              <input style={s.input} value={l.desc||""} onChange={updateField(i,"desc")}/>
+            </FG>
+            <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>Key: {l.key} (fixed once created — existing estimates reference it)</div>
+          </div>
+        ))}
+        <Btn onClick={addLevel}>+ Add Level</Btn>
+      </div>
+      {error && <div style={{marginBottom:12,fontSize:12,color:"#991b1b",background:"#fee2e2",borderRadius:8,padding:"8px 12px"}}>{error}</div>}
+      <div style={{display:"flex",justifyContent:"flex-end",gap:10}}>
+        {saved && <span style={{fontSize:13,color:"#10b981",alignSelf:"center"}}>✓ Saved</span>}
+        <Btn primary onClick={save}>{saving?"Saving…":"Save Changes"}</Btn>
+      </div>
+    </div>
+  )
+}
+
+// ─────────────────────────── BILLING & PLAN ───────────────────────────
+// Mirrors backend/config/plans.js — display labels only, kept in sync
+// manually (same pattern as src/SignupPage.jsx's PLAN_OPTIONS).
+const PLAN_LABELS = { starter: "Starter", pro: "Pro", legacy: "Legacy Workspace", manual: "Manually Provisioned" }
+
+const ORG_STATUS_STYLE = {
+  trialing: { bg:"#dbeafe", color:"#1e40af", label:"Trialing" },
+  active:   { bg:"#d1fae5", color:"#065f46", label:"Active" },
+  past_due: { bg:"#fee2e2", color:"#991b1b", label:"Payment issue" },
+  canceled: { bg:"#f1f5f9", color:"#475569", label:"Canceled" },
+}
+
+// Small brand badges for the payment methods list — approximations of the
+// Visa/Mastercard marks (no icon library in this project), falling back to
+// a plain uppercase label for any other card brand Stripe returns.
+function CardBrandBadge({ brand }) {
+  const b = (brand || "").toLowerCase()
+  const box = {width:56,height:36,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}
+  if (b === "visa") {
+    return <div style={{...box,background:"#dbeafe"}}><span style={{fontStyle:"italic",fontWeight:800,fontSize:14,color:"#1d4ed8",letterSpacing:0.5}}>VISA</span></div>
+  }
+  if (b === "mastercard") {
+    return (
+      <div style={{...box,background:"#fee2e2",gap:0}}>
+        <div style={{width:18,height:18,borderRadius:"50%",background:"#eb001b"}} />
+        <div style={{width:18,height:18,borderRadius:"50%",background:"#f79e1b",marginLeft:-8,opacity:0.9}} />
+      </div>
+    )
+  }
+  return <div style={{...box,background:"#f1f5f9"}}><span style={{fontWeight:700,fontSize:10,color:"#475569",textTransform:"uppercase"}}>{b || "card"}</span></div>
+}
+
+// Cached across modal opens so we don't re-run loadStripe() (and its
+// script injection) every time — Stripe's own guidance is to call it once
+// per publishable key, not per component mount.
+let _stripePromise = null
+function getStripePromise(publishableKey) {
+  if (!_stripePromise) _stripePromise = loadStripe(publishableKey)
+  return _stripePromise
+}
+
+const STRIPE_ELEMENT_STYLE = {
+  base: { fontSize: "14px", fontFamily: "inherit", color: "#0f172a", "::placeholder": { color: "#94a3b8" } },
+}
+// Shared wrapper so a Stripe Element (an iframe) sits inside a box that
+// looks like every other text input in this app (s.input's border/radius/
+// padding), since the element itself can't take those styles directly.
+const stripeElementBoxStyle = { ...s.input, display: "flex", alignItems: "center" }
+
+// The actual card form — must render inside <Elements> so useStripe()/
+// useElements() below can see the Stripe instance and the mounted
+// CardNumberElement/CardExpiryElement/CardCvcElement. Card number, expiry,
+// and CVV are entered directly into Stripe-hosted iframes; none of that
+// ever reaches our backend — only the resulting PaymentMethod id does.
+function AddCardForm({ clientSecret, onClose, onAdded }) {
+  const stripe   = useStripe()
+  const elements = useElements()
+  const [brand,      setBrand]      = useState("unknown")
+  const [submitting, setSubmitting] = useState(false)
+  const [error,      setError]      = useState("")
+
+  async function handleSubmit(ev) {
+    ev.preventDefault()
+    if (!stripe || !elements || submitting) return
+    setSubmitting(true); setError("")
+    try {
+      const { error: stripeError, setupIntent } = await stripe.confirmCardSetup(clientSecret, {
+        payment_method: { card: elements.getElement(CardNumberElement) },
+      })
+      if (stripeError) { setError(stripeError.message); setSubmitting(false); return }
+      await onAdded(setupIntent.payment_method)
+    } catch (err) {
+      setError(err.message || "Couldn't save card")
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <div style={{display:"flex",alignItems:"flex-end",gap:12,marginBottom:14}}>
+        <CardBrandBadge brand={brand==="unknown"?"":brand} />
+        <div style={{flex:1}}>
+          <div style={s.label}>Card Number</div>
+          <div style={stripeElementBoxStyle}>
+            <CardNumberElement
+              options={{ style: STRIPE_ELEMENT_STYLE, showIcon: true }}
+              onChange={ev=>setBrand(ev.brand || "unknown")}
+            />
+          </div>
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+        <div>
+          <div style={s.label}>Expiry Date</div>
+          <div style={stripeElementBoxStyle}><CardExpiryElement options={{ style: STRIPE_ELEMENT_STYLE }} /></div>
+        </div>
+        <div>
+          <div style={s.label}>CVV</div>
+          <div style={stripeElementBoxStyle}><CardCvcElement options={{ style: STRIPE_ELEMENT_STYLE }} /></div>
+        </div>
+      </div>
+      {error && <div style={{marginBottom:14,fontSize:12,color:"#991b1b",background:"#fee2e2",borderRadius:8,padding:"8px 12px"}}>{error}</div>}
+      <div style={{display:"flex",justifyContent:"flex-end",gap:10}}>
+        <Btn type="button" onClick={onClose}>Cancel</Btn>
+        <Btn primary type="submit" style={{opacity:(!stripe||submitting)?0.6:1}}>{submitting ? "Saving…" : "Save Card"}</Btn>
+      </div>
+    </form>
+  )
+}
+
+// Simple leading-digit brand detection (same ranges Stripe itself uses) —
+// only for showing the right badge/label in the dummy form. Never a
+// substitute for real validation (Luhn check, issuer lookup), since no
+// real charge or storage of the actual number happens here anyway.
+function detectCardBrand(digits) {
+  if (/^4/.test(digits)) return "visa"
+  if (/^5[1-5]/.test(digits) || /^2(2[2-9]|[3-6]\d|7[01]|720)/.test(digits)) return "mastercard"
+  if (/^3[47]/.test(digits)) return "amex"
+  if (/^6(?:011|5)/.test(digits)) return "discover"
+  return "unknown"
+}
+
+// Placeholder card form used only while Stripe isn't configured yet (no
+// STRIPE_SECRET_KEY/STRIPE_PUBLISHABLE_KEY in the backend's .env) — lets
+// the Billing & Plan UI be built/tested end-to-end before real Stripe keys
+// exist. Same fields as the real Stripe Elements form (card number,
+// expiry, CVV), but plain inputs instead of Stripe's iframes. The CVV is
+// validated for shape only and never sent anywhere — only brand/last4/
+// expiry (never the full number) reach the backend, same rule as the real
+// flow, so this placeholder can't turn into an accidental card-data leak
+// once someone pastes a real card into it during testing.
+function DummyCardForm({ onClose, onAdded }) {
+  const [cardNumber, setCardNumber] = useState("")
+  const [expiry,      setExpiry]     = useState("")
+  const [cvv,          setCvv]       = useState("")
+  const [submitting,  setSubmitting] = useState(false)
+  const [error,        setError]     = useState("")
+
+  const digits = cardNumber.replace(/\D/g, "")
+  const brand  = digits.length >= 2 ? detectCardBrand(digits) : "unknown"
+
+  async function handleSubmit(ev) {
+    ev.preventDefault()
+    if (digits.length < 12 || digits.length > 19) { setError("Enter a valid card number."); return }
+    const [mm, yy] = expiry.split("/").map(s=>s?.trim())
+    const month = parseInt(mm, 10)
+    let year = parseInt(yy, 10)
+    if (!Number.isInteger(month) || month < 1 || month > 12 || !Number.isInteger(year)) {
+      setError("Enter a valid expiry date (MM/YY)."); return
+    }
+    if (year < 100) year += 2000
+    if (!/^\d{3,4}$/.test(cvv)) { setError("Enter a valid CVV."); return }
+
+    setSubmitting(true); setError("")
+    try {
+      const { id } = await billingApi.createDummyPaymentMethod({
+        brand, last4: digits.slice(-4), expMonth: month, expYear: year,
+      })
+      await onAdded(id)
+    } catch (err) {
+      setError(err.message || "Couldn't save card")
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <div style={{fontSize:11,color:"#92400e",background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,padding:"8px 12px",marginBottom:14,lineHeight:1.5}}>
+        Test mode — Stripe isn't connected yet. This card isn't real and won't be charged; only its brand, last 4 digits, and expiry are saved.
+      </div>
+      <div style={{display:"flex",alignItems:"flex-end",gap:12,marginBottom:14}}>
+        <CardBrandBadge brand={brand==="unknown"?"":brand} />
+        <div style={{flex:1}}>
+          <div style={s.label}>Card Number</div>
+          <input style={s.input} inputMode="numeric" placeholder="4242 4242 4242 4242"
+            value={cardNumber} onChange={e=>setCardNumber(e.target.value)} maxLength={23}/>
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+        <div>
+          <div style={s.label}>Expiry Date</div>
+          <input style={s.input} placeholder="MM/YY" value={expiry} onChange={e=>setExpiry(e.target.value)} maxLength={7}/>
+        </div>
+        <div>
+          <div style={s.label}>CVV</div>
+          <input style={s.input} inputMode="numeric" placeholder="123" value={cvv} onChange={e=>setCvv(e.target.value)} maxLength={4}/>
+        </div>
+      </div>
+      {error && <div style={{marginBottom:14,fontSize:12,color:"#991b1b",background:"#fee2e2",borderRadius:8,padding:"8px 12px"}}>{error}</div>}
+      <div style={{display:"flex",justifyContent:"flex-end",gap:10}}>
+        <Btn type="button" onClick={onClose}>Cancel</Btn>
+        <Btn primary type="submit" style={{opacity:submitting?0.6:1}}>{submitting ? "Saving…" : "Save Card"}</Btn>
+      </div>
+    </form>
+  )
+}
+
+function AddPaymentMethodModal({ onClose, onAdded }) {
+  const [mode,          setMode]          = useState(null) // "stripe" | "dummy"
+  const [stripePromise, setStripePromise] = useState(null)
+  const [clientSecret,  setClientSecret]  = useState(null)
+  const [error,         setError]         = useState("")
+  const [loading,       setLoading]       = useState(true)
+
+  useEffect(()=>{
+    let cancelled = false
+    Promise.all([billingApi.getPublishableKey(), billingApi.createSetupIntent()])
+      .then(([{ publishableKey }, setupIntentRes])=>{
+        if (cancelled) return
+        if (!publishableKey || setupIntentRes.dummy) {
+          setMode("dummy")
+          setLoading(false)
+          return
+        }
+        setStripePromise(getStripePromise(publishableKey))
+        setClientSecret(setupIntentRes.clientSecret)
+        setMode("stripe")
+        setLoading(false)
+      })
+      .catch(err=>{ if (!cancelled) { setError(err.message || "Couldn't start card setup"); setLoading(false) } })
+    return ()=>{ cancelled = true }
+  },[])
+
+  return (
+    <Modal title="Add Payment Method" onClose={onClose} width={420}>
+      {loading && <div style={{color:"#94a3b8",padding:"20px 0"}}>Loading…</div>}
+      {!loading && error && <div style={{fontSize:12,color:"#991b1b",background:"#fee2e2",borderRadius:8,padding:"10px 14px"}}>{error}</div>}
+      {!loading && !error && mode==="dummy" && <DummyCardForm onClose={onClose} onAdded={onAdded} />}
+      {!loading && !error && mode==="stripe" && stripePromise && clientSecret && (
+        <Elements stripe={stripePromise}>
+          <AddCardForm clientSecret={clientSecret} onClose={onClose} onAdded={onAdded} />
+        </Elements>
+      )}
+    </Modal>
+  )
+}
+
+function BillingSettings({ user }) {
+  const [org,         setOrg]         = useState(null)
+  const [loading,     setLoading]     = useState(true)
+  const [redirecting, setRedirecting] = useState(false)
+  const [error,       setError]       = useState("")
+
+  const [paymentMethods,        setPaymentMethods]        = useState([])
+  const [defaultPaymentMethodId,setDefaultPaymentMethodId] = useState(null)
+  const [pmLoading,             setPmLoading]              = useState(true)
+  const [showAddCard,           setShowAddCard]            = useState(false)
+  const [pmActionId,            setPmActionId]             = useState(null) // id currently being set-default/removed, for per-row disabling
+
+  useEffect(()=>{
+    organizationApi.get().then(setOrg).catch(err=>setError(err.message||"Couldn't load billing info")).finally(()=>setLoading(false))
+  },[])
+
+  function loadPaymentMethods() {
+    if (org?.myRole !== "owner" && org?.myRole !== "admin") { setPmLoading(false); return }
+    setPmLoading(true)
+    return billingApi.getPaymentMethods()
+      .then(({ paymentMethods, defaultPaymentMethodId }) => {
+        setPaymentMethods(paymentMethods || [])
+        setDefaultPaymentMethodId(defaultPaymentMethodId || null)
+      })
+      .catch(()=>{})
+      .finally(()=>setPmLoading(false))
+  }
+  useEffect(()=>{ loadPaymentMethods() },[org?.myRole])
+
+  async function openBillingPortal() {
+    setRedirecting(true); setError("")
+    try {
+      const { url } = await billingApi.getPortalUrl()
+      window.location.href = url
+    } catch (err) {
+      setError(err.message || "Couldn't open billing portal")
+      setRedirecting(false)
+    }
+  }
+
+  // Called by AddPaymentMethodModal once Stripe has confirmed the card and
+  // handed back its PaymentMethod id — never a raw card number.
+  async function handleCardAdded(paymentMethodId) {
+    try {
+      // First card on the org becomes primary automatically — otherwise
+      // there'd be a card on file that's still unusable for billing until
+      // the owner remembers to flip it on separately.
+      if (paymentMethods.length === 0) {
+        await billingApi.setDefaultPaymentMethod(paymentMethodId)
+      }
+    } catch { /* card is still saved even if setting it default failed */ }
+    setShowAddCard(false)
+    await loadPaymentMethods()
+  }
+
+  async function handleSetPrimary(id) {
+    setPmActionId(id); setError("")
+    try { await billingApi.setDefaultPaymentMethod(id); await loadPaymentMethods() }
+    catch (err) { setError(err.message || "Couldn't set primary card") }
+    finally { setPmActionId(null) }
+  }
+
+  async function handleRemove(id) {
+    if (!window.confirm("Remove this card?")) return
+    setPmActionId(id); setError("")
+    try { await billingApi.deletePaymentMethod(id); await loadPaymentMethods() }
+    catch (err) { setError(err.message || "Couldn't remove card") }
+    finally { setPmActionId(null) }
+  }
+
+  if (loading) return <div style={{color:"#64748b",padding:20}}>Loading…</div>
+  if (!org) return <div style={{color:"#64748b",padding:20}}>{error || "Couldn't load billing info."}</div>
+
+  const statusStyle = ORG_STATUS_STYLE[org.status] || ORG_STATUS_STYLE.trialing
+  // Owner and admin can both manage billing/payment methods — same tier as
+  // team management (isManager in routes/users.js), not owner-only.
+  const canManageBilling = org.myRole === "owner" || org.myRole === "admin"
+
+  return (
+    <div style={{maxWidth:600}}>
+      <div style={{...s.card,marginBottom:16}}>
+        <div style={{fontWeight:700,marginBottom:4}}>{org.name}</div>
+        <div style={{fontSize:12,color:"#94a3b8",marginBottom:16}}>Your organization's subscription and seat usage.</div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}} className="grid2-responsive">
+          <div>
+            <div style={s.label}>Plan</div>
+            <div style={{fontSize:15,fontWeight:600}}>{PLAN_LABELS[org.planKey] || org.planKey || "—"}</div>
+          </div>
+          <div>
+            <div style={s.label}>Status</div>
+            <span style={{display:"inline-flex",alignItems:"center",padding:"3px 10px",borderRadius:20,fontSize:12,fontWeight:600,background:statusStyle.bg,color:statusStyle.color}}>
+              {statusStyle.label}
+            </span>
+          </div>
+          <div>
+            <div style={s.label}>Seats used</div>
+            <div style={{fontSize:15,fontWeight:600}}>{org.activeUserCount} / {org.seatLimit}</div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{...s.card,marginBottom:16}}>
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:16}}>
+          <div>
+            <div style={{fontWeight:700,marginBottom:4}}>Payment Methods</div>
+            <div style={{fontSize:12,color:"#94a3b8"}}>Add multiple payment methods you have</div>
+          </div>
+          {canManageBilling && (
+            <button onClick={()=>setShowAddCard(true)}
+              style={{display:"flex",alignItems:"center",gap:6,background:"none",border:"none",color:"#7c3aed",fontWeight:600,fontSize:13,cursor:"pointer",padding:0}}>
+              <span style={{fontSize:16,lineHeight:1}}>+</span> Add Payment Method
+            </button>
+          )}
+        </div>
+
+        {!canManageBilling ? (
+          <div style={{fontSize:12,color:"#92400e",background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,padding:"10px 14px"}}>
+            Only your workspace owner or admin can manage billing and payment methods.
+          </div>
+        ) : pmLoading ? (
+          <div style={{color:"#94a3b8",fontSize:13,padding:"10px 0"}}>Loading…</div>
+        ) : paymentMethods.length === 0 ? (
+          <div style={{color:"#94a3b8",fontSize:13,padding:"10px 0"}}>No payment methods on file yet.</div>
+        ) : (
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {paymentMethods.map(pm => {
+              const isPrimary = pm.id === defaultPaymentMethodId
+              return (
+                <div key={pm.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",border:"1px solid #e2e8f0",borderRadius:10,padding:"12px 16px"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:14}}>
+                    <CardBrandBadge brand={pm.brand} />
+                    <div>
+                      <div style={{fontSize:14,fontWeight:600,color:"#0f172a",textTransform:"capitalize"}}>
+                        {pm.brand} xxxx-xxxx-xxxx-{pm.last4}
+                      </div>
+                      {pm.expMonth && pm.expYear && (
+                        <div style={{fontSize:12,color:"#94a3b8",marginTop:2}}>
+                          Expires {String(pm.expMonth).padStart(2,"0")}/{pm.expYear}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:14}}>
+                    {isPrimary ? (
+                      <span style={{background:"#7c3aed",color:"#fff",fontSize:11,fontWeight:700,letterSpacing:0.5,padding:"5px 12px",borderRadius:6}}>PRIMARY</span>
+                    ) : (
+                      <button onClick={()=>handleSetPrimary(pm.id)} disabled={pmActionId===pm.id}
+                        style={{background:"none",border:"none",color:"#7c3aed",fontSize:13,fontWeight:600,cursor:pmActionId===pm.id?"default":"pointer",opacity:pmActionId===pm.id?0.6:1,padding:0}}>
+                        Set as Primary
+                      </button>
+                    )}
+                    <button onClick={()=>handleRemove(pm.id)} disabled={pmActionId===pm.id} title="Remove card"
+                      style={{background:"none",border:"none",color:"#94a3b8",fontSize:16,cursor:pmActionId===pm.id?"default":"pointer",opacity:pmActionId===pm.id?0.6:1,padding:0}}>
+                      🗑
+                    </button>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        {error && <div style={{marginTop:14,fontSize:12,color:"#991b1b",background:"#fee2e2",borderRadius:8,padding:"8px 12px"}}>{error}</div>}
+        <div style={{marginTop:14,fontSize:11,color:"#94a3b8"}}>
+          Card details are entered directly into Stripe's secure form — they never pass through our servers.
+        </div>
+      </div>
+
+      {canManageBilling && (
+        <div style={{...s.card,marginBottom:16}}>
+          <div style={{fontWeight:700,marginBottom:6}}>Invoices & plan changes</div>
+          <div style={{fontSize:12,color:"#94a3b8",marginBottom:14,lineHeight:1.6}}>
+            View past invoices or change your subscription plan through Stripe's billing portal.
+          </div>
+          <Btn onClick={openBillingPortal} style={{opacity:redirecting?0.6:1}}>
+            {redirecting ? "Opening…" : "Open Billing Portal"}
+          </Btn>
+        </div>
+      )}
+
+      {showAddCard && (
+        <AddPaymentMethodModal onClose={()=>setShowAddCard(false)} onAdded={handleCardAdded} />
+      )}
+    </div>
+  )
+}
+
+// ─────────────────────────── PLATFORM ADMIN ───────────────────────────
+// Cross-organization, read-only — only visible/reachable if user.isPlatformAdmin
+// (both here and server-side via requirePlatformAdmin). Every other page in
+// this app is scoped to the caller's own org; this is the deliberate
+// exception, for you as the SaaS operator, not for a regular org owner/admin.
+// Create a brand-new organization — name + seat limit only. No users yet;
+// the flow is deliberately two steps (create the org, then click into it
+// to add its team) rather than one combined form, so an org can exist
+// with the right seat limit before anyone is added to it.
+function CreateOrgModal({ onClose, onCreated }) {
+  const [form,    setForm]    = useState({ name:"", seatLimit:"5" })
+  const [saving,  setSaving]  = useState(false)
+  const [error,   setError]   = useState("")
+  const upd = k => e => setForm(prev=>({...prev,[k]:e.target.value}))
+
+  async function save() {
+    if (!form.name.trim()) { setError("Organization name is required."); return }
+    const seats = parseInt(form.seatLimit, 10)
+    if (!Number.isInteger(seats) || seats < 1) { setError("Seat limit must be a positive number."); return }
+    setSaving(true); setError("")
+    try {
+      const org = await platformAdminApi.createOrganization({ name: form.name.trim(), seatLimit: seats })
+      onCreated(org)
+    } catch(err) { setError(err.message || "Couldn't create organization.") }
+    finally      { setSaving(false) }
+  }
+
+  return (
+    <Modal title="New Organization" onClose={onClose} width={420}>
+      <FG label="Organization Name *"><input style={s.input} value={form.name} onChange={upd("name")} placeholder="RK Roofing"/></FG>
+      <FG label="Seat Limit (max users) *"><input style={s.input} type="number" min="1" value={form.seatLimit} onChange={upd("seatLimit")}/></FG>
+      {error && <div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#b91c1c",marginBottom:4}}>{error}</div>}
+      <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:16}}>
+        <Btn onClick={onClose}>Cancel</Btn>
+        <Btn primary onClick={save} style={{opacity:saving?0.6:1}}>{saving?"Creating…":"Create Organization"}</Btn>
+      </div>
+    </Modal>
+  )
+}
+
+// Rename / change seat limit / change status on an existing organization.
+function EditOrgModal({ org, onClose, onSaved }) {
+  const [form,    setForm]    = useState({ name:org.name, seatLimit:String(org.seatLimit), status:org.status })
+  const [saving,  setSaving]  = useState(false)
+  const [error,   setError]   = useState("")
+  const upd = k => e => setForm(prev=>({...prev,[k]:e.target.value}))
+
+  async function save() {
+    const seats = parseInt(form.seatLimit, 10)
+    if (!Number.isInteger(seats) || seats < 1) { setError("Seat limit must be a positive number."); return }
+    setSaving(true); setError("")
+    try {
+      const updated = await platformAdminApi.updateOrganization(org.id, { name: form.name.trim(), seatLimit: seats, status: form.status })
+      onSaved(updated)
+    } catch(err) { setError(err.message || "Couldn't update organization.") }
+    finally      { setSaving(false) }
+  }
+
+  return (
+    <Modal title="Edit Organization" onClose={onClose} width={420}>
+      <FG label="Organization Name *"><input style={s.input} value={form.name} onChange={upd("name")}/></FG>
+      <FG label="Seat Limit (max users) *"><input style={s.input} type="number" min="1" value={form.seatLimit} onChange={upd("seatLimit")}/></FG>
+      <FG label="Status">
+        <select style={s.input} value={form.status} onChange={upd("status")}>
+          {["trialing","active","past_due","canceled"].map(st=><option key={st} value={st}>{ORG_STATUS_STYLE[st]?.label || st}</option>)}
+        </select>
+      </FG>
+      {error && <div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#b91c1c",marginBottom:4}}>{error}</div>}
+      <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:16}}>
+        <Btn onClick={onClose}>Cancel</Btn>
+        <Btn primary onClick={save} style={{opacity:saving?0.6:1}}>{saving?"Saving…":"Save Changes"}</Btn>
+      </div>
+    </Modal>
+  )
+}
+
+// Add a user directly inside a specific organization. Role is limited to
+// Admin/Member here — this console stands up a manually-provisioned org's
+// team; it doesn't hand out Stripe-billing "owner" access outside the
+// self-serve signup flow.
+function AddOrgUserModal({ orgId, onClose, onCreated }) {
+  const [form,    setForm]    = useState({ name:"", email:"", password:"", role:"member" })
+  const [saving,  setSaving]  = useState(false)
+  const [error,   setError]   = useState("")
+  const upd = k => e => setForm(prev=>({...prev,[k]:e.target.value}))
+
+  async function save() {
+    if (!form.name.trim() || !form.email.trim() || !form.password.trim()) {
+      setError("Name, email and password are required."); return
+    }
+    setSaving(true); setError("")
+    try {
+      const user = await platformAdminApi.createOrganizationUser(orgId, form)
+      onCreated(user)
+    } catch(err) {
+      setError(err.body?.error==="seat_limit_exceeded"
+        ? `Seat limit reached (${err.body.currentCount}/${err.body.seatLimit}) — raise the org's seat limit first.`
+        : err.message || "Couldn't create user.")
+    }
+    finally { setSaving(false) }
+  }
+
+  return (
+    <Modal title="Add User" onClose={onClose} width={440}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
+        <FG label="Full Name *"><input style={s.input} value={form.name} onChange={upd("name")} placeholder="Jane Smith"/></FG>
+        <FG label="Email *"><input style={s.input} type="email" value={form.email} onChange={upd("email")} placeholder="jane@company.com"/></FG>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
+        <FG label="Password *"><input style={s.input} type="password" value={form.password} onChange={upd("password")} placeholder="Min 6 characters"/></FG>
+        <FG label="Role">
+          <select style={s.input} value={form.role} onChange={upd("role")}>
+            <option value="member">Member</option>
+            <option value="admin">Admin</option>
+          </select>
+        </FG>
+      </div>
+      {error && <div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#b91c1c",marginBottom:4}}>{error}</div>}
+      <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:16}}>
+        <Btn onClick={onClose}>Cancel</Btn>
+        <Btn primary onClick={save} style={{opacity:saving?0.6:1}}>{saving?"Creating…":"Create User"}</Btn>
+      </div>
+    </Modal>
+  )
+}
+
+// Edit a user inside any org — name/email/role/active, plus an optional
+// password reset (blank = unchanged). Role allows the full owner/admin/
+// member range since this edits users that may already exist outside the
+// manually-provisioned flow (e.g. Stripe-signup orgs' real owners).
+function EditOrgUserModal({ orgId, targetUser, onClose, onSaved }) {
+  const [form,   setForm]   = useState({ name:targetUser.name, email:targetUser.email, role:targetUser.role, password:"" })
+  const [saving, setSaving] = useState(false)
+  const [error,  setError]  = useState("")
+  const upd = k => e => setForm(prev=>({...prev,[k]:e.target.value}))
+
+  async function save() {
+    if (!form.name.trim() || !form.email.trim()) { setError("Name and email are required."); return }
+    setSaving(true); setError("")
+    try {
+      const payload = { name:form.name, email:form.email, role:form.role }
+      if (form.password.trim()) payload.password = form.password
+      const user = await platformAdminApi.updateOrganizationUser(orgId, targetUser.id, payload)
+      onSaved(user)
+    } catch(err) { setError(err.message || "Couldn't save user.") }
+    finally      { setSaving(false) }
+  }
+
+  return (
+    <Modal title="Edit User" onClose={onClose} width={440}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
+        <FG label="Full Name *"><input style={s.input} value={form.name} onChange={upd("name")}/></FG>
+        <FG label="Email *"><input style={s.input} type="email" value={form.email} onChange={upd("email")}/></FG>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
+        <FG label="New Password (leave blank to keep current)"><input style={s.input} type="password" value={form.password} onChange={upd("password")} placeholder="••••••••"/></FG>
+        <FG label="Role">
+          <select style={s.input} value={form.role} onChange={upd("role")}>
+            <option value="member">Member</option>
+            <option value="admin">Admin</option>
+            <option value="owner">Owner</option>
+          </select>
+        </FG>
+      </div>
+      {error && <div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#b91c1c",marginBottom:4}}>{error}</div>}
+      <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:16}}>
+        <Btn onClick={onClose}>Cancel</Btn>
+        <Btn primary onClick={save} style={{opacity:saving?0.6:1}}>{saving?"Saving…":"Save Changes"}</Btn>
+      </div>
+    </Modal>
+  )
+}
+
+function PlatformAdminPanel() {
+  const [orgs,       setOrgs]       = useState([])
+  const [loading,    setLoading]    = useState(true)
+  const [expandedId, setExpandedId] = useState(null)
+  const [orgUsers,   setOrgUsers]   = useState({}) // { [orgId]: users[] }
+  const [usersLoading, setUsersLoading] = useState(false)
+
+  const [showCreateOrg, setShowCreateOrg] = useState(false)
+  const [editingOrg,    setEditingOrg]    = useState(null) // org row being edited
+  const [addUserOrgId,  setAddUserOrgId]  = useState(null) // org id we're adding a user into
+  const [editingUser,   setEditingUser]   = useState(null) // { orgId, user }
+
+  useEffect(()=>{ loadOrgs() },[])
+
+  async function loadOrgs() {
+    setLoading(true)
+    try { setOrgs(await platformAdminApi.getOrganizations()) }
+    catch(err) { console.error("Failed to load organizations:", err) }
+    finally    { setLoading(false) }
+  }
+
+  async function loadOrgUsers(orgId) {
+    setUsersLoading(true)
+    try {
+      const rows = await platformAdminApi.getOrganizationUsers(orgId)
+      setOrgUsers(prev => ({ ...prev, [orgId]: rows.map(normalizeKeys) }))
+    } catch(err) { console.error("Failed to load org users:", err) }
+    finally      { setUsersLoading(false) }
+  }
+
+  async function toggleExpand(orgId) {
+    if (expandedId === orgId) { setExpandedId(null); return }
+    setExpandedId(orgId)
+    if (!orgUsers[orgId]) await loadOrgUsers(orgId)
+  }
+
+  if (loading) return <div style={{color:"#64748b",padding:20}}>Loading…</div>
+
+  return (
+    <div style={{width:"100%"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:16,flexWrap:"wrap"}}>
+        <div style={{fontSize:13,color:"#64748b"}}>
+          Every organization on the platform — visible to you as a platform admin only. Click a row to see its team.
+        </div>
+        <Btn primary onClick={()=>setShowCreateOrg(true)}>+ New Organization</Btn>
+      </div>
+      <div style={{...s.card,padding:0,overflow:"hidden"}}>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",minWidth:680}}>
+            <thead>
+              <tr>{["Organization","Plan","Status","Seats","Created",""].map(h=><th key={h} style={s.th}>{h}</th>)}</tr>
+            </thead>
+            <tbody>
+              {orgs.map(org => {
+                const statusStyle = ORG_STATUS_STYLE[org.status] || ORG_STATUS_STYLE.trialing
+                const expanded = expandedId === org.id
+                return (
+                  <Fragment key={org.id}>
+                    <tr>
+                      <td style={{...s.td,fontWeight:600,cursor:"pointer"}} onClick={()=>toggleExpand(org.id)}>{expanded?"▾":"▸"} {org.name}</td>
+                      <td style={{...s.td,fontSize:12,color:"#64748b"}}>{PLAN_LABELS[org.planKey] || org.planKey || "—"}</td>
+                      <td style={s.td}>
+                        <span style={{display:"inline-flex",alignItems:"center",padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,background:statusStyle.bg,color:statusStyle.color}}>
+                          {statusStyle.label}
+                        </span>
+                      </td>
+                      <td style={{...s.td,fontSize:12,color:"#64748b"}}>{org.activeUserCount} / {org.seatLimit}</td>
+                      <td style={{...s.td,fontSize:12,color:"#64748b"}}>{fmtD(org.createdAt)}</td>
+                      <td style={s.td}><Btn sm onClick={()=>setEditingOrg(org)}>Edit</Btn></td>
+                    </tr>
+                    {expanded && (
+                      <tr>
+                        <td colSpan={6} style={{padding:"0 16px 16px 40px",borderBottom:"1px solid #f1f5f9"}}>
+                          <div style={{display:"flex",justifyContent:"flex-end",marginBottom:8}}>
+                            <Btn sm onClick={()=>setAddUserOrgId(org.id)}>+ Add User</Btn>
+                          </div>
+                          {usersLoading && !orgUsers[org.id] ? (
+                            <div style={{color:"#94a3b8",fontSize:12,padding:10}}>Loading team…</div>
+                          ) : (
+                            <table style={{width:"100%",borderCollapse:"collapse"}}>
+                              <thead>
+                                <tr>{["User","Email","Role","Status",""].map(h=><th key={h} style={{...s.th,fontSize:10}}>{h}</th>)}</tr>
+                              </thead>
+                              <tbody>
+                                {(orgUsers[org.id]||[]).map(u=>(
+                                  <tr key={u.id}>
+                                    <td style={{...s.td,fontSize:12}}>{u.name}{u.isPlatformAdmin && <span style={{marginLeft:6,fontSize:9,background:"#ede9fe",color:"#5b21b6",padding:"1px 6px",borderRadius:8,fontWeight:600}}>PLATFORM ADMIN</span>}</td>
+                                    <td style={{...s.td,fontSize:12,color:"#3b82f6"}}>{u.email}</td>
+                                    <td style={{...s.td,fontSize:12,color:"#64748b",textTransform:"capitalize"}}>{u.role}</td>
+                                    <td style={{...s.td,fontSize:12,color:u.isActive!==false?"#065f46":"#991b1b"}}>{u.isActive!==false?"Active":"Disabled"}</td>
+                                    <td style={s.td}><Btn sm onClick={()=>setEditingUser({orgId:org.id, user:u})}>Edit</Btn></td>
+                                  </tr>
+                                ))}
+                                {(orgUsers[org.id]||[]).length===0 && <tr><td colSpan={5} style={{...s.td,textAlign:"center",color:"#94a3b8"}}>No users yet</td></tr>}
+                              </tbody>
+                            </table>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                )
+              })}
+              {orgs.length===0 && <tr><td colSpan={6} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No organizations found</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {showCreateOrg && (
+        <CreateOrgModal
+          onClose={()=>setShowCreateOrg(false)}
+          onCreated={(org)=>{ setOrgs(prev=>[org, ...prev]); setShowCreateOrg(false) }}
+        />
+      )}
+
+      {editingOrg && (
+        <EditOrgModal
+          org={editingOrg}
+          onClose={()=>setEditingOrg(null)}
+          onSaved={(updated)=>{ setOrgs(prev=>prev.map(o=>o.id===updated.id?{...o,...updated}:o)); setEditingOrg(null) }}
+        />
+      )}
+
+      {addUserOrgId && (
+        <AddOrgUserModal
+          orgId={addUserOrgId}
+          onClose={()=>setAddUserOrgId(null)}
+          onCreated={(user)=>{
+            setOrgUsers(prev => ({ ...prev, [addUserOrgId]: [...(prev[addUserOrgId]||[]), normalizeKeys(user)] }))
+            setOrgs(prev => prev.map(o => o.id===addUserOrgId ? { ...o, activeUserCount: o.activeUserCount+1 } : o))
+            setAddUserOrgId(null)
+          }}
+        />
+      )}
+
+      {editingUser && (
+        <EditOrgUserModal
+          orgId={editingUser.orgId}
+          targetUser={editingUser.user}
+          onClose={()=>setEditingUser(null)}
+          onSaved={(updated)=>{
+            const orgId = editingUser.orgId
+            setOrgUsers(prev => ({ ...prev, [orgId]: (prev[orgId]||[]).map(u=>u.id===updated.id?normalizeKeys(updated):u) }))
+            setEditingUser(null)
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -3348,8 +5147,10 @@ export default function App() {
   const [showWizard,      setShowWizard]     = useState(false)
   const [editingProject,  setEditingProject] = useState(null)
   const [mobileNavOpen,   setMobileNavOpen]  = useState(false)
+  const [authView,        setAuthView]       = useState("login") // "login" | "signup" — only relevant while logged out
+  const [showProfileModal, setShowProfileModal] = useState(false)
 
-  const { user, login, logout } = useAuth()
+  const { user, login, logout, updateUser } = useAuth()
 
   // ← Quotation branding is now per-user, stored server-side in
   //   company_profiles (was previously a single browser-localStorage blob
@@ -3397,7 +5198,11 @@ export default function App() {
   },[user])
 
   // Early returns AFTER all hooks
-  if (!user) return <LoginPage onLogin={login} />
+  if (!user) {
+    return authView === "signup"
+      ? <SignupPage onBackToLogin={() => setAuthView("login")} onLogin={login} />
+      : <LoginPage onLogin={login} onShowSignup={() => setAuthView("signup")} />
+  }
 
   async function saveSettings(updates) {
     const merged = {...settings,...updates}
@@ -3410,7 +5215,9 @@ export default function App() {
     projects:"Projects",   project:"Project Detail",
     customers:"Customers", quote_print:"Quote",
     jobs:"Jobs",
-    users:"Users",         settings:"Settings",
+    users:"Team",          settings:"Settings",
+    complexity:"Job Complexity", billing:"Billing & Plan",
+    "platform-admin":"All Organizations",
   }
 
   function handleNav(key) {
@@ -3514,8 +5321,16 @@ export default function App() {
               { key:"customers",  label:"Customers",   icon:"👤" },
               { key:"jobs",       label:"Jobs",        icon:"🧰" },
               null,
-              { key:"users",      label:"Users",       icon:"🔑" },
+              { key:"users",      label:"Team",        icon:"🔑" },
               { key:"settings",   label:"Settings",    icon:"⚙" },
+              { key:"complexity", label:"Job Complexity", icon:"📊" },
+              { key:"billing",    label:"Billing & Plan", icon:"💳" },
+              // ← Only for you as the SaaS operator — spread-in rather than a
+              //   plain conditional entry so a non-platform-admin doesn't get
+              //   a stray divider where a `null` placeholder would otherwise
+              //   render (every real `null` in this array means "draw a
+              //   divider line here", which isn't what "not shown" means).
+              ...(user?.isPlatformAdmin ? [{ key:"platform-admin", label:"All Organizations", icon:"🌐" }] : []),
             ].map((item,i)=> item===null
               ? <div key={i} className="h-px bg-white/[.06] my-2"/>
               : (
@@ -3533,15 +5348,16 @@ export default function App() {
             )}
           </nav>
           <div className="app-sidebar-user flex items-center justify-between gap-2 mt-3 mx-2 mb-2 px-2.5 py-2 rounded-lg bg-white/[.04]">
-            <div className="flex items-center gap-2 min-w-0">
+            <button onClick={()=>setShowProfileModal(true)} title="My Profile"
+              className="flex items-center gap-2 min-w-0 bg-transparent border-none cursor-pointer text-left p-0">
               <div className="w-7 h-7 rounded-full bg-gradient-to-br from-accent to-orange-500 flex items-center justify-center text-[11px] font-bold text-slate-900 shrink-0">
                 {user?.name?.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}
               </div>
               <div className="min-w-0">
                 <div className="text-xs text-white font-medium whitespace-nowrap overflow-hidden text-ellipsis">{user?.name}</div>
-                <div className="text-[10px] text-slate-500">aTopRoof CRM</div>
+                <div className="text-[10px] text-slate-500">My Profile</div>
               </div>
-            </div>
+            </button>
             <button onClick={logout} title="Sign out" className="bg-transparent border-none cursor-pointer text-slate-500 hover:text-slate-300 text-base p-1 leading-none shrink-0">⏻</button>
           </div>
         </div>
@@ -3562,6 +5378,8 @@ export default function App() {
               </Btn>
             </div>
           </div>
+
+          <BillingBanner user={user} />
 
           <div data-main-content className="app-content flex-1 overflow-y-auto p-6">
             {view==="dashboard"&&(
@@ -3588,6 +5406,9 @@ export default function App() {
             {view==="jobs"&&<Jobs jobs={jobs} setJobs={setJobs} customers={customers}/>}
             {view==="users"&&<Users currentUser={user}/>}
             {view==="settings"&&<Settings settings={settings} onSave={saveSettings}/>}
+            {view==="complexity"&&<JobComplexitySettings/>}
+            {view==="billing"&&<BillingSettings user={user}/>}
+            {view==="platform-admin"&&user?.isPlatformAdmin&&<PlatformAdminPanel/>}
           </div>
         </div>
       </div>
@@ -3605,6 +5426,14 @@ export default function App() {
       )}
 
       {toast&&<Toast msg={toast} onDone={()=>setToast(null)}/>}
+
+      {showProfileModal && (
+        <MyProfileModal
+          user={user}
+          onClose={()=>setShowProfileModal(false)}
+          onSaved={(partial)=>{ updateUser(partial); setShowProfileModal(false) }}
+        />
+      )}
     </CurrencyProvider>
   )
 }

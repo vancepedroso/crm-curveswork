@@ -38,12 +38,20 @@ function serializePhoto(row) {
   };
 }
 
+async function assertOwnProject(projectId, organizationId) {
+  const { rows } = await pool.query(
+    "SELECT id FROM projects WHERE id = $1 AND organization_id = $2", [projectId, organizationId]
+  );
+  return rows.length > 0;
+}
+
 // GET /api/photos/:projectId — list photos for a project
 router.get("/:projectId", async (req, res) => {
   try {
+    if (!(await assertOwnProject(req.params.projectId, req.user.organizationId))) return res.json([]);
     const { rows } = await pool.query(
-      "SELECT * FROM project_photos WHERE project_id = $1 ORDER BY created_at DESC",
-      [req.params.projectId]
+      "SELECT * FROM project_photos WHERE project_id = $1 AND organization_id = $2 ORDER BY created_at DESC",
+      [req.params.projectId, req.user.organizationId]
     );
     res.json(rows.map(serializePhoto));
   } catch (err) {
@@ -56,6 +64,8 @@ router.post("/:projectId", (req, res) => {
   upload.array("photos", 10)(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message });
     try {
+      if (!(await assertOwnProject(req.params.projectId, req.user.organizationId)))
+        return res.status(404).json({ error: "Project not found" });
       const files = req.files || [];
       if (!files.length) return res.status(400).json({ error: "No files uploaded" });
 
@@ -63,8 +73,8 @@ router.post("/:projectId", (req, res) => {
       for (const file of files) {
         const url = `/uploads/photos/${file.filename}`;
         const { rows } = await pool.query(
-          `INSERT INTO project_photos (project_id, filename, url) VALUES ($1,$2,$3) RETURNING *`,
-          [req.params.projectId, file.filename, url]
+          `INSERT INTO project_photos (project_id, filename, url, organization_id) VALUES ($1,$2,$3,$4) RETURNING *`,
+          [req.params.projectId, file.filename, url, req.user.organizationId]
         );
         inserted.push(serializePhoto(rows[0]));
       }
@@ -79,8 +89,8 @@ router.post("/:projectId", (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     const { rows } = await pool.query(
-      "DELETE FROM project_photos WHERE id = $1 RETURNING filename",
-      [req.params.id]
+      "DELETE FROM project_photos WHERE id = $1 AND organization_id = $2 RETURNING filename",
+      [req.params.id, req.user.organizationId]
     );
     if (!rows.length) return res.status(404).json({ error: "Not found" });
 

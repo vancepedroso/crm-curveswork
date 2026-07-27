@@ -5,10 +5,10 @@ const fs      = require("fs");
 const https   = require("https");
 require("dotenv").config();
 
+const { requireAuth, requirePlatformAdmin } = require("./middleware/auth");
 const customersRouter = require("./routes/customers");
 const projectsRouter  = require("./routes/projects");
 const estimatesRouter = require("./routes/estimates");
-const seedRouter      = require("./routes/seed");
 const authRouter      = require("./routes/auth");
 const usersRouter     = require("./routes/users");
 const settingsRouter = require("./routes/settings");
@@ -19,35 +19,56 @@ const jobsRouter       = require("./routes/jobs");
 const jobPhotosRouter  = require("./routes/jobPhotos");
 const materialsRouter  = require("./routes/materials");
 const companyProfileRouter = require("./routes/companyProfile");
+const complexityLevelsRouter = require("./routes/complexityLevels");
+const billingRouter = require("./routes/billing");
+const stripeWebhookRouter = require("./routes/stripeWebhook");
+const organizationRouter = require("./routes/organization");
+const platformAdminRouter = require("./routes/platformAdmin");
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
+
+// Stripe webhook needs the RAW request body for signature verification, so
+// it's mounted before express.json() parses everything else into an object.
+app.use("/api/stripe/webhook", express.raw({ type: "application/json" }), stripeWebhookRouter);
+
 app.use(express.json({ limit: "5mb" }));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-// ── Auth (no JWT required) ──
+// ── Auth (no JWT required — this is how you get one) ──
 app.use("/api/auth", authRouter);
 
+// ── Billing (public signup + owner-only portal link) ──
+app.use("/api/billing", billingRouter);
+
 // ── Protected routes ──
-// users.js has requireAuth built into every handler, so no middleware needed here
-app.use("/api/customers", customersRouter);
-app.use("/api/projects",  projectsRouter);
-app.use("/api/estimates", estimatesRouter);
-app.use("/api/seed",      seedRouter);
-app.use("/api/users",     usersRouter);
-app.use("/api/settings", settingsRouter);
-app.use("/api/roof-types", roofTypesRouter);
-app.use("/api/photos",    photosRouter);
-app.use("/api/quotes",    quotesRouter);
-app.use("/api/jobs",       jobsRouter);
-app.use("/api/job-photos", jobPhotosRouter);
-app.use("/api/materials",  materialsRouter);
-app.use("/api/company-profile", companyProfileRouter);
+// requireAuth applied uniformly here rather than inside each router, so
+// there's one place that shows every route in the app that requires a
+// logged-in (and now, org-scoped) user — previously customers/projects/
+// estimates/jobs/photos/quotes/jobPhotos/materials/roofTypes/settings/
+// complexityLevels had NO auth at all; users.js/companyProfile.js each had
+// their own duplicated inline copy. Both problems are fixed by mounting
+// the one shared middleware here.
+app.use("/api/customers", requireAuth, customersRouter);
+app.use("/api/projects",  requireAuth, projectsRouter);
+app.use("/api/estimates", requireAuth, estimatesRouter);
+app.use("/api/users",     requireAuth, usersRouter);
+app.use("/api/settings", requireAuth, settingsRouter);
+app.use("/api/roof-types", requireAuth, roofTypesRouter);
+app.use("/api/photos",    requireAuth, photosRouter);
+app.use("/api/quotes",    requireAuth, quotesRouter);
+app.use("/api/jobs",       requireAuth, jobsRouter);
+app.use("/api/job-photos", requireAuth, jobPhotosRouter);
+app.use("/api/materials",  requireAuth, materialsRouter);
+app.use("/api/company-profile", requireAuth, companyProfileRouter);
+app.use("/api/complexity-levels", requireAuth, complexityLevelsRouter);
+app.use("/api/organization", requireAuth, organizationRouter);
+app.use("/api/platform-admin", requireAuth, requirePlatformAdmin, platformAdminRouter);
 
 // ── Dashboard stats ──
-app.get("/api/dashboard", async (req, res) => {
+app.get("/api/dashboard", requireAuth, async (req, res) => {
   try {
     const pool  = require("./db");
     const stats = await pool.query(`
@@ -60,8 +81,8 @@ app.get("/api/dashboard", async (req, res) => {
         COALESCE(SUM(e.total) FILTER (WHERE p.status = 'Quote Sent'), 0) AS pipeline_value
       FROM projects p
       LEFT JOIN estimates e ON e.project_id = p.id
-      WHERE p.is_deleted = FALSE
-    `);
+      WHERE p.is_deleted = FALSE AND p.organization_id = $1
+    `, [req.user.organizationId]);
     res.json(stats.rows[0]);
   } catch (err) {
     console.error(err);
@@ -70,7 +91,7 @@ app.get("/api/dashboard", async (req, res) => {
 });
 
 // ── Pipeline by status ──
-app.get("/api/pipeline", async (req, res) => {
+app.get("/api/pipeline", requireAuth, async (req, res) => {
   try {
     const pool   = require("./db");
     const result = await pool.query(`
@@ -79,9 +100,9 @@ app.get("/api/pipeline", async (req, res) => {
       FROM projects p
       LEFT JOIN estimates e ON e.project_id = p.id
       LEFT JOIN customers c ON c.id = p.customer_id
-      WHERE p.is_deleted = FALSE
+      WHERE p.is_deleted = FALSE AND p.organization_id = $1
       ORDER BY p.created_at DESC
-    `);
+    `, [req.user.organizationId]);
     res.json(result.rows);
   } catch (err) {
     console.error(err);

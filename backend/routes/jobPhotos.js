@@ -38,12 +38,20 @@ function serializePhoto(row) {
   };
 }
 
+async function assertOwnJob(jobId, organizationId) {
+  const { rows } = await pool.query(
+    "SELECT id FROM jobs WHERE id = $1 AND organization_id = $2", [jobId, organizationId]
+  );
+  return rows.length > 0;
+}
+
 // GET /api/job-photos/:jobId — list photos for a job
 router.get("/:jobId", async (req, res) => {
   try {
+    if (!(await assertOwnJob(req.params.jobId, req.user.organizationId))) return res.json([]);
     const { rows } = await pool.query(
-      "SELECT * FROM job_photos WHERE job_id = $1 ORDER BY created_at DESC",
-      [req.params.jobId]
+      "SELECT * FROM job_photos WHERE job_id = $1 AND organization_id = $2 ORDER BY created_at DESC",
+      [req.params.jobId, req.user.organizationId]
     );
     res.json(rows.map(serializePhoto));
   } catch (err) {
@@ -56,6 +64,8 @@ router.post("/:jobId", (req, res) => {
   upload.array("photos", 10)(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message });
     try {
+      if (!(await assertOwnJob(req.params.jobId, req.user.organizationId)))
+        return res.status(404).json({ error: "Job not found" });
       const files = req.files || [];
       if (!files.length) return res.status(400).json({ error: "No files uploaded" });
 
@@ -63,8 +73,8 @@ router.post("/:jobId", (req, res) => {
       for (const file of files) {
         const url = `/uploads/job-photos/${file.filename}`;
         const { rows } = await pool.query(
-          `INSERT INTO job_photos (job_id, filename, url) VALUES ($1,$2,$3) RETURNING *`,
-          [req.params.jobId, file.filename, url]
+          `INSERT INTO job_photos (job_id, filename, url, organization_id) VALUES ($1,$2,$3,$4) RETURNING *`,
+          [req.params.jobId, file.filename, url, req.user.organizationId]
         );
         inserted.push(serializePhoto(rows[0]));
       }
@@ -79,8 +89,8 @@ router.post("/:jobId", (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     const { rows } = await pool.query(
-      "DELETE FROM job_photos WHERE id = $1 RETURNING filename",
-      [req.params.id]
+      "DELETE FROM job_photos WHERE id = $1 AND organization_id = $2 RETURNING filename",
+      [req.params.id, req.user.organizationId]
     );
     if (!rows.length) return res.status(404).json({ error: "Not found" });
 

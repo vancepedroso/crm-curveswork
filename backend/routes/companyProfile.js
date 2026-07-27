@@ -2,24 +2,10 @@ const { Router } = require("express");
 const multer = require("multer");
 const path   = require("path");
 const fs     = require("fs");
-const jwt    = require("jsonwebtoken");
 const pool   = require("../db");
 
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET || "changeme_use_env_in_prod";
-
-// ── Auth middleware (same pattern as backend/routes/users.js) ──────────────
-function requireAuth(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ error: "Invalid or expired token" });
-  }
-}
+// requireAuth is applied once, in server.js — no per-router copy needed here.
 
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads", "branding");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -27,8 +13,12 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
+    // ← Keyed by organizationId, not user id — the profile itself is now
+    //   shared by the whole org, so that's the collision to avoid (two
+    //   users in the same org uploading a logo in the same millisecond),
+    //   not two different users who'd never collide on this filename anyway.
     const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${req.params.kind}-${req.user.id}-${Date.now()}${ext}`);
+    cb(null, `${req.params.kind}-${req.user.organizationId}-${Date.now()}${ext}`);
   },
 });
 
@@ -61,20 +51,21 @@ function serializeProfile(row) {
   };
 }
 
-async function getOrCreateProfile(userId) {
-  const { rows } = await pool.query("SELECT * FROM company_profiles WHERE user_id = $1", [userId]);
+async function getOrCreateProfile(organizationId) {
+  const { rows } = await pool.query("SELECT * FROM company_profiles WHERE organization_id = $1", [organizationId]);
   if (rows.length) return rows[0];
   const { rows: created } = await pool.query(
-    `INSERT INTO company_profiles (user_id) VALUES ($1) RETURNING *`,
-    [userId]
+    `INSERT INTO company_profiles (organization_id) VALUES ($1) RETURNING *`,
+    [organizationId]
   );
   return created[0];
 }
 
-// GET /api/company-profile — current user's branding, auto-created on first access
-router.get("/", requireAuth, async (req, res) => {
+// GET /api/company-profile — the caller's organization's branding, shared by
+// every user in it, auto-created on first access
+router.get("/", async (req, res) => {
   try {
-    const row = await getOrCreateProfile(req.user.id);
+    const row = await getOrCreateProfile(req.user.organizationId);
     res.json(serializeProfile(row));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -82,9 +73,9 @@ router.get("/", requireAuth, async (req, res) => {
 });
 
 // PUT /api/company-profile — update text fields
-router.put("/", requireAuth, async (req, res) => {
+router.put("/", async (req, res) => {
   try {
-    await getOrCreateProfile(req.user.id); // ensure a row exists
+    await getOrCreateProfile(req.user.organizationId); // ensure a row exists
     const {
       companyName, companyAddress, companyPhone, companyEmail,
       companyGst, companyBank, estimatorName, estimatorTitle,
@@ -96,13 +87,13 @@ router.put("/", requireAuth, async (req, res) => {
          company_name=$1, company_address=$2, company_phone=$3, company_email=$4,
          company_gst=$5, company_bank=$6, estimator_name=$7, estimator_title=$8,
          day_rate=$9, margin=$10, wastage=$11, updated_at=NOW()
-       WHERE user_id=$12
+       WHERE organization_id=$12
        RETURNING *`,
       [
         companyName || "", companyAddress || "", companyPhone || "", companyEmail || "",
         companyGst || "", companyBank || "", estimatorName || "", estimatorTitle || "",
         dayRate || 850, margin || 20, wastage || 10,
-        req.user.id,
+        req.user.organizationId,
       ]
     );
     res.json(serializeProfile(rows[0]));
@@ -112,17 +103,17 @@ router.put("/", requireAuth, async (req, res) => {
 });
 
 // POST /api/company-profile/logo | /badges — image upload (field "image")
-router.post("/:kind(logo|badges)", requireAuth, (req, res) => {
+router.post("/:kind(logo|badges)", (req, res) => {
   upload.single("image")(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message });
     try {
       if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-      await getOrCreateProfile(req.user.id);
+      await getOrCreateProfile(req.user.organizationId);
       const url = `/uploads/branding/${req.file.filename}`;
       const column = req.params.kind === "logo" ? "logo_url" : "badges_url";
       const { rows } = await pool.query(
-        `UPDATE company_profiles SET ${column} = $1, updated_at = NOW() WHERE user_id = $2 RETURNING *`,
-        [url, req.user.id]
+        `UPDATE company_profiles SET ${column} = $1, updated_at = NOW() WHERE organization_id = $2 RETURNING *`,
+        [url, req.user.organizationId]
       );
       res.status(201).json(serializeProfile(rows[0]));
     } catch (dbErr) {

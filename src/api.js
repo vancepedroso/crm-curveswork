@@ -44,6 +44,20 @@ async function request(endpoint, options = {}) {
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     const message = body?.error || body?.message || `HTTP ${response.status}`;
+
+    // A 401 on any authenticated call means the stored token is dead (expired,
+    // or — as happened when the multi-tenant JWT shape changed — simply out of
+    // date). Without this, the app silently renders empty (every load fails,
+    // but nothing ever clears the stale session or sends the user back to the
+    // login screen) instead of just asking the user to log back in. Login
+    // itself is excluded — a wrong password there is a normal 401, not a dead
+    // session, and there's no token to clear yet anyway.
+    if (response.status === 401 && !endpoint.startsWith("/auth/")) {
+      localStorage.removeItem("auth_token");
+      localStorage.removeItem("auth_user");
+      window.location.reload();
+    }
+
     const error = new Error(message);
     error.status = response.status;
     error.body = body;
@@ -137,10 +151,10 @@ export const jobPhotosApi = {
 // Roof materials (supplier price catalog)
 // ---------------------------------------------------------------------------
 export const materialsApi = {
-  search:       (query)          => get(`/materials?search=${encodeURIComponent(query)}`),
-  getSuppliers: ()                => get(`/materials/suppliers`),
-  getTypes:     (supplier)        => get(`/materials/types?supplier=${encodeURIComponent(supplier)}`),
-  getByType:    (supplier, type)  => get(`/materials/by-type?supplier=${encodeURIComponent(supplier)}&type=${encodeURIComponent(type)}`),
+  search:       (query, group="", catalogUnit="")         => get(`/materials?search=${encodeURIComponent(query)}${group?`&group=${encodeURIComponent(group)}`:""}${catalogUnit?`&unit=${encodeURIComponent(catalogUnit)}`:""}`),
+  getSuppliers: ()                                        => get(`/materials/suppliers`),
+  getTypes:     (supplier, group="", catalogUnit="")       => get(`/materials/types?supplier=${encodeURIComponent(supplier)}${group?`&group=${encodeURIComponent(group)}`:""}${catalogUnit?`&unit=${encodeURIComponent(catalogUnit)}`:""}`),
+  getByType:    (supplier, type, group="", catalogUnit="") => get(`/materials/by-type?supplier=${encodeURIComponent(supplier)}&type=${encodeURIComponent(type)}${group?`&group=${encodeURIComponent(group)}`:""}${catalogUnit?`&unit=${encodeURIComponent(catalogUnit)}`:""}`),
 };
 
 // ---------------------------------------------------------------------------
@@ -157,6 +171,51 @@ export const companyProfileApi = {
     const form = new FormData(); form.append("image", file);
     return request("/company-profile/badges", { method: "POST", body: form });
   },
+};
+
+// ---------------------------------------------------------------------------
+// Billing (Stripe) — starting a paid signup, and the owner's "manage
+// billing" link into the Stripe Customer Portal
+// ---------------------------------------------------------------------------
+export const billingApi = {
+  startCheckout:           (data) => post("/billing/checkout-session", data),
+  getPortalUrl:            ()     => get("/billing/portal-session"),
+  getPaymentMethods:       ()     => get("/billing/payment-methods"),
+  getPublishableKey:       ()     => get("/billing/publishable-key"),
+  createSetupIntent:       ()     => post("/billing/setup-intent", {}),
+  createDummyPaymentMethod:(data) => post("/billing/payment-methods/dummy", data),
+  setDefaultPaymentMethod: (id)   => post(`/billing/payment-methods/${id}/default`, {}),
+  deletePaymentMethod:     (id)   => del(`/billing/payment-methods/${id}`),
+};
+
+// ---------------------------------------------------------------------------
+// The caller's own organization — plan, seat usage, subscription status
+// ---------------------------------------------------------------------------
+export const organizationApi = {
+  get: () => get("/organization"),
+};
+
+// ---------------------------------------------------------------------------
+// Platform admin only — cross-organization, read-only. Every other API
+// module here is scoped to the caller's own org; these two endpoints are
+// the deliberate exception, gated server-side by requirePlatformAdmin.
+// ---------------------------------------------------------------------------
+export const platformAdminApi = {
+  getOrganizations:       ()                    => get("/platform-admin/organizations"),
+  getOrganizationUsers:   (orgId)                => get(`/platform-admin/organizations/${orgId}/users`),
+  createOrganization:     (data)                 => post("/platform-admin/organizations", data),
+  updateOrganization:     (orgId, data)           => put(`/platform-admin/organizations/${orgId}`, data),
+  createOrganizationUser: (orgId, data)           => post(`/platform-admin/organizations/${orgId}/users`, data),
+  updateOrganizationUser: (orgId, userId, data)   => put(`/platform-admin/organizations/${orgId}/users/${userId}`, data),
+};
+
+// ---------------------------------------------------------------------------
+// Job complexity multipliers (global, not per-user — same list for everyone
+// quoting, editable from the Job Complexity settings page)
+// ---------------------------------------------------------------------------
+export const complexityLevelsApi = {
+  getAll: ()       => get("/complexity-levels"),
+  save:   (levels) => put("/complexity-levels", levels),
 };
 
 // ---------------------------------------------------------------------------
@@ -183,13 +242,6 @@ export const usersApi = {
   create:       (data)          => post("/users", data),
   update:       (id, data)      => put(`/users/${id}`, data),
   setActive:    (id, is_active) => patch(`/users/${id}/status`, { is_active }),
-};
-
-// ---------------------------------------------------------------------------
-// Seed (dev / staging only)
-// ---------------------------------------------------------------------------
-export const seedApi = {
-  seed: (data) => post("/seed", data),
 };
 
 // ---------------------------------------------------------------------------

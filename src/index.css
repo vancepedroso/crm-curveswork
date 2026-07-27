@@ -71,7 +71,6 @@
   .mt-canvas-wrap {
     position: relative;
     width: 100%;
-    max-width: 700px;
     aspect-ratio: 490 / 330;
   }
   .mt-canvas-wrap canvas {

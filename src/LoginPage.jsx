@@ -2,7 +2,7 @@ import { useState } from "react"
 
 const BASE_URL = `${window.location.protocol}//${window.location.hostname}:3001/api`
 
-export default function LoginPage({ onLogin }) {
+export default function LoginPage({ onLogin, onShowSignup }) {
   const [email,    setEmail]    = useState("")
   const [password, setPassword] = useState("")
   const [error,    setError]    = useState("")
@@ -116,6 +116,15 @@ export default function LoginPage({ onLogin }) {
             >
               {loading ? "Signing in…" : "Sign In"}
             </button>
+
+            {onShowSignup && (
+              <button
+                type="button" onClick={onShowSignup}
+                className="w-full mt-3 px-4 py-2 rounded-lg border-none bg-transparent text-slate-400 text-[13px] font-sans cursor-pointer hover:text-slate-200"
+              >
+                New company? Start a workspace
+              </button>
+            )}
           </form>
         </div>
       </div>
