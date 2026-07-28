@@ -541,24 +541,83 @@ function deriveSectionPitchInput(pitchStr) {
   if(!isNaN(d) && d>5 && d<90) return { mode:"degrees", value: str }
   return { mode:"ratio", value:"" }
 }
-// Cutting List stores pitch as a plain degrees number (no ratio/factor
-// concept) — converts whatever parsePitch() would also accept (a ratio
-// like "6:12", a bare degrees value, or a bare multiplier factor like the
-// legacy "1.15" default) into degrees for that handoff.
-function degreesFromPitchString(str) {
-  const s = String(str ?? "").trim()
-  const ratioMatch = s.match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/)
-  if(ratioMatch) return parseFloat((Math.atan(parseFloat(ratioMatch[1])/parseFloat(ratioMatch[2]))*180/Math.PI).toFixed(2))
-  const d = parseFloat(s)
-  if(isNaN(d)) return 0
-  if(d>5 && d<90) return parseFloat(d.toFixed(2)) // already plausible degrees
-  if(d<=5 && d>=1) return parseFloat((Math.acos(1/d)*180/Math.PI).toFixed(2)) // bare multiplier factor
-  return 0
-}
 function polyAreaPx(pts) {
   let sum=0; const n=pts.length
   for(let i=0;i<n;i++){const j=(i+1)%n;sum+=pts[i].x*pts[j].y-pts[j].x*pts[i].y}
   return Math.abs(sum/2)
+}
+// ← Cutting list requires the section's pitch to be entered as degrees
+//   (e.g. "30") rather than a ratio ("4:12") — that angle IS the stripe
+//   direction, so a ratio pitch (no angle) can't generate a cutting list.
+function sectionAngleDeg(pitchStr) {
+  const d = deriveSectionPitchInput(pitchStr)
+  return d.mode==="degrees" ? parseFloat(d.value) : null
+}
+// ← Where a stripe line (p1→p2, spanning well past the polygon on both
+//   ends) actually crosses the polygon boundary — used to trim each sheet
+//   stripe down to its real in-roof length instead of a uniform bbox span
+//   (a triangular/hip section narrows, so each stripe's true length differs).
+function clipSegmentToPolygon(p1, p2, pts) {
+  const dx=p2.x-p1.x, dy=p2.y-p1.y
+  const ts=[]
+  for(let i=0;i<pts.length;i++){
+    const a=pts[i], b=pts[(i+1)%pts.length]
+    const ex=b.x-a.x, ey=b.y-a.y
+    const denom = dx*ey - dy*ex
+    if(Math.abs(denom)<1e-9) continue
+    const t = ((a.x-p1.x)*ey - (a.y-p1.y)*ex)/denom
+    const u = ((a.x-p1.x)*dy - (a.y-p1.y)*dx)/denom
+    if(u>=-1e-6 && u<=1+1e-6 && t>=0 && t<=1) ts.push(t)
+  }
+  if(ts.length<2) return null
+  ts.sort((a,b)=>a-b)
+  const tIn=ts[0], tOut=ts[ts.length-1]
+  const q1={ x:p1.x+dx*tIn, y:p1.y+dy*tIn }
+  const q2={ x:p1.x+dx*tOut, y:p1.y+dy*tOut }
+  return { p1:q1, p2:q2, lenPx:Math.hypot(q2.x-q1.x,q2.y-q1.y) }
+}
+// ← Sheet "cutting list" stripes: direction comes from the section's pitch
+//   angle (degrees) when set, otherwise falls back to treating the
+//   polygon's longest edge as the eave/ridge line. Sheets lay side-by-side
+//   along the eave (spaced by cover width), each running perpendicular
+//   (down-slope), clipped to the polygon so each stripe's length reflects
+//   how the roof section actually narrows/widens under it. Returns
+//   pixel-space segments plus the counts/lengths the sidebar reads.
+function sectionStripeInfo(pts, sheetWidthPx, angleDeg) {
+  if(!pts || pts.length<3 || !sheetWidthPx || sheetWidthPx<=0) return { stripes:[], count:0, dirLenPx:0, perpLenPx:0 }
+  let dir
+  if(angleDeg!=null && !isNaN(angleDeg)){
+    const rad = angleDeg*Math.PI/180
+    dir = { x:Math.cos(rad), y:Math.sin(rad) }
+  } else {
+    let longest=0
+    dir={x:1,y:0}
+    for(let i=0;i<pts.length;i++){
+      const a=pts[i], b=pts[(i+1)%pts.length]
+      const dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy)
+      if(len>longest){ longest=len; dir={x:dx/len,y:dy/len} }
+    }
+  }
+  const perp = { x:-dir.y, y:dir.x }
+  const dirVals  = pts.map(p=>p.x*dir.x+p.y*dir.y)
+  const perpVals = pts.map(p=>p.x*perp.x+p.y*perp.y)
+  const dirMin=Math.min(...dirVals), dirMax=Math.max(...dirVals)
+  const perpMin=Math.min(...perpVals), perpMax=Math.max(...perpVals)
+  // ← Guard against a runaway stripe count (bad/uncalibrated scale, or a
+  //   sheet width much smaller than the section) that would otherwise draw
+  //   thousands of overlapping lines and labels — no real roof needs this
+  //   many sheets, so treat it as "can't generate" instead of freezing the
+  //   canvas in a garbled mess.
+  const MAX_STRIPES = 300
+  if((dirMax-dirMin)/sheetWidthPx > MAX_STRIPES) return { stripes:[], count:0, dirLenPx:dirMax-dirMin, perpLenPx:perpMax-perpMin, tooMany:true }
+  const stripes=[]
+  for(let d=dirMin; d<=dirMax+1e-6; d+=sheetWidthPx){
+    const p1={ x:d*dir.x+perpMin*perp.x, y:d*dir.y+perpMin*perp.y }
+    const p2={ x:d*dir.x+perpMax*perp.x, y:d*dir.y+perpMax*perp.y }
+    const clipped = clipSegmentToPolygon(p1, p2, pts)
+    if(clipped && clipped.lenPx>1) stripes.push({ p1:clipped.p1, p2:clipped.p2, lenPx:clipped.lenPx })
+  }
+  return { stripes, count: stripes.length, dirLenPx: dirMax-dirMin, perpLenPx: perpMax-perpMin }
 }
 function linelenPx(pts) {
   let l=0
@@ -593,7 +652,9 @@ function initialSectionsFrom(g) {
     id: sec.id || uid(), name: sec.name || `Section ${i+1}`,
     pts: sec.shape_points || [], closed: true,
     pitch: sec.pitch || "1.15", color: SEC_COLORS[i % SEC_COLORS.length],
-    materialLabel: sec.materialLabel || "", rate: sec.rate || 0, coverWidth: sec.coverWidth || 0,
+    materialLabel: sec.materialLabel || "", rate: sec.rate || 0,
+    sheetWidthMm: sec.sheetWidthMm || 762,
+    cutAngleDeg: sec.cutAngleDeg ?? null,
   }))
 }
 function initialLineItemsFrom(g) {
@@ -616,6 +677,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   const imgRef      = useRef(null)
   const [imgSrc,    setImgSrc]    = useState(null)
   const [sections,  setSections]  = useState(() => initialSectionsFrom(initialGeometry))
+  const [expandedCutSections, setExpandedCutSections] = useState({}) // {[sectionId]: boolean} — cutting-list panel toggle
   // ← id of a just-closed section awaiting its "pick a roof sheet brand"
   //   popup — prompted immediately on close rather than only in Estimate.
   const [sectionMaterialModalId, setSectionMaterialModalId] = useState(null)
@@ -732,13 +794,24 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       const fpPx = sec.closed ? polyAreaPx(sec.pts) : 0
       const fp   = fpPx*sf*sf
       const fac  = parsePitch(sec.pitch||"1.15")
+      const sheetWidthMm = sec.sheetWidthMm || 762
+      // ← Direction priority: explicit per-section override > degree pitch > shape auto-detect
+      const angleDeg = sec.cutAngleDeg ?? sectionAngleDeg(sec.pitch)
+      const stripeInfo = sec.closed ? sectionStripeInfo(sec.pts, (sheetWidthMm/1000)/sf, angleDeg) : { stripes:[], count:0, perpLenPx:0 }
+      const sheet_lengths_m = stripeInfo.stripes.map(s=>parseFloat((s.lenPx*sf*fac).toFixed(3)))
       return {
         id:sec.id, name:sec.name, pitch:sec.pitch,
         shape_points:sec.pts,
         footprint_m2: parseFloat(fp.toFixed(2)),
         surface_m2:   parseFloat((fp*fac).toFixed(2)),
         pitchFactor:  parseFloat(fac.toFixed(3)),
-        materialLabel: sec.materialLabel||"", rate: sec.rate||0, coverWidth: sec.coverWidth||0,
+        materialLabel: sec.materialLabel||"", rate: sec.rate||0,
+        sheetWidthMm,
+        pitchAngleDeg: angleDeg,
+        sheet_count: stripeInfo.count,
+        sheet_lengths_m,
+        sheet_length_m: sheet_lengths_m.length ? Math.max(...sheet_lengths_m) : 0,
+        sheetsTooMany: !!stripeInfo.tooMany,
         edges:[]
       }
     })
@@ -875,6 +948,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     ctx.translate(view.offX, view.offY)
     ctx.scale(view.zoom, view.zoom)
     const lw = px=>px/view.zoom // keep stroke/point sizes visually constant across zoom levels
+    const sf = mPerPx || 0.05
 
     if(imgRef.current){ ctx.drawImage(imgRef.current,0,0,MT_CANVAS_W,MT_CANVAS_H) }
     else{
@@ -897,6 +971,92 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       if(sec.closed) ctx.closePath()
       ctx.stroke()
       if(sec.closed){ctx.fillStyle=col+"2a";ctx.fill()}
+
+      // ← Pre-compute the name/area label's footprint here (before stripes
+      //   are drawn below) so stripe-length pills can be skipped wherever
+      //   they'd sit under that label instead of overlapping it.
+      let nameRect=null
+      if(sec.closed){
+        const cx0=sec.pts.reduce((a,p)=>a+p.x,0)/sec.pts.length
+        const cy0=sec.pts.reduce((a,p)=>a+p.y,0)/sec.pts.length
+        const fontPx0 = 9/view.zoom
+        ctx.font=`bold ${fontPx0}px DM Sans`; ctx.textAlign="center"
+        const label0 = sec.name||`Sec ${idx+1}`
+        const maxTextW0 = lw(110)
+        const words0 = label0.split(" ")
+        const lines0 = []
+        let current0 = ""
+        words0.forEach(word=>{
+          const test = current0 ? current0+" "+word : word
+          if(current0 && ctx.measureText(test).width>maxTextW0){ lines0.push(current0); current0 = word }
+          else current0 = test
+        })
+        if(current0) lines0.push(current0)
+        if(lines0.length>3){
+          lines0.length = 3
+          let last = lines0[2]
+          while(last.length>1 && ctx.measureText(last+"…").width>maxTextW0) last = last.slice(0,-1)
+          lines0[2] = last+"…"
+        }
+        const lineH0 = lw(11)
+        const boxH0 = lines0.length*lineH0 + lw(8)
+        const boxW0 = Math.max(lw(72), maxTextW0)
+        nameRect = { x1:cx0-boxW0/2-lw(6), y1:cy0-boxH0/2-lw(6), x2:cx0+boxW0/2+lw(6), y2:cy0+boxH0/2+lw(16) }
+      }
+
+      if(sec.closed && sec.pts.length>=3){
+        const sheetWidthPx = ((sec.sheetWidthMm||762)/1000)/sf
+        const stripeAngle = sec.cutAngleDeg ?? sectionAngleDeg(sec.pitch)
+        const { stripes } = sectionStripeInfo(sec.pts, sheetWidthPx, stripeAngle)
+        if(stripes.length){
+          ctx.save()
+          ctx.beginPath(); ctx.moveTo(sec.pts[0].x,sec.pts[0].y)
+          sec.pts.forEach(p=>ctx.lineTo(p.x,p.y))
+          ctx.closePath(); ctx.clip()
+          ctx.strokeStyle="rgba(255,255,255,0.5)"; ctx.lineWidth=lw(1)
+          ctx.setLineDash([lw(3),lw(3)])
+          stripes.forEach(s=>{ ctx.beginPath(); ctx.moveTo(s.p1.x,s.p1.y); ctx.lineTo(s.p2.x,s.p2.y); ctx.stroke() })
+          ctx.setLineDash([])
+          ctx.restore()
+
+          // ── per-stripe length pill, anchored near the top of each cut so
+          //   it doesn't collide with the section-name box in the middle ──
+          const fac = parsePitch(sec.pitch||"1.15")
+          const inRect = (x,y) => nameRect && x>=nameRect.x1 && x<=nameRect.x2 && y>=nameRect.y1 && y<=nameRect.y2
+          stripes.forEach(s=>{
+            const top = s.p1.y<=s.p2.y ? s.p1 : s.p2
+            const bot = s.p1.y<=s.p2.y ? s.p2 : s.p1
+            // ← Try near the top first; if that spot sits under the name
+            //   label, try progressively further down the stripe instead
+            //   of drawing on top of it. Skip the label entirely if every
+            //   candidate spot is covered (very small/narrow section).
+            const candidates=[0.16,0.32,0.84,0.92]
+            let t = candidates.find(tt=>!inRect(top.x+(bot.x-top.x)*tt, top.y+(bot.y-top.y)*tt))
+            if(t==null) return
+            const ax = top.x + (bot.x-top.x)*t
+            const ay = top.y + (bot.y-top.y)*t
+            let ang = Math.atan2(bot.y-top.y, bot.x-top.x)
+            if(ang>Math.PI/2) ang-=Math.PI; else if(ang<-Math.PI/2) ang+=Math.PI
+            const lenM = Math.hypot(s.p2.x-s.p1.x,s.p2.y-s.p1.y)*sf*fac
+            const label = `${lenM.toFixed(2)}m`
+            ctx.save()
+            ctx.translate(ax,ay); ctx.rotate(ang)
+            const fontPx=9/view.zoom
+            ctx.font=`600 ${fontPx}px DM Sans`; ctx.textAlign="center"; ctx.textBaseline="middle"
+            const padX=lw(5), padY=lw(2.5)
+            const boxW=ctx.measureText(label).width+padX*2, boxH=fontPx+padY*2
+            ctx.fillStyle="rgba(255,255,255,0.94)"
+            ctx.strokeStyle="rgba(15,23,42,0.12)"; ctx.lineWidth=lw(1)
+            ctx.beginPath()
+            try{ ctx.roundRect(-boxW/2,-boxH/2,boxW,boxH,lw(3)) }
+            catch{ ctx.rect(-boxW/2,-boxH/2,boxW,boxH) }
+            ctx.fill(); ctx.stroke()
+            ctx.fillStyle="#1e293b"
+            ctx.fillText(label,0,0)
+            ctx.restore()
+          })
+        }
+      }
       ctx.setLineDash([])
       sec.pts.forEach((p,i)=>{
         ctx.fillStyle=i===0?col:"#fff"; ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?5:3),0,Math.PI*2); ctx.fill()
@@ -933,18 +1093,32 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           lines[maxLines-1] = last+"…"
         }
         const lineH = lw(11)
-        const boxW = Math.max(lw(72), Math.max(...lines.map(l=>ctx.measureText(l).width))+lw(16))
         const boxH = lines.length*lineH + lw(8)
-        ctx.fillStyle="rgba(0,0,0,0.6)"; ctx.beginPath()
-        try{ ctx.roundRect(cx-boxW/2,cy-boxH/2,boxW,boxH,lw(4)); ctx.fill() }
-        catch{ ctx.fillRect(cx-boxW/2,cy-boxH/2,boxW,boxH) }
-        ctx.fillStyle="#fff"
+        ctx.save()
+        // ← Shadow alone isn't enough on light patches of the photo (white
+        //   roofing, concrete, etc.) — a dark outline stroke behind the
+        //   white fill guarantees contrast no matter what's underneath.
+        ctx.shadowColor="rgba(0,0,0,0.9)"; ctx.shadowBlur=lw(8); ctx.shadowOffsetY=lw(1)
+        ctx.lineJoin="round"; ctx.strokeStyle="rgba(0,0,0,0.85)"; ctx.lineWidth=lw(3)
         ctx.textBaseline="middle"
         const firstLineY = cy-boxH/2+lineH/2
-        lines.forEach((line,li)=>ctx.fillText(line,cx,firstLineY+li*lineH))
+        lines.forEach((line,li)=>{
+          ctx.strokeText(line,cx,firstLineY+li*lineH)
+          ctx.fillStyle="#fff"
+          ctx.fillText(line,cx,firstLineY+li*lineH)
+        })
         ctx.textBaseline="alphabetic"
         const gs=geometry.sections[idx]
-        if(gs?.surface_m2){ctx.font=`${9/view.zoom}px DM Sans`;ctx.fillStyle="#040404";ctx.fillText(gs.surface_m2+" m²",cx,cy+boxH/2+lw(11))}
+        if(gs?.surface_m2){
+          ctx.font=`bold ${9/view.zoom}px DM Sans`
+          const areaLabel = gs.surface_m2+" m²"
+          const areaY = cy+boxH/2+lw(11)
+          ctx.lineWidth=lw(2.5)
+          ctx.strokeText(areaLabel,cx,areaY)
+          ctx.fillStyle="#fff"
+          ctx.fillText(areaLabel,cx,areaY)
+        }
+        ctx.restore()
       }
     })
 
@@ -1087,7 +1261,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
 
     ctx.restore()
-  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,knownM,calibModalOpen,geometry,imgSrc,view,editMode,selection,selectionCount,selectBox])
+  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,knownM,calibModalOpen,geometry,imgSrc,view,editMode,selection,selectionCount,selectBox,mPerPx])
 
   useEffect(()=>{ drawCanvas() },[drawCanvas])
 
@@ -1258,7 +1432,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         const fp=drawPts[0], d=Math.hypot(pt.x-fp.x,pt.y-fp.y)
         if(d<15){
           const newId = uid()
-          setSections(prev=>[...prev,{id:newId,name:`Section ${prev.length+1}`,pts:drawPts,closed:true,pitch:"1.15",color:SEC_COLORS[prev.length%SEC_COLORS.length],materialLabel:"",rate:0}])
+          setSections(prev=>[...prev,{id:newId,name:`Section ${prev.length+1}`,pts:drawPts,closed:true,pitch:"1.15",color:SEC_COLORS[prev.length%SEC_COLORS.length],materialLabel:"",rate:0,sheetWidthMm:762,cutAngleDeg:null}])
           setDrawPts([])
           // ← Prompt for this section's pitch, then its roof sheet brand,
           //   right away while the roofer is still looking at it, instead
@@ -1328,40 +1502,6 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     setScaleLine(null); setDrawPts([]); setAsbestos(false)
     setSelection({sections:[],lines:[],points:[],scale:false}); setSelectBox(null)
     resetView()
-  }
-
-  // ← Hands the currently-traced photo + roof sections off to the separate
-  //   Cutting List tool (public/cutting-list.html, same origin) instead of
-  //   making the user re-trace everything there. Points transfer as-is —
-  //   both tools store them in raw image-pixel space, unaffected by either
-  //   tool's own pan/zoom, so they line up as long as the same photo loads
-  //   at the same native size on the other end.
-  function sendToCuttingList(){
-    const closedSections = sections.filter(sec=>sec.closed && sec.pts.length>=3)
-    if(!imgSrc || !closedSections.length) return
-    const payload = {
-      type: "aTopRoof:load",
-      photoSrc: imgSrc,
-      pxPerMm: mPerPx ? 1/(mPerPx*1000) : null,
-      shapes: closedSections.map(sec=>({
-        id: sec.id, name: sec.name, pts: sec.pts, color: sec.color,
-        pitch: degreesFromPitchString(sec.pitch),
-        effectiveCoverWidth: sec.coverWidth || 700,
-        profile: sec.materialLabel || "", sheetColour: "", sheetDir: "vertical",
-      })),
-    }
-    const win = window.open("/cutting-list.html", "_blank")
-    if(!win){ alert("Please allow pop-ups for this site to open Cutting List."); return }
-    function onReady(e){
-      if(e.source!==win || !e.data || e.data.type!=="aTopRoof:ready") return
-      win.postMessage(payload, window.location.origin)
-      window.removeEventListener("message", onReady)
-    }
-    window.addEventListener("message", onReady)
-    // Fallback in case the popup's "ready" ping fires before the listener
-    // above attaches (slow machine/tab) — Cutting List's receiver just
-    // re-applies the same payload, so a harmless duplicate is fine.
-    setTimeout(()=>{ try{ win.postMessage(payload, window.location.origin) }catch(_){} }, 800)
   }
 
   function applyCalibration(){
@@ -1546,6 +1686,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
             {sections.length===0&&<div style={{fontSize:11,color:"#94a3b8",textAlign:"center",padding:"8px 0"}}>No sections yet — use ▲ Section tool</div>}
             {sections.map((sec,idx)=>{
               const gs=geometry.sections[idx]
+              const expanded = !!expandedCutSections[sec.id]
               return(
                 <div key={sec.id} style={{marginBottom:10,paddingBottom:10,borderBottom:"1px solid #f1f5f9"}}>
                   <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
@@ -1568,6 +1709,68 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                     <span>Plan: {gs?.footprint_m2||0} m²</span>
                     <span style={{color:sec.color,fontWeight:700}}>Surf: {gs?.surface_m2||0} m²</span>
                   </div>
+
+                  <button
+                    onClick={()=>setExpandedCutSections(prev=>({...prev,[sec.id]:!prev[sec.id]}))}
+                    style={{marginTop:6,padding:"2px 0",border:"none",background:"transparent",color:"#3b82f6",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+                    {expanded?"▾":"▸"} Cutting list{gs?.sheet_count?` · ${gs.sheet_count} sheets`:""}
+                  </button>
+
+                  {expanded && (
+                    <div style={{marginTop:6,paddingLeft:10,borderLeft:"2px solid #f1f5f9"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+                        <span style={{fontSize:10,color:"#64748b",width:64,flexShrink:0}}>Sheet width</span>
+                        <input type="number" value={sec.sheetWidthMm||762}
+                          onChange={e=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,sheetWidthMm:parseFloat(e.target.value)||762}:x))}
+                          style={{width:56,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:4,fontSize:11,fontFamily:"inherit"}}/>
+                        <span style={{fontSize:10,color:"#94a3b8"}}>mm cover</span>
+                      </div>
+                      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+                        <span style={{fontSize:10,color:"#64748b",width:64,flexShrink:0}}>Cut angle</span>
+                        <input type="number" min={0} max={179}
+                          value={sec.cutAngleDeg ?? Math.round(gs?.pitchAngleDeg ?? 0)}
+                          onChange={e=>{
+                            const v = e.target.value
+                            setSections(prev=>prev.map(x=>x.id===sec.id?{...x,cutAngleDeg:v===""?null:((parseFloat(v)%180+180)%180)}:x))
+                          }}
+                          style={{width:56,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:4,fontSize:11,fontFamily:"inherit"}}/>
+                        <span style={{fontSize:10,color:"#94a3b8"}}>°</span>
+                        {sec.cutAngleDeg!=null && (
+                          <button onClick={()=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,cutAngleDeg:null}:x))}
+                            style={{padding:"1px 6px",border:"1px solid #e2e8f0",background:"transparent",color:"#64748b",borderRadius:4,fontSize:10,cursor:"pointer",fontFamily:"inherit"}}>
+                            Reset
+                          </button>
+                        )}
+                      </div>
+                      <input type="range" min={0} max={179} step={1}
+                        value={sec.cutAngleDeg ?? Math.round(gs?.pitchAngleDeg ?? 0)}
+                        onChange={e=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,cutAngleDeg:parseFloat(e.target.value)}:x))}
+                        style={{width:"100%",marginBottom:5}}/>
+                      {gs?.sheetsTooMany && (
+                        <div style={{fontSize:10,color:"#ef4444",marginBottom:4}}>
+                          Sheet width is too small for this section's scale — increase "Sheet width" or check Set Scale, then try again.
+                        </div>
+                      )}
+                      <div style={{fontSize:11,color:"#64748b",display:"flex",justifyContent:"space-between",marginBottom:4}}>
+                        <span>{gs?.sheet_count||0} sheet{gs?.sheet_count===1?"":"s"}</span>
+                        <span>longest ~{gs?.sheet_length_m||0} m</span>
+                      </div>
+                      {gs?.sheet_lengths_m?.length>0 && (
+                        <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:4}}>
+                          {gs.sheet_lengths_m.map((len,li)=>(
+                            <span key={li} style={{fontSize:10,padding:"2px 5px",background:"#f1f5f9",borderRadius:4,color:"#334155"}}>
+                              {len.toFixed(3)}m
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {sec.cutAngleDeg==null && (
+                        <div style={{fontSize:10,color:"#94a3b8",marginTop:4}}>
+                          {gs?.pitchAngleDeg!=null ? `Using pitch angle (${gs.pitchAngleDeg}°). Drag above to override.` : "Direction auto-detected from shape. Drag above to set an exact angle."}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )
             })}
@@ -1691,7 +1894,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           <MaterialPicker
             group="roof_sheet"
             value={pendingSectionMaterial?.label ?? sections.find(s=>s.id===sectionMaterialModalId)?.materialLabel ?? ""}
-            onSelect={({label,rate,coverWidth})=>setPendingSectionMaterial({label,rate,coverWidth})}
+            onSelect={({label,rate})=>setPendingSectionMaterial({label,rate})}
           />
           <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:16}}>
             <Btn primary style={{opacity:pendingSectionMaterial?1:.5}} onClick={()=>{
@@ -1700,11 +1903,8 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               // ← Section is renamed to the brand picked (was "Section N")
               //   so it reads meaningfully everywhere — sidebar, canvas
               //   label, and the Estimate step's per-section list — instead
-              //   of a generic number no one can tell apart. coverWidth is
-              //   kept too (not shown in this app's own UI) so a later
-              //   "Send to Cutting List" handoff can carry the real sheet
-              //   width instead of a generic default.
-              setSections(prev=>prev.map(s=>s.id===id?{...s,name:pendingSectionMaterial.label,materialLabel:pendingSectionMaterial.label,rate:pendingSectionMaterial.rate,coverWidth:pendingSectionMaterial.coverWidth}:s))
+              //   of a generic number no one can tell apart.
+              setSections(prev=>prev.map(s=>s.id===id?{...s,name:pendingSectionMaterial.label,materialLabel:pendingSectionMaterial.label,rate:pendingSectionMaterial.rate}:s))
               setSectionMaterialModalId(null); setPendingSectionMaterial(null)
             }}>Save</Btn>
           </div>
@@ -2022,10 +2222,6 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
           footprint_m2: sec.footprint_m2 ?? prev?.footprint_m2 ?? 0,
           materialLabel: prev?.materialLabel ?? sec.materialLabel ?? "",
           rate: prev?.rate ?? sec.rate ?? 0,
-          // ← Not shown in this app's own Estimate-step UI — kept purely so
-          //   "Send to Cutting List" has the real sheet width to hand over
-          //   instead of a generic default.
-          coverWidth: prev?.coverWidth ?? sec.coverWidth ?? 0,
         }
       }),
       flashings: initialEstimate?.flashings ?? 0,
@@ -2720,7 +2916,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
           //   the Estimate step would revert the moment the Measure step
           //   re-renders from geometryFull.
           return m ? { ...s, name:m.name, materialLabel:m.materialLabel, rate:m.rate,
-            pitch:m.pitch, pitchFactor:m.pitchFactor, surface_m2:m.surface_m2, coverWidth:m.coverWidth } : s
+            pitch:m.pitch, pitchFactor:m.pitchFactor, surface_m2:m.surface_m2 } : s
         })}
       }
       // ← Flashing brand is picked per subtype (Ridge Cap, Valley, etc.),
