@@ -140,30 +140,6 @@ function nextQuoteNum(projects) {
   return "QT-"+String((nums.length ? Math.max(...nums) : 40)+1).padStart(3,"0")
 }
 
-// ─────────────────────────── SEED DATA ───────────────────────────
-const seed_customers = [
-  { id:"c1",name:"Sarah Thompson",    email:"sarah.t@gmail.com",     phone:"021 999 0011", address:"47 Ridgeline Ave, Titirangi, Auckland" },
-  { id:"c2",name:"Mike Thorn",        email:"m.thorn@hotmail.com",   phone:"021 444 2233", address:"14 Henderson Valley Rd, Henderson"     },
-  { id:"c3",name:"Raj Patel",         email:"rpatel@patel.co.nz",    phone:"09 555 7788",  address:"22 Remuera Rd, Remuera, Auckland"      },
-  { id:"c4",name:"James Clark",       email:"james@clark.net",       phone:"021 234 5678", address:"51 Clark St, Ponsonby, Auckland"       },
-  { id:"c5",name:"Riverdale Builders",email:"info@riverdale.co.nz",  phone:"09 800 1100",  address:"5 Trade Lane, Mt Wellington, Auckland" },
-]
-const e1 = calcEst({area:215,pitch:1.15,waste:10,materialRate:55,materialLabel:"Long Run Steel",   flashings:24,guttering:32,dayRate:850,days:3.5,margin:20})
-const e2 = calcEst({area:165,pitch:1.1, waste:10,materialRate:55,materialLabel:"Long Run Steel",   flashings:18,guttering:24,dayRate:850,days:2.5,margin:20})
-const e3 = calcEst({area:142,pitch:1.15,waste:12,materialRate:65,materialLabel:"Metal Tiles",      flashings:16,guttering:20,dayRate:850,days:2,  margin:25})
-const e4 = calcEst({area:187,pitch:1.25,waste:15,materialRate:55,materialLabel:"Long Run Steel",   flashings:28,guttering:36,dayRate:850,days:4,  margin:20})
-const e6 = calcEst({area:198,pitch:1.15,waste:10,materialRate:65,materialLabel:"Metal Tiles",      flashings:22,guttering:28,dayRate:850,days:3,  margin:22})
-const e7 = calcEst({area:130,pitch:1.0, waste:10,materialRate:35,materialLabel:"Corrugated Iron",  flashings:14,guttering:18,dayRate:850,days:2,  margin:18})
-const seed_projects = [
-  { id:"p1",customerId:"c1",address:"47 Ridgeline Ave, Titirangi, Auckland",status:"Quote Sent",area:215,roofType:"Long Run Steel",  notes:"Remove existing iron. Access via side gate.",quoteNum:"QT-041",quoteDate:"2024-12-15",createdAt:"2024-12-14",estimate:e1 },
-  { id:"p2",customerId:"c2",address:"14 Henderson Valley Rd, Henderson",    status:"Won",       area:165,roofType:"Long Run Steel",  notes:"Full reroof including underlayment.",         quoteNum:"QT-039",quoteDate:"2024-12-08",createdAt:"2024-12-06",estimate:e2 },
-  { id:"p3",customerId:"c3",address:"22 Remuera Rd, Remuera, Auckland",     status:"Quote Sent",area:142,roofType:"Metal Tiles",     notes:"Metal tiles to match character home.",        quoteNum:"QT-042",quoteDate:"2024-12-14",createdAt:"2024-12-12",estimate:e3 },
-  { id:"p4",customerId:"c4",address:"51 Clark St, Ponsonby, Auckland",      status:"Estimating",area:187,roofType:"Long Run Steel",  notes:"Complex hip roof. Measure carefully.",         quoteNum:"",      quoteDate:"",          createdAt:"2024-12-13",estimate:e4 },
-  { id:"p5",customerId:"c5",address:"5 Trade Lane, Mt Wellington, Auckland",status:"New Lead",  area:0,  roofType:"",               notes:"Large commercial building. Needs site visit.", quoteNum:"",      quoteDate:"",          createdAt:"2024-12-13",estimate:null },
-  { id:"p6",customerId:"c2",address:"8 Second Ave, Remuera, Auckland",      status:"Won",       area:198,roofType:"Metal Tiles",     notes:"",                                            quoteNum:"QT-036",quoteDate:"2024-11-28",createdAt:"2024-11-25",estimate:e6 },
-  { id:"p7",customerId:"c1",address:"3 Beach Rd, Pt Chevalier, Auckland",   status:"Lost",      area:130,roofType:"Corrugated Iron", notes:"Client went with another contractor.",        quoteNum:"QT-037",quoteDate:"2024-12-01",createdAt:"2024-11-28",estimate:e7 },
-]
-
 // ─────────────────────────── UI PRIMITIVES ───────────────────────────
 const s = {
   app:    { display:"flex", height:"100vh", fontFamily:"'DM Sans', sans-serif", fontSize:14, color:"#0f172a", background:"#f8fafc", overflow:"hidden" },
@@ -552,6 +528,33 @@ function parsePitch(str) {
   if(!isNaN(d) && d<90)  return 1/Math.cos(d*Math.PI/180)
   return 1.15
 }
+// Reverse of the string-building the Roof Pitch popup does, for
+// pre-filling it from whatever's already on the section (default "1.15",
+// a previously-entered ratio like "6:12", or degrees like "30") — mode
+// detection mirrors parsePitch's own heuristics (ratio syntax, then a
+// plausible degree range) rather than introducing a second parser.
+function deriveSectionPitchInput(pitchStr) {
+  const str = String(pitchStr ?? "").trim()
+  const ratioMatch = str.match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/)
+  if(ratioMatch) return { mode:"ratio", value: ratioMatch[1] }
+  const d = parseFloat(str)
+  if(!isNaN(d) && d>5 && d<90) return { mode:"degrees", value: str }
+  return { mode:"ratio", value:"" }
+}
+// Cutting List stores pitch as a plain degrees number (no ratio/factor
+// concept) — converts whatever parsePitch() would also accept (a ratio
+// like "6:12", a bare degrees value, or a bare multiplier factor like the
+// legacy "1.15" default) into degrees for that handoff.
+function degreesFromPitchString(str) {
+  const s = String(str ?? "").trim()
+  const ratioMatch = s.match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/)
+  if(ratioMatch) return parseFloat((Math.atan(parseFloat(ratioMatch[1])/parseFloat(ratioMatch[2]))*180/Math.PI).toFixed(2))
+  const d = parseFloat(s)
+  if(isNaN(d)) return 0
+  if(d>5 && d<90) return parseFloat(d.toFixed(2)) // already plausible degrees
+  if(d<=5 && d>=1) return parseFloat((Math.acos(1/d)*180/Math.PI).toFixed(2)) // bare multiplier factor
+  return 0
+}
 function polyAreaPx(pts) {
   let sum=0; const n=pts.length
   for(let i=0;i<n;i++){const j=(i+1)%n;sum+=pts[i].x*pts[j].y-pts[j].x*pts[i].y}
@@ -590,7 +593,7 @@ function initialSectionsFrom(g) {
     id: sec.id || uid(), name: sec.name || `Section ${i+1}`,
     pts: sec.shape_points || [], closed: true,
     pitch: sec.pitch || "1.15", color: SEC_COLORS[i % SEC_COLORS.length],
-    materialLabel: sec.materialLabel || "", rate: sec.rate || 0,
+    materialLabel: sec.materialLabel || "", rate: sec.rate || 0, coverWidth: sec.coverWidth || 0,
   }))
 }
 function initialLineItemsFrom(g) {
@@ -620,6 +623,13 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   //   section when "Save" is clicked, not the instant a result is picked,
   //   so browsing/searching doesn't accidentally close the popup early.
   const [pendingSectionMaterial, setPendingSectionMaterial] = useState(null)
+  // ← Same "prompt right after closing the trace" idea as the brand popup,
+  //   shown FIRST in the sequence (pitch, then brand) — a section's real
+  //   surface area depends on its pitch, so it's asked before anything
+  //   material-related. {mode:"ratio"|"degrees", value} pending until Save,
+  //   same commit-on-Save pattern as pendingSectionMaterial.
+  const [sectionPitchModalId, setSectionPitchModalId] = useState(null)
+  const [pendingSectionPitch, setPendingSectionPitch] = useState(null)
   // ← Same "pick a brand right after drawing it" popup as roof sections,
   //   generalized to the other traced items that also carry their own
   //   materialLabel/rate: gutters, downpipes, roof drains, penetrations.
@@ -728,7 +738,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         footprint_m2: parseFloat(fp.toFixed(2)),
         surface_m2:   parseFloat((fp*fac).toFixed(2)),
         pitchFactor:  parseFloat(fac.toFixed(3)),
-        materialLabel: sec.materialLabel||"", rate: sec.rate||0,
+        materialLabel: sec.materialLabel||"", rate: sec.rate||0, coverWidth: sec.coverWidth||0,
         edges:[]
       }
     })
@@ -1250,11 +1260,12 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           const newId = uid()
           setSections(prev=>[...prev,{id:newId,name:`Section ${prev.length+1}`,pts:drawPts,closed:true,pitch:"1.15",color:SEC_COLORS[prev.length%SEC_COLORS.length],materialLabel:"",rate:0}])
           setDrawPts([])
-          // ← Prompt for this section's roof sheet brand right away, while
-          //   the roofer is still looking at it, instead of making them
-          //   remember to assign it later in the Estimate step for every
-          //   section (rate can still be changed there afterwards).
-          setSectionMaterialModalId(newId)
+          // ← Prompt for this section's pitch, then its roof sheet brand,
+          //   right away while the roofer is still looking at it, instead
+          //   of making them remember to set either later in the Estimate
+          //   step (both can still be changed there afterwards). Pitch
+          //   popup chains into the brand popup on Save/Skip below.
+          setSectionPitchModalId(newId)
           return
         }
       }
@@ -1317,6 +1328,40 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     setScaleLine(null); setDrawPts([]); setAsbestos(false)
     setSelection({sections:[],lines:[],points:[],scale:false}); setSelectBox(null)
     resetView()
+  }
+
+  // ← Hands the currently-traced photo + roof sections off to the separate
+  //   Cutting List tool (public/cutting-list.html, same origin) instead of
+  //   making the user re-trace everything there. Points transfer as-is —
+  //   both tools store them in raw image-pixel space, unaffected by either
+  //   tool's own pan/zoom, so they line up as long as the same photo loads
+  //   at the same native size on the other end.
+  function sendToCuttingList(){
+    const closedSections = sections.filter(sec=>sec.closed && sec.pts.length>=3)
+    if(!imgSrc || !closedSections.length) return
+    const payload = {
+      type: "aTopRoof:load",
+      photoSrc: imgSrc,
+      pxPerMm: mPerPx ? 1/(mPerPx*1000) : null,
+      shapes: closedSections.map(sec=>({
+        id: sec.id, name: sec.name, pts: sec.pts, color: sec.color,
+        pitch: degreesFromPitchString(sec.pitch),
+        effectiveCoverWidth: sec.coverWidth || 700,
+        profile: sec.materialLabel || "", sheetColour: "", sheetDir: "vertical",
+      })),
+    }
+    const win = window.open("/cutting-list.html", "_blank")
+    if(!win){ alert("Please allow pop-ups for this site to open Cutting List."); return }
+    function onReady(e){
+      if(e.source!==win || !e.data || e.data.type!=="aTopRoof:ready") return
+      win.postMessage(payload, window.location.origin)
+      window.removeEventListener("message", onReady)
+    }
+    window.addEventListener("message", onReady)
+    // Fallback in case the popup's "ready" ping fires before the listener
+    // above attaches (slow machine/tab) — Cutting List's receiver just
+    // re-applies the same payload, so a harmless duplicate is fine.
+    setTimeout(()=>{ try{ win.postMessage(payload, window.location.origin) }catch(_){} }, 800)
   }
 
   function applyCalibration(){
@@ -1596,6 +1641,47 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         </Modal>
       )}
 
+      {sectionPitchModalId && (() => {
+        const section = sections.find(s=>s.id===sectionPitchModalId)
+        const pending = pendingSectionPitch || deriveSectionPitchInput(section?.pitch)
+        const proceedToBrand = () => { setSectionPitchModalId(null); setPendingSectionPitch(null); setSectionMaterialModalId(sectionPitchModalId) }
+        const confirmPitch = () => {
+          if(!pending.value) return
+          const pitch = pending.mode==="ratio" ? `${pending.value}:12` : `${pending.value}`
+          setSections(prev=>prev.map(s=>s.id===sectionPitchModalId?{...s,pitch}:s))
+          proceedToBrand()
+        }
+        return (
+        <Modal title="Roof Pitch" onClose={proceedToBrand} width={380}>
+          <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
+            What's the pitch of <strong>{section?.name}</strong>? You can fine-tune this later in the sidebar or Estimate step.
+          </div>
+          <div style={{display:"flex",gap:8,marginBottom:12}}>
+            {["ratio","degrees"].map(mode=>(
+              <button key={mode} type="button" onClick={()=>setPendingSectionPitch({...pending,mode})}
+                style={{flex:1,padding:"7px 0",borderRadius:8,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
+                  border:pending.mode===mode?"2px solid #f59e0b":"1px solid #e2e8f0",
+                  background:pending.mode===mode?"#fffbeb":"#fff"}}>
+                {mode==="ratio" ? "Ratio (X:12)" : "Degrees (°)"}
+              </button>
+            ))}
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:16}}>
+            <input type="number" min="0" step="any" autoFocus value={pending.value}
+              onChange={e=>setPendingSectionPitch({...pending,value:e.target.value})}
+              onKeyDown={e=>{ if(e.key==="Enter" && pending.value) confirmPitch() }}
+              placeholder={pending.mode==="ratio" ? "e.g. 6" : "e.g. 30"}
+              style={{...s.input,flex:1}}/>
+            <span style={{fontSize:13,color:"#64748b",fontWeight:600}}>{pending.mode==="ratio" ? ": 12" : "°"}</span>
+          </div>
+          <div style={{display:"flex",justifyContent:"flex-end",gap:10}}>
+            <Btn onClick={proceedToBrand}>Skip</Btn>
+            <Btn primary style={{opacity:pending.value?1:.5}} onClick={confirmPitch}>Save</Btn>
+          </div>
+        </Modal>
+        )
+      })()}
+
       {sectionMaterialModalId && (
         <Modal title="Roof Sheet Brand" onClose={()=>{ setSectionMaterialModalId(null); setPendingSectionMaterial(null) }} width={420}>
           <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
@@ -1605,7 +1691,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           <MaterialPicker
             group="roof_sheet"
             value={pendingSectionMaterial?.label ?? sections.find(s=>s.id===sectionMaterialModalId)?.materialLabel ?? ""}
-            onSelect={({label,rate})=>setPendingSectionMaterial({label,rate})}
+            onSelect={({label,rate,coverWidth})=>setPendingSectionMaterial({label,rate,coverWidth})}
           />
           <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:16}}>
             <Btn primary style={{opacity:pendingSectionMaterial?1:.5}} onClick={()=>{
@@ -1614,8 +1700,11 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               // ← Section is renamed to the brand picked (was "Section N")
               //   so it reads meaningfully everywhere — sidebar, canvas
               //   label, and the Estimate step's per-section list — instead
-              //   of a generic number no one can tell apart.
-              setSections(prev=>prev.map(s=>s.id===id?{...s,name:pendingSectionMaterial.label,materialLabel:pendingSectionMaterial.label,rate:pendingSectionMaterial.rate}:s))
+              //   of a generic number no one can tell apart. coverWidth is
+              //   kept too (not shown in this app's own UI) so a later
+              //   "Send to Cutting List" handoff can carry the real sheet
+              //   width instead of a generic default.
+              setSections(prev=>prev.map(s=>s.id===id?{...s,name:pendingSectionMaterial.label,materialLabel:pendingSectionMaterial.label,rate:pendingSectionMaterial.rate,coverWidth:pendingSectionMaterial.coverWidth}:s))
               setSectionMaterialModalId(null); setPendingSectionMaterial(null)
             }}>Save</Btn>
           </div>
@@ -1811,7 +1900,10 @@ function MaterialPicker({ value, onSelect, unit="m2", group="", catalogUnit="" }
     const rate  = unit==="each" ? (m.rateLm ?? m.rateM2 ?? 0)
       : unit==="lm" ? (m.rateLm ?? (m.rateM2 && m.coverWidth ? m.rateM2 * (m.coverWidth/1000) : 0))
       : (m.rateM2 ?? (m.rateLm && m.coverWidth ? m.rateLm / (m.coverWidth/1000) : 0))
-    onSelect({ label, rate: parseFloat(rate.toFixed(2)) })
+    // ← coverWidth passed through (not just used for the rate math above)
+    //   so callers that need the real sheet width later — e.g. handing a
+    //   section off to the Cutting List tool — don't have to re-fetch it.
+    onSelect({ label, rate: parseFloat(rate.toFixed(2)), coverWidth: m.coverWidth||0 })
     setQuery(label)
     setOpen(false)
   }
@@ -1920,8 +2012,20 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
         const prev = savedSections.get(sec.id)
         return {
           id: sec.id, name: sec.name, surface_m2: sec.surface_m2,
+          // ← Per-section pitch (Ratio "4:12" or Degrees), same
+          //   saved-wins-over-retrace pattern as materialLabel/rate below —
+          //   otherwise reopening a project to edit would silently reset
+          //   every section back to whatever the last trace happened to
+          //   carry, discarding an Estimate-step pitch edit.
+          pitch: prev?.pitch ?? sec.pitch ?? "1.15",
+          pitchFactor: prev?.pitchFactor ?? sec.pitchFactor ?? 1.15,
+          footprint_m2: sec.footprint_m2 ?? prev?.footprint_m2 ?? 0,
           materialLabel: prev?.materialLabel ?? sec.materialLabel ?? "",
           rate: prev?.rate ?? sec.rate ?? 0,
+          // ← Not shown in this app's own Estimate-step UI — kept purely so
+          //   "Send to Cutting List" has the real sheet width to hand over
+          //   instead of a generic default.
+          coverWidth: prev?.coverWidth ?? sec.coverWidth ?? 0,
         }
       }),
       flashings: initialEstimate?.flashings ?? 0,
@@ -2024,6 +2128,27 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
                     <span style={{fontSize:13,fontWeight:600}}>{sec.name}</span>
                     <span style={{fontSize:12,color:"#64748b"}}>{sec.surface_m2} m²</span>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                    <span style={{fontSize:11,color:"#64748b"}}>Pitch</span>
+                    <input
+                      value={sec.pitch ?? ""}
+                      onChange={ev=>{
+                        const pitch = ev.target.value
+                        const pitchFactor = parseFloat(parsePitch(pitch).toFixed(3))
+                        // ← Re-derive surface_m2 from the section's flat
+                        //   footprint rather than adjusting the already-
+                        //   sloped surface_m2 in place, since the latter
+                        //   would compound with every edit instead of
+                        //   recomputing cleanly from the original trace.
+                        setE(prev=>({...prev,sections:prev.sections.map((s,si)=>si===i?{
+                          ...s, pitch, pitchFactor,
+                          surface_m2: parseFloat(((s.footprint_m2||0)*pitchFactor).toFixed(2)),
+                        }:s)}))
+                      }}
+                      placeholder="4:12 or 30°"
+                      style={{width:70,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:4,fontSize:11,fontFamily:"inherit"}}/>
+                    <span style={{fontSize:10,color:"#94a3b8"}}>×{sec.pitchFactor||1} · plan {sec.footprint_m2||0}m²</span>
                   </div>
                   <MaterialPicker
                     group="roof_sheet"
@@ -2590,7 +2715,12 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
         const edited = new Map(result.sections.map(s=>[s.id,s]))
         next = { ...next, sections: next.sections.map(s=>{
           const m = edited.get(s.id)
-          return m ? { ...s, name:m.name, materialLabel:m.materialLabel, rate:m.rate } : s
+          // ← pitch/pitchFactor/surface_m2 synced back too, same reasoning
+          //   as name/materialLabel/rate — otherwise a pitch edit made in
+          //   the Estimate step would revert the moment the Measure step
+          //   re-renders from geometryFull.
+          return m ? { ...s, name:m.name, materialLabel:m.materialLabel, rate:m.rate,
+            pitch:m.pitch, pitchFactor:m.pitchFactor, surface_m2:m.surface_m2, coverWidth:m.coverWidth } : s
         })}
       }
       // ← Flashing brand is picked per subtype (Ridge Cap, Valley, etc.),
