@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, Fragment, forwardRef, useImperativeHandle } from "react"
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, Fragment, forwardRef, useImperativeHandle } from "react"
 import { createPortal } from "react-dom"
 import { loadStripe } from "@stripe/stripe-js"
 import { Elements, CardNumberElement, CardExpiryElement, CardCvcElement, useStripe, useElements } from "@stripe/react-stripe-js"
@@ -521,37 +521,99 @@ const ACCESSORY_MODAL_CONFIG = {
 
 function parsePitch(str) {
   if(!str||str==="") return 1.0
-  const m = String(str).match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/)
+  const s = String(str).trim()
+  const m = s.match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/)
   if(m) return Math.sqrt(parseFloat(m[1])**2+parseFloat(m[2])**2)/parseFloat(m[2])
-  const d = parseFloat(str)
+  // ← Explicit degree marker (e.g. "5°") — checked before the bare-number
+  //   fallbacks below so a shallow degrees pitch (≤5°) can't be confused
+  //   with the "already a multiplier" case (bare "1.15" default etc.).
+  //   Clamped below 90° — a roof plane can't actually be vertical, and
+  //   Math.cos(90°) isn't exactly 0 in floating point (≈6e-17), so an
+  //   unclamped 1/cos(90°) explodes to ~10^16 instead of erroring.
+  const deg = s.match(/^(\d+(?:\.\d+)?)\s*°$/)
+  if(deg) return 1/Math.cos(Math.min(Math.max(parseFloat(deg[1]),0),89)*Math.PI/180)
+  const d = parseFloat(s)
   if(!isNaN(d) && d<=5)  return d
   if(!isNaN(d) && d<90)  return 1/Math.cos(d*Math.PI/180)
   return 1.15
 }
-// Reverse of the string-building the Roof Pitch popup does, for
-// pre-filling it from whatever's already on the section (default "1.15",
-// a previously-entered ratio like "6:12", or degrees like "30") — mode
-// detection mirrors parsePitch's own heuristics (ratio syntax, then a
-// plausible degree range) rather than introducing a second parser.
+// Reverse of the string-building the Roof Pitch popup does — derives the
+// single canonical angle (in degrees) a stored pitch string represents, so
+// the modal's Ratio/Degrees display never has to convert from a previously
+// *displayed* (already-rounded) number: everything always derives fresh
+// from this one angle. Returns null when no pitch has been set yet
+// ("Unknown Pitch"), instead of a fake default.
 function deriveSectionPitchInput(pitchStr) {
   const str = String(pitchStr ?? "").trim()
+  if(!str) return null
   const ratioMatch = str.match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/)
-  if(ratioMatch) return { mode:"ratio", value: ratioMatch[1] }
+  if(ratioMatch) {
+    const rise = parseFloat(ratioMatch[1]), run = parseFloat(ratioMatch[2])
+    return { mode:"ratio", angleDeg: Math.atan(rise/run)*180/Math.PI }
+  }
+  const degMatch = str.match(/^(\d+(?:\.\d+)?)\s*°$/)
+  if(degMatch) return { mode:"degrees", angleDeg: parseFloat(degMatch[1]) }
   const d = parseFloat(str)
-  if(!isNaN(d) && d>5 && d<90) return { mode:"degrees", value: str }
-  return { mode:"ratio", value:"" }
+  if(!isNaN(d) && d>5 && d<90) return { mode:"degrees", angleDeg: d }
+  // ← Legacy bare-multiplier pitch (the old "1.15" default, from before
+  //   "Unknown Pitch" existed as an explicit state) — best-effort
+  //   reconstruct an equivalent angle so old data still opens sensibly
+  //   instead of silently showing a blank field.
+  if(!isNaN(d) && d>=1) return { mode:"ratio", angleDeg: Math.acos(1/d)*180/Math.PI }
+  return null
 }
 function polyAreaPx(pts) {
   let sum=0; const n=pts.length
   for(let i=0;i<n;i++){const j=(i+1)%n;sum+=pts[i].x*pts[j].y-pts[j].x*pts[i].y}
   return Math.abs(sum/2)
 }
-// ← Cutting list requires the section's pitch to be entered as degrees
-//   (e.g. "30") rather than a ratio ("4:12") — that angle IS the stripe
-//   direction, so a ratio pitch (no angle) can't generate a cutting list.
+// ← When horizontal/vertical calibration scales differ (anisotropic), every
+//   point fed into the existing area/length/clipping functions is squashed
+//   along X by (sfX/sfY) first so those functions can stay untouched (see
+//   `geometry` useMemo). A direction angle defined in true (unsquashed)
+//   photo space — the Cut Angle slider, or a degree pitch — needs the same
+//   transform applied to its unit vector, or the stripe direction computed
+//   from it would silently drift from what the slider/photo actually show.
+function squashAngleDeg(trueDeg, squashRatio) {
+  if(squashRatio===1 || trueDeg==null || isNaN(trueDeg)) return trueDeg
+  const rad = trueDeg*Math.PI/180
+  return Math.atan2(Math.sin(rad), Math.cos(rad)*squashRatio)*180/Math.PI
+}
+// ← Classifies a section's shape (in true real-world coordinates — angles
+//   only mean something before any anisotropic squashing) as "rectangle-
+//   like" using GLOBAL properties (point count, opposite-side length
+//   ratio, corner angles) rather than per-column sampling. This is what
+//   decides whether the cutting list uses the Uniform strategy (every
+//   sheet the same length) instead of the tapered polygon-clipping one —
+//   verified against a battery of shapes (perfect rectangle, a rectangle
+//   with a few-cm trace imprecision, a triangular hip apex, a stepped hip,
+//   a genuinely skewed parallelogram, a quad with one hip-like corner)
+//   before relying on it: it correctly passes only true 4-point,
+//   near-rectangular shapes and correctly rejects every other case tested.
+function isRectangleLike(pts, angleTolDeg=6, lengthTolPct=8) {
+  if(!pts || pts.length!==4) return false
+  const edges = []
+  for(let i=0;i<4;i++){
+    const a=pts[i], b=pts[(i+1)%4]
+    edges.push({dx:b.x-a.x, dy:b.y-a.y, len:Math.hypot(b.x-a.x,b.y-a.y)})
+  }
+  const r1 = Math.abs(edges[0].len-edges[2].len)/Math.max(edges[0].len,edges[2].len)*100
+  const r2 = Math.abs(edges[1].len-edges[3].len)/Math.max(edges[1].len,edges[3].len)*100
+  if(r1>lengthTolPct || r2>lengthTolPct) return false
+  for(let i=0;i<4;i++){
+    const e1=edges[i], e2=edges[(i+1)%4]
+    const cosA = (e1.dx*e2.dx+e1.dy*e2.dy)/(e1.len*e2.len)
+    const angleDeg = Math.acos(Math.min(1,Math.max(-1,cosA)))*180/Math.PI
+    if(Math.abs(angleDeg-90)>angleTolDeg) return false
+  }
+  return true
+}
+// ← Only a degree pitch (e.g. "30") doubles as an explicit stripe angle; a
+//   ratio pitch (e.g. "4:12") returns null here so callers fall back to
+//   shape-based direction detection instead of blocking the cutting list.
 function sectionAngleDeg(pitchStr) {
   const d = deriveSectionPitchInput(pitchStr)
-  return d.mode==="degrees" ? parseFloat(d.value) : null
+  return d?.mode==="degrees" ? d.angleDeg : null
 }
 // ← Where a stripe line (p1→p2, spanning well past the polygon on both
 //   ends) actually crosses the polygon boundary — used to trim each sheet
@@ -567,7 +629,15 @@ function clipSegmentToPolygon(p1, p2, pts) {
     if(Math.abs(denom)<1e-9) continue
     const t = ((a.x-p1.x)*ey - (a.y-p1.y)*ex)/denom
     const u = ((a.x-p1.x)*dy - (a.y-p1.y)*dx)/denom
-    if(u>=-1e-6 && u<=1+1e-6 && t>=0 && t<=1) ts.push(t)
+    // ← t needs the same small tolerance u already has — a legitimate
+    //   intersection exactly at the query line's own endpoint (t≈0 or
+    //   t≈1, which happens constantly here since every stripe's p1/p2 are
+    //   built at the polygon's own perpMin/perpMax) can compute as a
+    //   hair outside [0,1] from floating-point roundoff and get wrongly
+    //   rejected. Without this, that edge silently drops from `ts`,
+    //   sometimes leaving only 1 crossing where there should be 2 —
+    //   undercounting the cutting list by a sheet.
+    if(u>=-1e-6 && u<=1+1e-6 && t>=-1e-6 && t<=1+1e-6) ts.push(Math.min(Math.max(t,0),1))
   }
   if(ts.length<2) return null
   ts.sort((a,b)=>a-b)
@@ -584,40 +654,73 @@ function clipSegmentToPolygon(p1, p2, pts) {
 //   how the roof section actually narrows/widens under it. Returns
 //   pixel-space segments plus the counts/lengths the sidebar reads.
 function sectionStripeInfo(pts, sheetWidthPx, angleDeg) {
-  if(!pts || pts.length<3 || !sheetWidthPx || sheetWidthPx<=0) return { stripes:[], count:0, dirLenPx:0, perpLenPx:0 }
-  let dir
-  if(angleDeg!=null && !isNaN(angleDeg)){
-    const rad = angleDeg*Math.PI/180
-    dir = { x:Math.cos(rad), y:Math.sin(rad) }
-  } else {
-    let longest=0
-    dir={x:1,y:0}
-    for(let i=0;i<pts.length;i++){
-      const a=pts[i], b=pts[(i+1)%pts.length]
-      const dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy)
-      if(len>longest){ longest=len; dir={x:dx/len,y:dy/len} }
-    }
+  if(!pts || pts.length<3) return { stripes:[], count:0, dirLenPx:0, perpLenPx:0, longestEdgePx:0 }
+  // ← Longest edge is computed unconditionally (not just for auto-direction)
+  //   since RoofPlane summaries want it regardless of which direction mode
+  //   is active.
+  let longest=0, longestDir={x:1,y:0}, longestA=pts[0], longestB=pts[1]
+  for(let i=0;i<pts.length;i++){
+    const a=pts[i], b=pts[(i+1)%pts.length]
+    const dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy)
+    if(len>longest){ longest=len; longestDir={x:dx/len,y:dy/len}; longestA=a; longestB=b }
   }
+  const usingAutoDirection = !(angleDeg!=null && !isNaN(angleDeg))
+  const dir = usingAutoDirection
+    ? longestDir
+    : { x:Math.cos(angleDeg*Math.PI/180), y:Math.sin(angleDeg*Math.PI/180) }
+  if(!sheetWidthPx || sheetWidthPx<=0) return { stripes:[], count:0, dirLenPx:0, perpLenPx:0, longestEdgePx:longest }
   const perp = { x:-dir.y, y:dir.x }
-  const dirVals  = pts.map(p=>p.x*dir.x+p.y*dir.y)
   const perpVals = pts.map(p=>p.x*perp.x+p.y*perp.y)
-  const dirMin=Math.min(...dirVals), dirMax=Math.max(...dirVals)
+  // ← When direction is auto-detected (from the longest edge), anchor the
+  //   run's start/end to that EDGE'S OWN two endpoints rather than the
+  //   min/max projection over every vertex — the eave's length is what the
+  //   eave edge itself measures, not how far the whole shape's projected
+  //   shadow happens to extend at that angle. Without this, a few-cm trace
+  //   imprecision at one corner tilts the eave's implied angle just enough
+  //   that the boundary-most column clips against a slightly-skewed side
+  //   edge instead of crossing cleanly top-to-bottom, producing one
+  //   dramatically short sheet next to an otherwise-uniform run. Interior
+  //   clipping (hip/valley tapering) is untouched — perpMin/perpMax still
+  //   come from the full polygon; only the run's own extent changes here.
+  let dirMin, dirMax
+  if(usingAutoDirection){
+    const aProj=longestA.x*dir.x+longestA.y*dir.y, bProj=longestB.x*dir.x+longestB.y*dir.y
+    dirMin=Math.min(aProj,bProj); dirMax=Math.max(aProj,bProj)
+  } else {
+    const dirVals = pts.map(p=>p.x*dir.x+p.y*dir.y)
+    dirMin=Math.min(...dirVals); dirMax=Math.max(...dirVals)
+  }
   const perpMin=Math.min(...perpVals), perpMax=Math.max(...perpVals)
+  // ← dir/perp/dirMin/perpMin/perpMax are exposed (not just the derived
+  //   lengths) so callers building a *uniform* sheet run (Rectangle/Gable
+  //   roof-plane type — see `geometry` useMemo) can synthesize their own
+  //   evenly-spaced, unclipped lines in the same coordinate frame instead
+  //   of duplicating this direction/extent computation.
   // ← Guard against a runaway stripe count (bad/uncalibrated scale, or a
   //   sheet width much smaller than the section) that would otherwise draw
   //   thousands of overlapping lines and labels — no real roof needs this
   //   many sheets, so treat it as "can't generate" instead of freezing the
   //   canvas in a garbled mess.
   const MAX_STRIPES = 300
-  if((dirMax-dirMin)/sheetWidthPx > MAX_STRIPES) return { stripes:[], count:0, dirLenPx:dirMax-dirMin, perpLenPx:perpMax-perpMin, tooMany:true }
+  if((dirMax-dirMin)/sheetWidthPx > MAX_STRIPES) return { stripes:[], count:0, dirLenPx:dirMax-dirMin, perpLenPx:perpMax-perpMin, longestEdgePx:longest, tooMany:true, dir, perp, dirMin, perpMin, perpMax }
+  // ← The very first/last stripe sits exactly at dirMin/dirMax, which is
+  //   the x-position of an actual polygon corner — a query line placed
+  //   there passes through a single vertex (not a real cross-section), so
+  //   its two bounding edges both intersect at essentially the same point
+  //   and the clip degenerates to ~0 length and gets dropped, even though
+  //   the section has real, full width just a hair inside that corner.
+  //   Nudging only matters for those two ends — every interior sample is
+  //   already comfortably clear of dirMin/dirMax and is unaffected.
+  const EDGE_EPS = sheetWidthPx*0.01
   const stripes=[]
   for(let d=dirMin; d<=dirMax+1e-6; d+=sheetWidthPx){
-    const p1={ x:d*dir.x+perpMin*perp.x, y:d*dir.y+perpMin*perp.y }
-    const p2={ x:d*dir.x+perpMax*perp.x, y:d*dir.y+perpMax*perp.y }
+    const dSafe = Math.min(Math.max(d, dirMin+EDGE_EPS), dirMax-EDGE_EPS)
+    const p1={ x:dSafe*dir.x+perpMin*perp.x, y:dSafe*dir.y+perpMin*perp.y }
+    const p2={ x:dSafe*dir.x+perpMax*perp.x, y:dSafe*dir.y+perpMax*perp.y }
     const clipped = clipSegmentToPolygon(p1, p2, pts)
-    if(clipped && clipped.lenPx>1) stripes.push({ p1:clipped.p1, p2:clipped.p2, lenPx:clipped.lenPx })
+    if(clipped && clipped.lenPx>1) stripes.push({ id:uid(), startPoint:clipped.p1, endPoint:clipped.p2, lengthPx:clipped.lenPx })
   }
-  return { stripes, count: stripes.length, dirLenPx: dirMax-dirMin, perpLenPx: perpMax-perpMin }
+  return { stripes, count: stripes.length, dirLenPx: dirMax-dirMin, perpLenPx: perpMax-perpMin, longestEdgePx:longest, dir, perp, dirMin, perpMin, perpMax }
 }
 function linelenPx(pts) {
   let l=0
@@ -651,7 +754,7 @@ function initialSectionsFrom(g) {
   return g.sections.map((sec,i)=>({
     id: sec.id || uid(), name: sec.name || `Section ${i+1}`,
     pts: sec.shape_points || [], closed: true,
-    pitch: sec.pitch || "1.15", color: SEC_COLORS[i % SEC_COLORS.length],
+    pitch: sec.pitch ?? null, color: SEC_COLORS[i % SEC_COLORS.length],
     materialLabel: sec.materialLabel || "", rate: sec.rate || 0,
     sheetWidthMm: sec.sheetWidthMm || 762,
     cutAngleDeg: sec.cutAngleDeg ?? null,
@@ -660,7 +763,11 @@ function initialSectionsFrom(g) {
 function initialLineItemsFrom(g) {
   const flashings = g?.accessories?.flashings || []
   const gutters    = g?.accessories?.gutters   || []
-  return [...flashings, ...gutters].map(l => ({ id: l.id || uid(), type: l.type, subtype: l.subtype, pts: l.pts || [] }))
+  // ← Spread the full source object (matching initialPtItemsFrom below)
+  //   instead of hand-picking fields — otherwise materialLabel/rate (the
+  //   brand/rate picked via the flashing/gutter popup) silently drop out
+  //   on restore even though geometry.accessories already carries them.
+  return [...flashings, ...gutters].map(l => ({ ...l, id: l.id || uid() }))
 }
 function initialPtItemsFrom(g) {
   const downpipes = g?.accessories?.downpipes   || []
@@ -671,8 +778,15 @@ function initialPtItemsFrom(g) {
 function initialKnownMFrom(g) {
   return g?.scale_m_per_px ? parseFloat((g.scale_m_per_px*100).toFixed(4)) : 10
 }
+// ← Confirmed calibration reference lines don't round-trip through the
+//   single averaged scale_m_per_px number (the area math still gets the
+//   right scale via that fallback, but the visual lines themselves — and
+//   the "N references"/disagreement warning — need their own restore path.
+function initialScaleLinesFrom(g) {
+  return (g?.scaleLines||[]).map(l => ({ ...l, id: l.id || uid() }))
+}
 
-const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, photoUrl, initialGeometry }, ref) {
+const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, photoUrl, onPhotoChange, initialGeometry }, ref) {
   const canvasRef   = useRef(null)
   const imgRef      = useRef(null)
   const [imgSrc,    setImgSrc]    = useState(null)
@@ -708,6 +822,12 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   //   so restored section areas stay correct until/unless the user redraws
   //   their own scale line, which then takes over.
   const [scaleLine, setScaleLine] = useState(null)
+  // ← Confirmed calibration references (plural) — a photo can carry more
+  //   than one known dimension, so mPerPx is averaged across all of these
+  //   instead of trusting a single line. `scaleLine` above stays the
+  //   in-progress line being drawn/confirmed; once confirmed it's pushed
+  //   here and cleared, ready for the next reference.
+  const [scaleLines, setScaleLines] = useState(() => initialScaleLinesFrom(initialGeometry)) // [{id, p1, p2, knownM}]
   const [knownM,    setKnownM]    = useState(() => initialKnownMFrom(initialGeometry))
   // ← Postgres DECIMAL columns come back as strings (e.g. "0.05000000"), not
   //   numbers — without parseFloat here, downstream math like sf.toFixed()
@@ -742,11 +862,11 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   const redoRef = useRef([]) // states popped by undo, so redo can restore them — cleared on any new action
   const dragPushedRef = useRef(false) // whether the current drag gesture has already pushed its pre-drag snapshot
   function snapshot(){
-    return { sections, lineItems, ptItems, scaleLine, knownM, asbestos, drawPts }
+    return { sections, lineItems, ptItems, scaleLine, scaleLines, knownM, asbestos, drawPts }
   }
   function applySnapshot(snap){
     setSections(snap.sections); setLineItems(snap.lineItems); setPtItems(snap.ptItems)
-    setScaleLine(snap.scaleLine); setKnownM(snap.knownM); setAsbestos(snap.asbestos)
+    setScaleLine(snap.scaleLine); setScaleLines(snap.scaleLines||[]); setKnownM(snap.knownM); setAsbestos(snap.asbestos)
     setDrawPts(snap.drawPts)
   }
   function pushHistory(){
@@ -771,8 +891,21 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 
   // ── Marquee select (Photoshop-style drag-a-box, then Delete) ────────
   const [selectBox, setSelectBox] = useState(null) // {start:{x,y}, current:{x,y}} while dragging
-  const [selection, setSelection] = useState({ sections:[], lines:[], points:[], scale:false })
-  const selectionCount = selection.sections.length + selection.lines.length + selection.points.length + (selection.scale?1:0)
+  // ← Right-clicking mid-Flashing/Gutter trace used to silently finish the
+  //   line; this instead offers an explicit choice — screen coords (not
+  //   world coords) since it's positioned as a fixed-position popup.
+  const [lineContextMenu, setLineContextMenu] = useState(null) // {x,y} | null
+  const [selection, setSelection] = useState({ sections:[], lines:[], points:[], scale:false, scaleLineIds:[] })
+  const selectionCount = selection.sections.length + selection.lines.length + selection.points.length + (selection.scale?1:0) + selection.scaleLineIds.length
+
+  // ← In-app "duplicate shape" clipboard — holds the actual traced geometry
+  //   (points/pitch/material/etc, same shape as `sections`/`lineItems`/
+  //   `ptItems`) of the current Select-tool selection, not an image. Paste
+  //   re-inserts a copy with fresh ids, offset to wherever the user pastes —
+  //   this stays entirely inside the canvas, never touching the OS clipboard.
+  const [shapeClipboard, setShapeClipboard] = useState(null) // {sections,lines,points} | null
+  const [pastePopup, setPastePopup] = useState(null) // {x,y (screen), worldPt} | null — right-click "Paste" popup
+  const [shapeCopyMsg, setShapeCopyMsg] = useState("") // short confirmation label shown on the Copy/Paste buttons
 
   // ← Lets the parent wizard grab a PNG snapshot of the traced canvas (for
   //   embedding in generated quotes) without owning the canvas ref itself.
@@ -780,43 +913,177 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     getSnapshot: () => canvasRef.current?.toDataURL("image/png") || null,
   }))
 
+  // ← Each confirmed reference line yields its own meters-per-pixel ratio;
+  //   mPerPx is the average across all of them so a photo carrying more
+  //   than one known dimension (or a re-drawn correction) improves accuracy
+  //   instead of only ever trusting the single most recent line.
+  const scaleRatios = useMemo(()=>{
+    return scaleLines.map(l=>{
+      const px = Math.hypot(l.p2.x-l.p1.x, l.p2.y-l.p1.y)
+      return px>0 ? l.knownM/px : null
+    }).filter(v=>v!=null)
+  },[scaleLines])
   const mPerPx = useMemo(()=>{
-    if(scaleLine?.p1 && scaleLine?.p2){
-      const px=Math.sqrt((scaleLine.p2.x-scaleLine.p1.x)**2+(scaleLine.p2.y-scaleLine.p1.y)**2)
-      return px>0 ? knownM/px : null
-    }
-    return restoredMPerPx // fallback for a restored project until the user redraws their own line
-  },[scaleLine, knownM, restoredMPerPx])
+    if(scaleRatios.length) return scaleRatios.reduce((a,b)=>a+b,0)/scaleRatios.length
+    return restoredMPerPx // fallback for a restored project until the user redraws a reference line
+  },[scaleRatios, restoredMPerPx])
+  // ← How much the references disagree with each other, as a % of their
+  //   average — a large spread usually means a typo (wrong unit, extra
+  //   zero) in one of the entered lengths, so it's worth flagging.
+  const scaleSpreadPct = useMemo(()=>{
+    if(scaleRatios.length<2) return null
+    const min=Math.min(...scaleRatios), max=Math.max(...scaleRatios)
+    const avg=scaleRatios.reduce((a,b)=>a+b,0)/scaleRatios.length
+    return avg>0 ? ((max-min)/avg)*100 : null
+  },[scaleRatios])
+  // ← A tilted/perspective photo can have a genuinely different real-world
+  //   meters-per-pixel horizontally vs vertically — blending both into one
+  //   averaged mPerPx then stretches one axis and compresses the other
+  //   (this is what made a traced 12x12m square keep coming out non-square).
+  //   When at least one clearly-horizontal AND one clearly-vertical
+  //   reference both exist, compute their scales separately instead;
+  //   otherwise fall back to the single-average behavior unchanged.
+  const axisScale = useMemo(()=>{
+    const horiz=[], vert=[]
+    scaleLines.forEach(l=>{
+      const dx=Math.abs(l.p2.x-l.p1.x), dy=Math.abs(l.p2.y-l.p1.y)
+      if(dx>dy){ if(dx>0) horiz.push(l.knownM/dx) }
+      else{ if(dy>0) vert.push(l.knownM/dy) }
+    })
+    if(!horiz.length || !vert.length) return null
+    const avg = arr => arr.reduce((a,b)=>a+b,0)/arr.length
+    return { x: avg(horiz), y: avg(vert) }
+  },[scaleLines])
 
   const geometry = useMemo(()=>{
-    const sf = mPerPx || 0.05
+    const sfIso = mPerPx || 0.05
+    // ← sfY is used as the single uniform scale in every existing formula
+    //   below (area, length, clipping) — anisotropy is handled entirely by
+    //   pre-squashing each point set's X-axis by (sfX/sfY) before calling
+    //   those formulas, so polyAreaPx/linelenPx/sectionStripeInfo/
+    //   clipSegmentToPolygon themselves stay completely unmodified. When
+    //   axisScale is null (no anisotropic calibration yet), squashRatio is
+    //   1 and this is identical to the previous single-sf behavior.
+    const sfX = axisScale ? axisScale.x : sfIso
+    const sfY = axisScale ? axisScale.y : sfIso
+    const squashRatio = sfX/sfY
+    const squash = pts => squashRatio===1 ? pts : pts.map(p=>({x:p.x*squashRatio, y:p.y}))
     const processedSections = sections.map((sec)=>{
-      const fpPx = sec.closed ? polyAreaPx(sec.pts) : 0
-      const fp   = fpPx*sf*sf
-      const fac  = parsePitch(sec.pitch||"1.15")
+      const sqPts = squash(sec.pts)
+      const fpPx = sec.closed ? polyAreaPx(sqPts) : 0
+      const fp   = fpPx*sfY*sfY
+      // ← "Unknown Pitch" is now an explicit, real state (the Roof Pitch
+      //   modal's own dedicated button) instead of silently falling back
+      //   to a fake default multiplier — Surface Area and the cutting list
+      //   are only meaningful once a real pitch exists, so both are
+      //   skipped entirely here rather than computed against a guess.
+      const pitchUnknown = !sec.pitch
+      const fac  = pitchUnknown ? null : parsePitch(sec.pitch)
       const sheetWidthMm = sec.sheetWidthMm || 762
       // ← Direction priority: explicit per-section override > degree pitch > shape auto-detect
-      const angleDeg = sec.cutAngleDeg ?? sectionAngleDeg(sec.pitch)
-      const stripeInfo = sec.closed ? sectionStripeInfo(sec.pts, (sheetWidthMm/1000)/sf, angleDeg) : { stripes:[], count:0, perpLenPx:0 }
-      const sheet_lengths_m = stripeInfo.stripes.map(s=>parseFloat((s.lenPx*sf*fac).toFixed(3)))
+      //   True (photo-space) angle is what's shown/restored in the UI;
+      //   sectionStripeInfo needs the same angle re-expressed in the
+      //   squashed space its points now live in, or the stripe direction
+      //   would drift from what the slider/photo actually show.
+      const trueAngleDeg = sec.cutAngleDeg ?? sectionAngleDeg(sec.pitch)
+      const stripeAngleDeg = squashAngleDeg(trueAngleDeg, squashRatio)
+      const stripeInfo = (sec.closed && !pitchUnknown) ? sectionStripeInfo(sqPts, (sheetWidthMm/1000)/sfY, stripeAngleDeg) : { stripes:[], count:0, perpLenPx:0, longestEdgePx:0 }
+      // ← RoofSheet objects: each clipped stripe becomes a structured sheet
+      //   (not just a bare length) so future features (grouping, purchase
+      //   lists) can be built on this without redoing the clipping algorithm.
+      // ← Clip points come back in the squashed space sqPts was built in —
+      //   fine for the length math above, but drawCanvas draws these
+      //   directly as canvas/photo coordinates, so they need un-squashing
+      //   back to true photo space or the rendered stripes would land in
+      //   the wrong place whenever anisotropic calibration is active.
+      const unsquash = p => squashRatio===1 ? p : { x: p.x/squashRatio, y: p.y }
+      // ← Automatically detected, not user-classified: real-world (not
+      //   squashed-pixel) angles are what "rectangular" actually means, so
+      //   classification runs on points scaled by their own true per-axis
+      //   factors. A shape that passes this is treated as a uniform slope —
+      //   every sheet the same length, count from the eave's overall span —
+      //   which reuses dirLenPx/perpLenPx (simple min/max spans, not
+      //   per-column clipping) and so is immune to the boundary-column
+      //   sensitivity the tapered strategy is inherently exposed to. Any
+      //   shortfall between sheet-count×cover-width and the true eave
+      //   length is intentionally not tracked as a "trimmed" sheet — real
+      //   installers just buy another full sheet and trim the excess width
+      //   on site, so every sheet is reported at the same nominal cover
+      //   width, matching that practice instead of computing a bespoke
+      //   final width.
+      const realPts = sec.pts.map(p=>({x:p.x*sfX, y:p.y*sfY}))
+      const isUniformPlane = sec.closed && isRectangleLike(realPts)
+      let sheets
+      if(pitchUnknown){
+        sheets = []
+      } else if(isUniformPlane && stripeInfo.dir){
+        const eaveLenPxPerSheet = (sheetWidthMm/1000)/sfY
+        const count = Math.max(1, Math.ceil(stripeInfo.dirLenPx/eaveLenPxPerSheet - 1e-6))
+        const uniformLenM = parseFloat((stripeInfo.perpLenPx*sfY*fac).toFixed(3))
+        sheets = Array.from({length:count},(_,i)=>{
+          const d0 = stripeInfo.dirMin + i*eaveLenPxPerSheet
+          const p1 = { x:d0*stripeInfo.dir.x+stripeInfo.perpMin*stripeInfo.perp.x, y:d0*stripeInfo.dir.y+stripeInfo.perpMin*stripeInfo.perp.y }
+          const p2 = { x:d0*stripeInfo.dir.x+stripeInfo.perpMax*stripeInfo.perp.x, y:d0*stripeInfo.dir.y+stripeInfo.perpMax*stripeInfo.perp.y }
+          return {
+            id: uid(), planeId: sec.id,
+            manufacturer: sec.materialLabel||"", material: sec.materialLabel||"",
+            coverWidthMm: sheetWidthMm,
+            lengthM: uniformLenM,
+            startPoint: unsquash(p1), endPoint: unsquash(p2),
+            installationOrder: i+1,
+          }
+        })
+      } else {
+        sheets = stripeInfo.stripes.map((s,i)=>({
+          id: s.id, planeId: sec.id,
+          manufacturer: sec.materialLabel||"", material: sec.materialLabel||"",
+          coverWidthMm: sheetWidthMm,
+          lengthM: parseFloat((s.lengthPx*sfY*fac).toFixed(3)),
+          startPoint: unsquash(s.startPoint), endPoint: unsquash(s.endPoint),
+          installationOrder: i+1,
+        }))
+      }
+      const sheet_lengths_m = sheets.map(s=>s.lengthM)
+      // ← Perimeter/longest edge/centroid: available as soon as the
+      //   polygon closes, independent of pitch — matches how a roof
+      //   plane's flat geometry is known before its slope is assigned.
+      const perimeter_m = sec.closed ? parseFloat((linelenPx([...sqPts, sqPts[0]])*sfY).toFixed(2)) : 0
+      // ← Centroid stays in true (unsquashed) photo pixel space — it's used
+      //   for canvas label placement, not a real-world measurement.
+      const centroid = sec.pts.length ? {
+        x: sec.pts.reduce((a,p)=>a+p.x,0)/sec.pts.length,
+        y: sec.pts.reduce((a,p)=>a+p.y,0)/sec.pts.length,
+      } : null
       return {
         id:sec.id, name:sec.name, pitch:sec.pitch,
         shape_points:sec.pts,
+        pitchUnknown,
         footprint_m2: parseFloat(fp.toFixed(2)),
-        surface_m2:   parseFloat((fp*fac).toFixed(2)),
-        pitchFactor:  parseFloat(fac.toFixed(3)),
+        surface_m2:   pitchUnknown ? null : parseFloat((fp*fac).toFixed(2)),
+        pitchFactor:  pitchUnknown ? null : parseFloat(fac.toFixed(3)),
+        perimeter_m,
+        longestEdge_m: parseFloat((stripeInfo.longestEdgePx*sfY).toFixed(2)),
+        centroid,
         materialLabel: sec.materialLabel||"", rate: sec.rate||0,
         sheetWidthMm,
-        pitchAngleDeg: angleDeg,
+        isUniformPlane,
+        // ← Raw manual override (distinct from pitchAngleDeg below, which
+        //   is the *resolved* direction whether from this override or
+        //   auto-detection) — without exposing it here, initialSectionsFrom
+        //   has nothing to restore and a manual Cut Angle silently reverts
+        //   to auto-detected on remount.
+        cutAngleDeg: sec.cutAngleDeg ?? null,
+        pitchAngleDeg: trueAngleDeg,
         sheet_count: stripeInfo.count,
+        sheets,
         sheet_lengths_m,
         sheet_length_m: sheet_lengths_m.length ? Math.max(...sheet_lengths_m) : 0,
         sheetsTooMany: !!stripeInfo.tooMany,
         edges:[]
       }
     })
-    const flashings = lineItems.filter(l=>l.type==="flashing").map(l=>({...l,length_m:parseFloat((linelenPx(l.pts)*sf).toFixed(2))}))
-    const gutters   = lineItems.filter(l=>l.type==="gutter").map(l=>({...l,length_m:parseFloat((linelenPx(l.pts)*sf).toFixed(2))}))
+    const flashings = lineItems.filter(l=>l.type==="flashing").map(l=>({...l,length_m:parseFloat((linelenPx(squash(l.pts))*sfY).toFixed(2))}))
+    const gutters   = lineItems.filter(l=>l.type==="gutter").map(l=>({...l,length_m:parseFloat((linelenPx(squash(l.pts))*sfY).toFixed(2))}))
     const downpipes = ptItems.filter(p=>p.type==="downpipe")
     const drains    = ptItems.filter(p=>p.type==="drain")
     const pens      = ptItems.filter(p=>p.type==="penetration")
@@ -839,13 +1106,19 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       flashingBySubtype,
       flashingMaterialBySubtype,
       asbestos,
-      scale_m_per_px: parseFloat(sf.toFixed(6)),
+      // ← Raw reference lines (not just the averaged scale_m_per_px below) —
+      //   without this, initialScaleLinesFrom has nothing to restore and
+      //   the visible calibration lines vanish on remount, even though the
+      //   scale factor itself survives via the scale_m_per_px fallback.
+      scaleLines,
+      scale_m_per_px: parseFloat(sfIso.toFixed(6)),
+      axisScale,
       total_footprint_m2: parseFloat(processedSections.reduce((a,sec)=>a+sec.footprint_m2,0).toFixed(2)),
-      total_surface_m2:   parseFloat(processedSections.reduce((a,sec)=>a+sec.surface_m2,0).toFixed(2)),
+      total_surface_m2:   parseFloat(processedSections.reduce((a,sec)=>a+(sec.surface_m2||0),0).toFixed(2)),
       total_flashing_m:   parseFloat(flashings.reduce((a,f)=>a+f.length_m,0).toFixed(2)),
       total_gutter_m:     parseFloat(gutters.reduce((a,g)=>a+g.length_m,0).toFixed(2)),
     }
-  },[sections,lineItems,ptItems,asbestos,mPerPx])
+  },[sections,lineItems,ptItems,asbestos,mPerPx,scaleLines,axisScale])
 
   useEffect(()=>{ onGeometryChange?.(geometry) },[geometry, onGeometryChange])
 
@@ -906,7 +1179,62 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     if(selection.lines.length)    setLineItems(prev=>prev.filter(l=>!selection.lines.includes(l.id)))
     if(selection.points.length)   setPtItems(prev=>prev.filter(p=>!selection.points.includes(p.id)))
     if(selection.scale)           setScaleLine(null)
-    setSelection({ sections:[], lines:[], points:[], scale:false })
+    if(selection.scaleLineIds.length) setScaleLines(prev=>prev.filter(l=>!selection.scaleLineIds.includes(l.id)))
+    setSelection({ sections:[], lines:[], points:[], scale:false, scaleLineIds:[] })
+  }
+
+  // Snapshots the currently-selected sections/lines/points (their full
+  // geometry + attributes, not an image) into shapeClipboard, ready for
+  // pasteShapes() to duplicate. Scale-calibration lines aren't copyable —
+  // there should only ever be one calibration, not duplicates of it.
+  function copySelectedShapes() {
+    const copiedSections = sections.filter(s=>selection.sections.includes(s.id))
+    const copiedLines    = lineItems.filter(l=>selection.lines.includes(l.id))
+    const copiedPoints   = ptItems.filter(p=>selection.points.includes(p.id))
+    if(!copiedSections.length && !copiedLines.length && !copiedPoints.length) return
+    setShapeClipboard({ sections: copiedSections, lines: copiedLines, points: copiedPoints })
+    setShapeCopyMsg("Copied!")
+    setTimeout(()=>setShapeCopyMsg(""), 2000)
+  }
+
+  // Duplicates whatever's in shapeClipboard onto the canvas, translated so
+  // the copied shapes' centroid lands on `worldPt` (the right-click/paste
+  // location) — or offset a fixed amount from the originals when pasted via
+  // Ctrl+V with no specific target point. Fresh ids throughout so the
+  // duplicate is a fully independent, separately-editable shape.
+  function pasteShapes(worldPt) {
+    if(!shapeClipboard) return
+    const { sections: cSections, lines: cLines, points: cPoints } = shapeClipboard
+    const allPts = [
+      ...cSections.flatMap(s=>s.pts),
+      ...cLines.flatMap(l=>l.pts),
+      ...cPoints.map(p=>({x:p.x, y:p.y})),
+    ]
+    if(!allPts.length) return
+    const cx = allPts.reduce((a,p)=>a+p.x,0) / allPts.length
+    const cy = allPts.reduce((a,p)=>a+p.y,0) / allPts.length
+    const dx = worldPt ? worldPt.x - cx : 20
+    const dy = worldPt ? worldPt.y - cy : 20
+
+    pushHistory()
+    const newSections = cSections.map(s=>({ ...s, id: uid(), pts: s.pts.map(p=>({x:p.x+dx,y:p.y+dy})) }))
+    const newLines    = cLines.map(l=>({ ...l, id: uid(), pts: l.pts.map(p=>({x:p.x+dx,y:p.y+dy})) }))
+    const newPoints   = cPoints.map(p=>({ ...p, id: uid(), x:p.x+dx, y:p.y+dy }))
+    if(newSections.length) setSections(prev=>[...prev, ...newSections])
+    if(newLines.length)    setLineItems(prev=>[...prev, ...newLines])
+    if(newPoints.length)   setPtItems(prev=>[...prev, ...newPoints])
+
+    // Select the freshly-pasted copy so it's immediately obvious what
+    // happened, and ready to drag into its final position right away.
+    setActiveTool("select")
+    setSelection({
+      sections: newSections.map(s=>s.id),
+      lines:    newLines.map(l=>l.id),
+      points:   newPoints.map(p=>p.id),
+      scale: false, scaleLineIds: [],
+    })
+    setShapeCopyMsg("Pasted!")
+    setTimeout(()=>setShapeCopyMsg(""), 2000)
   }
 
   // Delete/Backspace removes the current marquee selection (Select tool only)
@@ -919,6 +1247,26 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     window.addEventListener("keydown", onKeyDown)
     return ()=>window.removeEventListener("keydown", onKeyDown)
   },[activeTool, selection])
+
+  // Ctrl/Cmd+C copies the current Select-tool selection's geometry (not an
+  // image) into shapeClipboard; Ctrl/Cmd+V pastes a duplicate centered on
+  // the last-known cursor position (hoverPt). Ctrl+C only intercepted when
+  // something is actually selected, so normal text copy elsewhere on the
+  // page (e.g. in an input) isn't hijacked.
+  useEffect(()=>{
+    function onKeyDown(e){
+      const tag = e.target?.tagName
+      if(tag==="INPUT" || tag==="TEXTAREA" || tag==="SELECT") return
+      const key = e.key.toLowerCase()
+      if((e.ctrlKey||e.metaKey) && key==="c" && selectionCount>0){
+        e.preventDefault(); copySelectedShapes()
+      } else if((e.ctrlKey||e.metaKey) && key==="v" && shapeClipboard){
+        e.preventDefault(); pasteShapes(hoverPt)
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return ()=>window.removeEventListener("keydown", onKeyDown)
+  },[selection, selectionCount, shapeClipboard, hoverPt, sections, lineItems, ptItems])
 
   // Ctrl/Cmd+Z undoes the last point/line/action; Ctrl/Cmd+Shift+Z or
   // Ctrl+Y redoes it — skipped while typing in a field (e.g. the
@@ -939,24 +1287,66 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     return ()=>window.removeEventListener("keydown", onKeyDown)
   },[])
 
+  // Escape dismisses the Flashing/Gutter "New Line / Stop" popup, or the
+  // right-click "Paste" popup, without taking any action.
+  useEffect(()=>{
+    if(!lineContextMenu && !pastePopup) return
+    function onKeyDown(e){ if(e.key==="Escape"){ setLineContextMenu(null); setPastePopup(null) } }
+    window.addEventListener("keydown", onKeyDown)
+    return ()=>window.removeEventListener("keydown", onKeyDown)
+  },[lineContextMenu, pastePopup])
+
   const drawCanvas = useCallback(()=>{
     const cv=canvasRef.current; if(!cv)return
     const ctx=cv.getContext("2d")
     ctx.setTransform(1,0,0,1,0,0)
     ctx.clearRect(0,0,cv.width,cv.height)
     ctx.save()
+    // ← Backing store is now sized to the canvas's actual displayed CSS size
+    //   × devicePixelRatio (see the resize effect below), not the fixed
+    //   MT_CANVAS_W×MT_CANVAS_H logical size — this scale maps everything
+    //   drawn below (still in that same 0..MT_CANVAS_W/0..MT_CANVAS_H space)
+    //   onto the full higher-resolution backing store instead of a small
+    //   bitmap that the browser would otherwise blur while upscaling.
+    const dprScale = cv.width / MT_CANVAS_W
+    ctx.scale(dprScale, dprScale)
     ctx.translate(view.offX, view.offY)
     ctx.scale(view.zoom, view.zoom)
     const lw = px=>px/view.zoom // keep stroke/point sizes visually constant across zoom levels
     const sf = mPerPx || 0.05
+    // ← One tick + total-length label at the very end of a Draw/Flashing/
+    //   Gutter line (traced or still in-progress) — a repeated label at
+    //   every whole metre reads cluttered/unprofessional in front of a
+    //   client, so only the final measurement is shown, same as a normal
+    //   dimension annotation.
+    const drawMeterTicks = (pts) => {
+      if(pts.length<2 || sf<=0) return
+      const totalLenM = linelenPx(pts)*sf
+      if(totalLenM<0.05) return
+      const end=pts[pts.length-1], prev=pts[pts.length-2]
+      const segLen = Math.hypot(end.x-prev.x, end.y-prev.y)
+      const dir = segLen>0 ? {x:(end.x-prev.x)/segLen,y:(end.y-prev.y)/segLen} : {x:1,y:0}
+      const perp = { x:-dir.y, y:dir.x }
+      ctx.strokeStyle="rgba(255,255,255,0.85)"; ctx.lineWidth=lw(1.5)
+      ctx.beginPath()
+      ctx.moveTo(end.x-perp.x*lw(5), end.y-perp.y*lw(5))
+      ctx.lineTo(end.x+perp.x*lw(5), end.y+perp.y*lw(5))
+      ctx.stroke()
+      const label = `${totalLenM.toFixed(2)}m`
+      const lx = end.x+perp.x*lw(11), ly = end.y+perp.y*lw(11)
+      ctx.font=`600 ${8/view.zoom}px DM Sans`; ctx.textAlign="center"; ctx.textBaseline="middle"
+      const boxW = ctx.measureText(label).width+lw(6), boxH=lw(11)
+      ctx.fillStyle="rgba(15,23,42,0.75)"
+      try{ ctx.beginPath(); ctx.roundRect(lx-boxW/2, ly-boxH/2, boxW, boxH, lw(3)); ctx.fill() }
+      catch{ ctx.fillRect(lx-boxW/2, ly-boxH/2, boxW, boxH) }
+      ctx.fillStyle="#fff"
+      ctx.fillText(label, lx, ly)
+    }
 
     if(imgRef.current){ ctx.drawImage(imgRef.current,0,0,MT_CANVAS_W,MT_CANVAS_H) }
     else{
-      ctx.fillStyle="#1e293b"; ctx.fillRect(0,0,MT_CANVAS_W,MT_CANVAS_H)
-      ctx.strokeStyle="rgba(255,255,255,0.04)"; ctx.lineWidth=lw(1)
-      for(let x=0;x<MT_CANVAS_W;x+=20){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,MT_CANVAS_H);ctx.stroke()}
-      for(let y=0;y<MT_CANVAS_H;y+=20){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(MT_CANVAS_W,y);ctx.stroke()}
-      ctx.fillStyle="rgba(255,255,255,0.09)"; ctx.font=`${12/view.zoom}px DM Sans`; ctx.textAlign="center"
+      ctx.fillStyle="#fff"; ctx.fillRect(0,0,MT_CANVAS_W,MT_CANVAS_H)
+      ctx.fillStyle="rgba(15,23,42,0.35)"; ctx.font=`${12/view.zoom}px DM Sans`; ctx.textAlign="center"
       ctx.fillText("Upload a roof photo or aerial image above",MT_CANVAS_W/2,MT_CANVAS_H/2-10)
       ctx.fillText("then click to trace sections, flashings & accessories",MT_CANVAS_W/2,MT_CANVAS_H/2+10)
     }
@@ -970,15 +1360,20 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       sec.pts.forEach(p=>ctx.lineTo(p.x,p.y))
       if(sec.closed) ctx.closePath()
       ctx.stroke()
-      if(sec.closed){ctx.fillStyle=col+"2a";ctx.fill()}
+      // ← Same metre tick marks as Flashing/Gutter — include the closing
+      //   edge (back to the first point) for a closed section so the
+      //   ticks wrap all the way around the outline, not just the open path.
+      drawMeterTicks(sec.closed ? [...sec.pts, sec.pts[0]] : sec.pts)
+
+      const gs=geometry.sections[idx]
 
       // ← Pre-compute the name/area label's footprint here (before stripes
       //   are drawn below) so stripe-length pills can be skipped wherever
       //   they'd sit under that label instead of overlapping it.
       let nameRect=null
       if(sec.closed){
-        const cx0=sec.pts.reduce((a,p)=>a+p.x,0)/sec.pts.length
-        const cy0=sec.pts.reduce((a,p)=>a+p.y,0)/sec.pts.length
+        const cx0=gs?.centroid?.x ?? sec.pts.reduce((a,p)=>a+p.x,0)/sec.pts.length
+        const cy0=gs?.centroid?.y ?? sec.pts.reduce((a,p)=>a+p.y,0)/sec.pts.length
         const fontPx0 = 9/view.zoom
         ctx.font=`bold ${fontPx0}px DM Sans`; ctx.textAlign="center"
         const label0 = sec.name||`Sec ${idx+1}`
@@ -1004,28 +1399,25 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         nameRect = { x1:cx0-boxW0/2-lw(6), y1:cy0-boxH0/2-lw(6), x2:cx0+boxW0/2+lw(6), y2:cy0+boxH0/2+lw(16) }
       }
 
-      if(sec.closed && sec.pts.length>=3){
-        const sheetWidthPx = ((sec.sheetWidthMm||762)/1000)/sf
-        const stripeAngle = sec.cutAngleDeg ?? sectionAngleDeg(sec.pitch)
-        const { stripes } = sectionStripeInfo(sec.pts, sheetWidthPx, stripeAngle)
-        if(stripes.length){
+      if(sec.closed && sec.pts.length>=3 && gs?.sheets?.length){
+        const sheets = gs.sheets
+        {
           ctx.save()
           ctx.beginPath(); ctx.moveTo(sec.pts[0].x,sec.pts[0].y)
           sec.pts.forEach(p=>ctx.lineTo(p.x,p.y))
           ctx.closePath(); ctx.clip()
-          ctx.strokeStyle="rgba(255,255,255,0.5)"; ctx.lineWidth=lw(1)
+          ctx.strokeStyle="rgba(15,23,42,0.6)"; ctx.lineWidth=lw(1)
           ctx.setLineDash([lw(3),lw(3)])
-          stripes.forEach(s=>{ ctx.beginPath(); ctx.moveTo(s.p1.x,s.p1.y); ctx.lineTo(s.p2.x,s.p2.y); ctx.stroke() })
+          sheets.forEach(s=>{ ctx.beginPath(); ctx.moveTo(s.startPoint.x,s.startPoint.y); ctx.lineTo(s.endPoint.x,s.endPoint.y); ctx.stroke() })
           ctx.setLineDash([])
           ctx.restore()
 
-          // ── per-stripe length pill, anchored near the top of each cut so
+          // ── per-sheet length pill, anchored near the top of each cut so
           //   it doesn't collide with the section-name box in the middle ──
-          const fac = parsePitch(sec.pitch||"1.15")
           const inRect = (x,y) => nameRect && x>=nameRect.x1 && x<=nameRect.x2 && y>=nameRect.y1 && y<=nameRect.y2
-          stripes.forEach(s=>{
-            const top = s.p1.y<=s.p2.y ? s.p1 : s.p2
-            const bot = s.p1.y<=s.p2.y ? s.p2 : s.p1
+          sheets.forEach(s=>{
+            const top = s.startPoint.y<=s.endPoint.y ? s.startPoint : s.endPoint
+            const bot = s.startPoint.y<=s.endPoint.y ? s.endPoint : s.startPoint
             // ← Try near the top first; if that spot sits under the name
             //   label, try progressively further down the stripe instead
             //   of drawing on top of it. Skip the label entirely if every
@@ -1037,8 +1429,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
             const ay = top.y + (bot.y-top.y)*t
             let ang = Math.atan2(bot.y-top.y, bot.x-top.x)
             if(ang>Math.PI/2) ang-=Math.PI; else if(ang<-Math.PI/2) ang+=Math.PI
-            const lenM = Math.hypot(s.p2.x-s.p1.x,s.p2.y-s.p1.y)*sf*fac
-            const label = `${lenM.toFixed(2)}m`
+            const label = `${s.lengthM.toFixed(2)}m`
             ctx.save()
             ctx.translate(ax,ay); ctx.rotate(ang)
             const fontPx=9/view.zoom
@@ -1063,8 +1454,8 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         ctx.strokeStyle=editMode?"#fff88f":col; ctx.lineWidth=lw(editMode?2.5:1.5); ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?5:3),0,Math.PI*2); ctx.stroke()
       })
       if(sec.closed){
-        const cx=sec.pts.reduce((a,p)=>a+p.x,0)/sec.pts.length
-        const cy=sec.pts.reduce((a,p)=>a+p.y,0)/sec.pts.length
+        const cx=gs?.centroid?.x ?? sec.pts.reduce((a,p)=>a+p.x,0)/sec.pts.length
+        const cy=gs?.centroid?.y ?? sec.pts.reduce((a,p)=>a+p.y,0)/sec.pts.length
         // ← Once a brand is picked, sec.name is the full supplier/product
         //   string (can be long) instead of "Section N" — word-wrapped onto
         //   several smaller lines (canvas text doesn't wrap on its own) so
@@ -1108,10 +1499,9 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           ctx.fillText(line,cx,firstLineY+li*lineH)
         })
         ctx.textBaseline="alphabetic"
-        const gs=geometry.sections[idx]
-        if(gs?.surface_m2){
+        if(gs?.pitchUnknown || gs?.surface_m2){
           ctx.font=`bold ${9/view.zoom}px DM Sans`
-          const areaLabel = gs.surface_m2+" m²"
+          const areaLabel = gs.pitchUnknown ? "⚠ Pitch not set" : gs.surface_m2+" m²"
           const areaY = cy+boxH/2+lw(11)
           ctx.lineWidth=lw(2.5)
           ctx.strokeText(areaLabel,cx,areaY)
@@ -1145,6 +1535,11 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       drawPts.forEach(p=>ctx.lineTo(p.x,p.y))
       if(hoverPt) ctx.lineTo(isClosing?drawPts[0].x:hoverPt.x, isClosing?drawPts[0].y:hoverPt.y)
       ctx.stroke(); ctx.setLineDash([])
+      // ← Live tick marks while still tracing — same treatment as
+      //   Flashing/Gutter, following the same endpoint the preview line
+      //   itself uses (snapped to the start point while closing).
+      if(hoverPt) drawMeterTicks([...drawPts, isClosing?drawPts[0]:hoverPt])
+      else drawMeterTicks(drawPts)
       drawPts.forEach((p,i)=>{
         ctx.fillStyle=i===0?col:"#fff"; ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?6:3.5),0,Math.PI*2); ctx.fill()
         if(i===0){
@@ -1166,15 +1561,19 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         ctx.fillStyle=li.type==="flashing"?"#f59e0b":"#06b6d4";ctx.beginPath();ctx.arc(p.x,p.y,lw(3),0,Math.PI*2);ctx.fill()
         if(editMode){ ctx.strokeStyle="#fff88f"; ctx.lineWidth=lw(1.5); ctx.beginPath(); ctx.arc(p.x,p.y,lw(5),0,Math.PI*2); ctx.stroke() }
       })
+      if(li.type==="flashing"||li.type==="gutter") drawMeterTicks(li.pts)
     })
 
     if((activeTool==="flashing"||activeTool==="gutter")&&drawPts.length>0){
       const col=activeTool==="flashing"?"#f59e0b":"#06b6d4"
       ctx.strokeStyle=col; ctx.lineWidth=lw(2.5); ctx.setLineDash(activeTool==="flashing"?[lw(8),lw(4)]:[lw(4),lw(2)])
-      ctx.beginPath(); ctx.moveTo(drawPts[0].x,drawPts[0].y)
-      drawPts.forEach(p=>ctx.lineTo(p.x,p.y))
-      if(hoverPt) ctx.lineTo(hoverPt.x,hoverPt.y)
+      const previewPts = hoverPt ? [...drawPts, hoverPt] : drawPts
+      ctx.beginPath(); ctx.moveTo(previewPts[0].x,previewPts[0].y)
+      previewPts.forEach(p=>ctx.lineTo(p.x,p.y))
       ctx.stroke(); ctx.setLineDash([])
+      // ← Live tick marks while still drawing — so the metre count is
+      //   visible as the run is being traced, not only after Done ✓.
+      drawMeterTicks(previewPts)
     }
 
     ptItems.forEach(pi=>{
@@ -1197,24 +1596,35 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       }
     })
 
+    const tick=p=>{ctx.beginPath();ctx.moveTo(p.x,p.y-lw(8));ctx.lineTo(p.x,p.y+lw(8));ctx.stroke()}
+    const drawScaleLabel=(p1,p2,text)=>{
+      const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2
+      ctx.fillStyle="#10b981"
+      try{ctx.beginPath();ctx.roundRect(mx-lw(22),my-lw(10),lw(44),lw(16),lw(4));ctx.fill()}catch{ctx.fillRect(mx-lw(22),my-lw(10),lw(44),lw(16))}
+      ctx.fillStyle="#fff"; ctx.font=`bold ${10/view.zoom}px DM Sans`; ctx.textAlign="center"
+      ctx.fillText(text,mx,my+lw(1))
+    }
+    // ← Every confirmed calibration reference is drawn, not just the most
+    //   recent one — a photo can carry several known dimensions.
+    scaleLines.forEach(l=>{
+      ctx.strokeStyle="#10b981"; ctx.lineWidth=lw(2.5); ctx.setLineDash([])
+      ctx.beginPath(); ctx.moveTo(l.p1.x,l.p1.y); ctx.lineTo(l.p2.x,l.p2.y); ctx.stroke()
+      tick(l.p1); tick(l.p2)
+      drawScaleLabel(l.p1,l.p2,`${l.knownM}m`)
+    })
     if(scaleLine?.p1){
       ctx.strokeStyle="#10b981"; ctx.lineWidth=lw(2.5); ctx.setLineDash([])
       ctx.beginPath(); ctx.moveTo(scaleLine.p1.x,scaleLine.p1.y)
       const p2=scaleLine.p2||(activeTool==="scale"?hoverPt:null)
       if(p2) ctx.lineTo(p2.x,p2.y)
       ctx.stroke()
-      const tick=p=>{ctx.beginPath();ctx.moveTo(p.x,p.y-lw(8));ctx.lineTo(p.x,p.y+lw(8));ctx.stroke()}
       tick(scaleLine.p1)
       if(scaleLine.p2){
         tick(scaleLine.p2)
-        const mx=(scaleLine.p1.x+scaleLine.p2.x)/2,my=(scaleLine.p1.y+scaleLine.p2.y)/2
-        ctx.fillStyle="#10b981"
-        try{ctx.beginPath();ctx.roundRect(mx-lw(22),my-lw(10),lw(44),lw(16),lw(4));ctx.fill()}catch{ctx.fillRect(mx-lw(22),my-lw(10),lw(44),lw(16))}
-        ctx.fillStyle="#fff"; ctx.font=`bold ${10/view.zoom}px DM Sans`; ctx.textAlign="center"
-        // While the calibration modal is still open, knownM is last
-        // session's value, not this line's — show a placeholder instead of
-        // a number that looks like it's already been measured/confirmed.
-        ctx.fillText(calibModalOpen ? "? m" : knownM+"m",mx,my+lw(1))
+        // Still being confirmed in the modal — no length known yet for
+        // this specific line, so show a placeholder rather than a number
+        // that looks like it's already been measured.
+        drawScaleLabel(scaleLine.p1,scaleLine.p2,"? m")
       }
     }
 
@@ -1225,13 +1635,15 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       ctx.setLineDash([])
     }
 
-    // ── Marquee-selected items get a dashed red bounding-box highlight ──
+    // ── Marquee-selected items get a dashed bounding-box highlight — blue,
+    //    not red, so a freshly-pasted (auto-selected) shape doesn't read as
+    //    "about to be deleted" the way the red Delete Selected button does.
     if(selectionCount>0){
       const bboxOf = pts => ({
         x1:Math.min(...pts.map(p=>p.x)), y1:Math.min(...pts.map(p=>p.y)),
         x2:Math.max(...pts.map(p=>p.x)), y2:Math.max(...pts.map(p=>p.y)),
       })
-      ctx.strokeStyle="#ef4444"; ctx.lineWidth=lw(2); ctx.setLineDash([lw(5),lw(3)])
+      ctx.strokeStyle="#3b82f6"; ctx.lineWidth=lw(2); ctx.setLineDash([lw(5),lw(3)])
       sections.filter(s=>selection.sections.includes(s.id)).forEach(sec=>{
         const b=bboxOf(sec.pts)
         ctx.strokeRect(b.x1-lw(6),b.y1-lw(6),(b.x2-b.x1)+lw(12),(b.y2-b.y1)+lw(12))
@@ -1247,10 +1659,14 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         const b=bboxOf([scaleLine.p1,scaleLine.p2])
         ctx.strokeRect(b.x1-lw(6),b.y1-lw(6),(b.x2-b.x1)+lw(12),(b.y2-b.y1)+lw(12))
       }
+      scaleLines.filter(l=>selection.scaleLineIds.includes(l.id)).forEach(l=>{
+        const b=bboxOf([l.p1,l.p2])
+        ctx.strokeRect(b.x1-lw(6),b.y1-lw(6),(b.x2-b.x1)+lw(12),(b.y2-b.y1)+lw(12))
+      })
       ctx.setLineDash([])
     }
 
-    // ── Active marquee drag ──────────────────────────────────────────────
+    // ── Active marquee drag (Select tool) ───
     if(selectBox){
       const x1=Math.min(selectBox.start.x,selectBox.current.x), x2=Math.max(selectBox.start.x,selectBox.current.x)
       const y1=Math.min(selectBox.start.y,selectBox.current.y), y2=Math.max(selectBox.start.y,selectBox.current.y)
@@ -1261,9 +1677,35 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
 
     ctx.restore()
-  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,knownM,calibModalOpen,geometry,imgSrc,view,editMode,selection,selectionCount,selectBox,mPerPx])
+  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,scaleLines,knownM,calibModalOpen,geometry,imgSrc,view,editMode,selection,selectionCount,selectBox,mPerPx])
 
   useEffect(()=>{ drawCanvas() },[drawCanvas])
+
+  // ← The canvas is displayed at whatever width its responsive container
+  //   gives it (CSS `width:100%!important` in index.css), but its backing
+  //   store defaults to a fixed MT_CANVAS_W×MT_CANVAS_H bitmap — on any
+  //   viewport wider than that, the browser upscales that small bitmap to
+  //   fill the space, which blurs both the traced photo and the drawn
+  //   overlay. Resizing the backing store to match the actual displayed
+  //   size × devicePixelRatio (capped at 2x to bound redraw cost) fixes
+  //   that; drawCanvas compensates with one extra uniform scale so every
+  //   existing coordinate (points, hit-testing, geometry) still works in
+  //   the same logical 0..MT_CANVAS_W / 0..MT_CANVAS_H space as before.
+  useLayoutEffect(()=>{
+    const cv = canvasRef.current
+    if(!cv) return
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    const resize = () => {
+      const rect = cv.getBoundingClientRect()
+      if(rect.width<=0 || rect.height<=0) return
+      const w = Math.round(rect.width*dpr), h = Math.round(rect.height*dpr)
+      if(cv.width!==w || cv.height!==h){ cv.width=w; cv.height=h; drawCanvas() }
+    }
+    resize()
+    const ro = new ResizeObserver(resize)
+    ro.observe(cv)
+    return () => ro.disconnect()
+  },[drawCanvas])
 
   // ── Hit-testing for editable points ──────────────────────────────────
   function findHit(pt) {
@@ -1282,6 +1724,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
     if(scaleLine?.p1 && Math.hypot(scaleLine.p1.x-pt.x, scaleLine.p1.y-pt.y) <= HIT_RADIUS) return { kind:"scale", which:"p1" }
     if(scaleLine?.p2 && Math.hypot(scaleLine.p2.x-pt.x, scaleLine.p2.y-pt.y) <= HIT_RADIUS) return { kind:"scale", which:"p2" }
+    for(const l of scaleLines){
+      if(Math.hypot(l.p1.x-pt.x, l.p1.y-pt.y) <= HIT_RADIUS) return { kind:"scaleRef", id:l.id, which:"p1" }
+      if(Math.hypot(l.p2.x-pt.x, l.p2.y-pt.y) <= HIT_RADIUS) return { kind:"scaleRef", id:l.id, which:"p2" }
+    }
     return null
   }
 
@@ -1316,6 +1762,8 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       setPtItems(prev=>prev.map(pi=> pi.id!==hit.id ? pi : { ...pi, x:pt.x, y:pt.y }))
     } else if(hit.kind==="scale"){
       setScaleLine(prev=> prev ? { ...prev, [hit.which]: pt } : prev)
+    } else if(hit.kind==="scaleRef"){
+      setScaleLines(prev=>prev.map(l=> l.id!==hit.id ? l : { ...l, [hit.which]: pt }))
     }
   }
 
@@ -1405,9 +1853,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           lines:    lineItems.filter(li=>li.pts.some(inBox)).map(l=>l.id),
           points:   ptItems.filter(inBox).map(p=>p.id),
           scale:    !!(scaleLine?.p1 && scaleLine?.p2 && (inBox(scaleLine.p1) || inBox(scaleLine.p2))),
+          scaleLineIds: scaleLines.filter(l=>inBox(l.p1) || inBox(l.p2)).map(l=>l.id),
         })
       } else {
-        setSelection({ sections:[], lines:[], points:[], scale:false })
+        setSelection({ sections:[], lines:[], points:[], scale:false, scaleLineIds:[] })
       }
       setSelectBox(null)
     }
@@ -1432,7 +1881,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         const fp=drawPts[0], d=Math.hypot(pt.x-fp.x,pt.y-fp.y)
         if(d<15){
           const newId = uid()
-          setSections(prev=>[...prev,{id:newId,name:`Section ${prev.length+1}`,pts:drawPts,closed:true,pitch:"1.15",color:SEC_COLORS[prev.length%SEC_COLORS.length],materialLabel:"",rate:0,sheetWidthMm:762,cutAngleDeg:null}])
+          setSections(prev=>[...prev,{id:newId,name:`Section ${prev.length+1}`,pts:drawPts,closed:true,pitch:null,color:SEC_COLORS[prev.length%SEC_COLORS.length],materialLabel:"",rate:0,sheetWidthMm:762,cutAngleDeg:null}])
           setDrawPts([])
           // ← Prompt for this section's pitch, then its roof sheet brand,
           //   right away while the roofer is still looking at it, instead
@@ -1469,7 +1918,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       setDrawPts([])
     }
     else if((activeTool==="flashing"||activeTool==="gutter") && drawPts.length>=2) {
-      finishLine() // same as clicking "Done ✓"
+      setLineContextMenu({ x:e.clientX, y:e.clientY })
     }
     else if((activeTool==="flashing"||activeTool==="gutter") && drawPts.length>0) {
       // fewer than 2 points — not enough to save a line, just cancel it
@@ -1478,6 +1927,11 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     else if(activeTool==="scale" && scaleLine?.p1 && !scaleLine?.p2) {
       // cancel an in-progress scale line
       setScaleLine(null)
+    }
+    // Nothing else claimed this right-click — if there's a copied shape
+    // waiting, offer to paste it right here instead of showing nothing.
+    else if(shapeClipboard) {
+      setPastePopup({ x:e.clientX, y:e.clientY, worldPt: getWorldPt(e.clientX, e.clientY) })
     }
   }
 
@@ -1499,17 +1953,20 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   function clearAll(){
     pushHistory()
     setSections([]); setLineItems([]); setPtItems([])
-    setScaleLine(null); setDrawPts([]); setAsbestos(false)
-    setSelection({sections:[],lines:[],points:[],scale:false}); setSelectBox(null)
+    setScaleLine(null); setScaleLines([]); setDrawPts([]); setAsbestos(false)
+    setSelection({sections:[],lines:[],points:[],scale:false,scaleLineIds:[]}); setSelectBox(null)
     resetView()
   }
 
   function applyCalibration(){
     const raw = parseFloat(calibInput)
-    if(!raw || raw<=0) return
+    if(!raw || raw<=0 || !scaleLine?.p1 || !scaleLine?.p2) return
     pushHistory()
     const toM = CALIB_UNITS.find(u=>u.key===calibUnit)?.toM ?? 1
-    setKnownM(raw*toM)
+    const value = raw*toM
+    setScaleLines(prev=>[...prev, { id:uid(), p1:scaleLine.p1, p2:scaleLine.p2, knownM:value }])
+    setKnownM(value) // pre-fills the next reference's modal with the last value typed, for convenience
+    setScaleLine(null)
     setCalibModalOpen(false)
   }
 
@@ -1534,6 +1991,15 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       const img=new Image()
       img.onload=()=>{imgRef.current=img;drawCanvas()}
       img.src=e.target.result; setImgSrc(e.target.result)
+      // ← A locally-uploaded photo only ever lived in this component's own
+      //   state, which React destroys when the wizard leaves the Measure
+      //   step (this component unmounts) — so navigating Measure → Estimate
+      //   → back to Measure showed a blank canvas even though the traced
+      //   sections themselves survived (those come from `initialGeometry`,
+      //   owned by the parent). Reporting the photo up the same way a
+      //   job-picked photo already is means the parent's `photoUrl` prop
+      //   restores it on remount instead of losing it.
+      onPhotoChange?.(e.target.result)
     }
     r.readAsDataURL(file)
   }
@@ -1551,18 +2017,19 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   },[photoUrl])
 
   const TOOLS=[
-    {key:"section",    label:"Roof Section",icon:"▲",color:"#3b82f6",hint:"Click to add points · click first point (⭕) to close · right-click to cancel"},
+    {key:"section",    label:"Draw",icon:"▲",color:"#3b82f6",hint:"Click to add points · click first point (⭕) to close · right-click to cancel"},
     {key:"flashing",   label:"Flashing",    icon:"⚡",color:"#f59e0b",hint:"Click points to trace · right-click or press Done ✓ to finish"},
     {key:"gutter",     label:"Gutter",      icon:"〰",color:"#06b6d4",hint:"Click points to trace · right-click or press Done ✓ to finish"},
     {key:"downpipe",   label:"Downpipe",    icon:"⬇",color:"#0ea5e9",hint:"Click canvas to place a downpipe (DP) marker"},
     {key:"drain",      label:"Roof Drain",  icon:"⊙",color:"#6366f1",hint:"Click canvas to place a roof drain (DR) marker"},
     {key:"penetration",label:"Penetration", icon:"◇",color:"#8b5cf6",hint:"Click to place — select type below"},
-    {key:"scale",      label:"Set Scale",   icon:"📏",color:"#10b981",hint:"Click two points over a known dimension · right-click to cancel"},
-    {key:"select",     label:"Select",      icon:"⬚",color:"#ef4444",hint:"Drag a box over items to select them · press Delete or click Delete Selected to remove"},
+    {key:"scale",      label:"Calibrate Image", icon:"📏",color:"#10b981",hint:"Click two points over a known dimension · right-click to cancel"},
+    {key:"select",     label:"Select",      icon:"⬚",color:"#ef4444",hint:"Drag a box over items to select them · Delete to remove · Ctrl+C to copy · Ctrl+V or right-click to paste a duplicate"},
     {key:"pan",        label:"Pan",         icon:"✋",color:"#64748b",hint:"Drag to pan the image (or hold Space with any tool)"},
   ]
 
-  const tip = isPanMode ? "Drag to pan · release Space to resume drawing" : (TOOLS.find(t=>t.key===activeTool)?.hint||"")
+  const tip = isPanMode ? "Drag to pan · release Space to resume drawing"
+    : (TOOLS.find(t=>t.key===activeTool)?.hint||"")
 
   return (
     <div>
@@ -1580,7 +2047,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           <div className="mt-toolbar" style={{display:"flex",alignItems:"center",gap:5,padding:"8px 10px",background:"#1e293b",flexWrap:"wrap"}}>
             {TOOLS.map(t=>(
               <button key={t.key}
-                onClick={()=>{setActiveTool(t.key);setDrawPts([]); if(t.key!=="select"){setSelection({sections:[],lines:[],points:[],scale:false});setSelectBox(null)}}}
+                onClick={()=>{setActiveTool(t.key);setDrawPts([]); if(t.key!=="select"){setSelection({sections:[],lines:[],points:[],scale:false,scaleLineIds:[]});setSelectBox(null)}}}
                 style={{padding:"5px 9px",borderRadius:6,
                   border:`1px solid ${activeTool===t.key?t.color:"rgba(255,255,255,0.14)"}`,
                   background:activeTool===t.key?t.color+"28":"transparent",
@@ -1623,10 +2090,20 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
             <span>{tip}{editMode && !isPanMode ? " · Edit mode: drag any highlighted point, or click a line to add a point" : ""}</span>
             <div style={{display:"flex",alignItems:"center",gap:8}}>
               {activeTool==="select"&&selectionCount>0&&(
+                <button onClick={copySelectedShapes}
+                  title="Copy the selected shape(s) — then press Ctrl+V or right-click anywhere to paste a duplicate"
+                  style={{padding:"5px 10px",borderRadius:6,border:`1px solid ${shapeCopyMsg?"#10b981":"#475569"}`,background:shapeCopyMsg?"#10b98122":"transparent",color:shapeCopyMsg?"#10b981":"#94a3b8",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:4}}>
+                  {shapeCopyMsg || `⧉ Copy (${selectionCount})`}
+                </button>
+              )}
+              {activeTool==="select"&&selectionCount>0&&(
                 <button onClick={deleteSelected}
                   style={{padding:"5px 10px",borderRadius:6,border:"1px solid #ef4444",background:"#ef444422",color:"#ef4444",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:4}}>
                   🗑 Delete Selected ({selectionCount})
                 </button>
+              )}
+              {activeTool==="select"&&!selectionCount&&shapeClipboard&&(
+                <span style={{fontSize:11,color:"#64748b"}}>Ctrl+V or right-click to paste</span>
               )}
               {activeTool==="penetration"&&(
                 <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
@@ -1655,8 +2132,15 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
             </div>
           </div>
 
+          {imgSrc && !mPerPx && (
+            <div style={{padding:"6px 12px",background:"#78350f",color:"#fde68a",fontSize:11,display:"flex",alignItems:"center",gap:6}}>
+              <span>⚠</span>
+              <span>This image has not been calibrated. Measurements are estimates until calibration is completed — use <strong>Calibrate Image</strong> above.</span>
+            </div>
+          )}
+
           <div className="mt-canvas-wrap">
-            <canvas ref={canvasRef} width={MT_CANVAS_W} height={MT_CANVAS_H}
+            <canvas ref={canvasRef}
               style={{cursor:isPanMode?(panRef.current?"grabbing":"grab"):(["section","flashing","gutter","scale","select"].includes(activeTool)?"crosshair":"cell")}}
               onMouseDown={handleMouseDown}
               onMouseMove={handleMouseMove}
@@ -1668,9 +2152,21 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           <div style={{padding:"7px 12px",background:"#0f172a",display:"flex",gap:14,alignItems:"center",flexWrap:"wrap"}}>
             <div style={{fontSize:11}}>
               <span style={{color:"#475569"}}>Scale: </span>
-              <span style={{color:mPerPx?"#10b981":"#f59e0b",fontWeight:600}}>
-                {mPerPx?`1px = ${(mPerPx*100).toFixed(1)}cm`:"Not calibrated (using 5cm/px default)"}
-              </span>
+              {geometry.axisScale ? (
+                <span style={{color:"#10b981",fontWeight:600}}>
+                  H: 1px = {(geometry.axisScale.x*100).toFixed(1)}cm · V: 1px = {(geometry.axisScale.y*100).toFixed(1)}cm
+                </span>
+              ) : (
+                <span style={{color:mPerPx?"#10b981":"#f59e0b",fontWeight:600}}>
+                  {mPerPx?`1px = ${(mPerPx*100).toFixed(1)}cm`:"Not calibrated (using 5cm/px default)"}
+                </span>
+              )}
+              {scaleLines.length>1 && (
+                <span style={{color:"#64748b"}}> · {scaleLines.length} references</span>
+              )}
+              {!geometry.axisScale && scaleSpreadPct!=null && scaleSpreadPct>5 && (
+                <span style={{color:"#ef4444",fontWeight:600}}> · ⚠ disagree by {scaleSpreadPct.toFixed(0)}% — double-check your measurements</span>
+              )}
             </div>
             <div style={{fontSize:11}}>
               <span style={{color:"#475569"}}>Surface area: </span>
@@ -1699,25 +2195,43 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                   </div>
                   <div style={{display:"flex",alignItems:"center",gap:6}}>
                     <span style={{fontSize:10,color:"#64748b",width:30,flexShrink:0}}>Pitch</span>
-                    <input value={sec.pitch}
-                      onChange={e=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,pitch:e.target.value}:x))}
-                      placeholder="4:12 or 30°"
+                    <input value={sec.pitch ?? ""}
+                      onChange={e=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,pitch:e.target.value||null}:x))}
+                      placeholder="Not set — 4:12 or 30°"
                       style={{width:62,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:4,fontSize:11,fontFamily:"inherit"}}/>
-                    <span style={{fontSize:10,color:"#94a3b8"}}>×{gs?.pitchFactor||1}</span>
+                    <span style={{fontSize:10,color:"#94a3b8"}}>{gs?.pitchUnknown ? "—" : `×${gs?.pitchFactor||1}`}</span>
                   </div>
                   <div style={{marginTop:5,fontSize:11,color:"#64748b",display:"flex",justifyContent:"space-between"}}>
                     <span>Plan: {gs?.footprint_m2||0} m²</span>
-                    <span style={{color:sec.color,fontWeight:700}}>Surf: {gs?.surface_m2||0} m²</span>
+                    <span style={{color:sec.color,fontWeight:700}}>Surf: {gs?.pitchUnknown ? "—" : `${gs?.surface_m2||0} m²`}</span>
                   </div>
+                  {sec.closed && (
+                    <div style={{marginTop:2,fontSize:10,color:"#94a3b8",display:"flex",justifyContent:"space-between"}}>
+                      <span>Perimeter: {gs?.perimeter_m||0}m</span>
+                      <span>Longest edge: {gs?.longestEdge_m||0}m</span>
+                    </div>
+                  )}
+                  {gs?.pitchUnknown && (
+                    <div style={{marginTop:5,fontSize:10,color:"#b45309",background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6,padding:"5px 7px",lineHeight:1.5}}>
+                      ⚠ Pitch not set. Surface Area and Cutting List will be calculated after a roof pitch is entered.
+                    </div>
+                  )}
 
+                  {!gs?.pitchUnknown && (
                   <button
                     onClick={()=>setExpandedCutSections(prev=>({...prev,[sec.id]:!prev[sec.id]}))}
                     style={{marginTop:6,padding:"2px 0",border:"none",background:"transparent",color:"#3b82f6",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
                     {expanded?"▾":"▸"} Cutting list{gs?.sheet_count?` · ${gs.sheet_count} sheets`:""}
                   </button>
+                  )}
 
-                  {expanded && (
+                  {!gs?.pitchUnknown && expanded && (
                     <div style={{marginTop:6,paddingLeft:10,borderLeft:"2px solid #f1f5f9"}}>
+                      {gs?.isUniformPlane && (
+                        <div style={{fontSize:10,color:"#64748b",marginBottom:5,lineHeight:1.4}}>
+                          Detected as a rectangular plane — every sheet gets the same length; the shortfall against a whole number of cover widths is normal trim waste, not a shorter sheet.
+                        </div>
+                      )}
                       <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
                         <span style={{fontSize:10,color:"#64748b",width:64,flexShrink:0}}>Sheet width</span>
                         <input type="number" value={sec.sheetWidthMm||762}
@@ -1748,22 +2262,47 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                         style={{width:"100%",marginBottom:5}}/>
                       {gs?.sheetsTooMany && (
                         <div style={{fontSize:10,color:"#ef4444",marginBottom:4}}>
-                          Sheet width is too small for this section's scale — increase "Sheet width" or check Set Scale, then try again.
+                          Sheet width is too small for this section's scale — increase "Sheet width" or re-check Calibrate Image, then try again.
                         </div>
                       )}
                       <div style={{fontSize:11,color:"#64748b",display:"flex",justifyContent:"space-between",marginBottom:4}}>
                         <span>{gs?.sheet_count||0} sheet{gs?.sheet_count===1?"":"s"}</span>
-                        <span>longest ~{gs?.sheet_length_m||0} m</span>
+                        <span>longest {gs?.sheet_length_m||0} m</span>
                       </div>
-                      {gs?.sheet_lengths_m?.length>0 && (
-                        <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:4}}>
-                          {gs.sheet_lengths_m.map((len,li)=>(
-                            <span key={li} style={{fontSize:10,padding:"2px 5px",background:"#f1f5f9",borderRadius:4,color:"#334155"}}>
-                              {len.toFixed(3)}m
-                            </span>
-                          ))}
-                        </div>
-                      )}
+                      {gs?.sheets?.length>0 && (() => {
+                        // ← Group RoofSheet objects by length (rounded to
+                        //   the nearest cm) so identical cuts collapse into
+                        //   one row with a quantity, like a real cutting list.
+                        const groups = new Map()
+                        gs.sheets.forEach(sh=>{
+                          const key = Math.round(sh.lengthM*100)
+                          if(!groups.has(key)) groups.set(key, { lengthM: key/100, qty:0, material: sh.material, plane: sec.name })
+                          groups.get(key).qty++
+                        })
+                        const rows = [...groups.values()].sort((a,b)=>b.lengthM-a.lengthM)
+                        return (
+                          <table style={{width:"100%",borderCollapse:"collapse",marginBottom:4}}>
+                            <thead>
+                              <tr style={{fontSize:9,color:"#94a3b8",textTransform:"uppercase",letterSpacing:.3}}>
+                                <th style={{textAlign:"left",fontWeight:600,padding:"2px 4px 2px 0"}}>Length</th>
+                                <th style={{textAlign:"right",fontWeight:600,padding:"2px 4px"}}>Qty</th>
+                                <th style={{textAlign:"left",fontWeight:600,padding:"2px 4px"}}>Material</th>
+                                <th style={{textAlign:"left",fontWeight:600,padding:"2px 0 2px 4px"}}>Plane</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {rows.map((r,ri)=>(
+                                <tr key={ri} style={{fontSize:11,color:"#334155",borderTop:"1px solid #f1f5f9"}}>
+                                  <td style={{padding:"3px 4px 3px 0"}}>{r.lengthM.toFixed(2)}m</td>
+                                  <td style={{textAlign:"right",padding:"3px 4px"}}>{r.qty}</td>
+                                  <td style={{padding:"3px 4px",color:r.material?"#334155":"#94a3b8"}}>{r.material||"—"}</td>
+                                  <td style={{padding:"3px 0 3px 4px"}}>{r.plane}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )
+                      })()}
                       {sec.cutAngleDeg==null && (
                         <div style={{fontSize:10,color:"#94a3b8",marginTop:4}}>
                           {gs?.pitchAngleDeg!=null ? `Using pitch angle (${gs.pitchAngleDeg}°). Drag above to override.` : "Direction auto-detected from shape. Drag above to set an exact angle."}
@@ -1822,9 +2361,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       </div>
 
       {calibModalOpen && (
-        <Modal title="Set Scale" onClose={cancelCalibration} width={360}>
+        <Modal title="Calibrate Image" onClose={cancelCalibration} width={360}>
           <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
             Enter the real-world length of the line you just drew.
+            {scaleLines.length>0 && ` You already have ${scaleLines.length} reference${scaleLines.length===1?"":"s"} — this one will be averaged with ${scaleLines.length===1?"it":"them"} for a more accurate scale.`}
           </div>
           <div style={{display:"flex",gap:8,marginBottom:16}}>
             <input
@@ -1846,22 +2386,84 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 
       {sectionPitchModalId && (() => {
         const section = sections.find(s=>s.id===sectionPitchModalId)
-        const pending = pendingSectionPitch || deriveSectionPitchInput(section?.pitch)
+        // ← Max ratio rise is a tighter, AU/NZ-practical bound (24:12 ≈
+        //   63.4°) sitting well under the hard physical ceiling for degrees
+        //   mode (85°, since a roof can't reach 90°/vertical — that's a
+        //   wall, not a roof plane, and 1/cos(90°) is undefined).
+        const MAX_PITCH_DEG = 85
+        const MAX_RATIO_RISE = 24
+        const formatForMode = (mode, deg) => {
+          if(deg==null || isNaN(deg)) return ""
+          return mode==="ratio"
+            ? String(Math.round(12*Math.tan(deg*Math.PI/180)*100)/100)
+            : String(Math.round(deg*10)/10)
+        }
+        // ← Canonical state while the dialog is open: `angleDeg` is the one
+        //   true numeric source of truth (full precision). `rawInput` is
+        //   exactly what's in the currently-editable field. Switching modes
+        //   never converts from displayed text — it only reformats the
+        //   other field fresh from `angleDeg`, so repeated switching can't
+        //   accumulate rounding error the way editing a chain of already-
+        //   rounded displayed numbers would.
+        const pending = pendingSectionPitch || (() => {
+          const derived = deriveSectionPitchInput(section?.pitch)
+          return derived
+            ? { mode: derived.mode, angleDeg: derived.angleDeg, rawInput: formatForMode(derived.mode, derived.angleDeg) }
+            : { mode: "ratio", angleDeg: null, rawInput: "" } // fresh section: Ratio is the AU/NZ default
+        })()
+        const angleDeg = pending.angleDeg
         const proceedToBrand = () => { setSectionPitchModalId(null); setPendingSectionPitch(null); setSectionMaterialModalId(sectionPitchModalId) }
+        // ← "Unknown Pitch" (was "Skip") — explicitly marks the section as
+        //   having no pitch yet, instead of silently leaving whatever
+        //   default it was created with. Also wired to the modal's own
+        //   close/X so dismissing any way lands in the same explicit state.
+        const useUnknownPitch = () => {
+          setSections(prev=>prev.map(s=>s.id===sectionPitchModalId?{...s,pitch:null}:s))
+          proceedToBrand()
+        }
+        const switchMode = (mode) => {
+          if(mode===pending.mode) return
+          setPendingSectionPitch({ mode, angleDeg, rawInput: formatForMode(mode, angleDeg) })
+        }
+        const updateActive = (raw) => {
+          const v = parseFloat(raw)
+          const newAngle = raw==="" ? null : (isNaN(v) ? angleDeg : (
+            pending.mode==="ratio" ? Math.atan(v/12)*180/Math.PI : v
+          ))
+          setPendingSectionPitch({ ...pending, rawInput: raw, angleDeg: newAngle })
+        }
+        const riseVal = pending.mode==="ratio" ? parseFloat(pending.rawInput) : null
+        let pitchError = null
+        if(pending.rawInput!==""){
+          if(pending.mode==="ratio"){
+            if(isNaN(riseVal) || riseVal<0 || riseVal>MAX_RATIO_RISE) pitchError = `Enter a rise between 0 and ${MAX_RATIO_RISE} (over a 12 run).`
+          } else if(isNaN(angleDeg) || angleDeg<0 || angleDeg>=90){
+            pitchError = `A roof pitch cannot be 90°. A 90° surface is a wall, not a roof plane.`
+          } else if(angleDeg>=MAX_PITCH_DEG){
+            pitchError = `Enter an angle between 0° and ${MAX_PITCH_DEG}°.`
+          }
+        }
+        const hasValidAngle = angleDeg!=null && !isNaN(angleDeg) && !pitchError
+        const multiplier = hasValidAngle ? 1/Math.cos(Math.min(angleDeg,89)*Math.PI/180) : null
+        const gsForModal = geometry.sections.find(x=>x.id===sectionPitchModalId)
+        const planArea = gsForModal?.footprint_m2 ?? 0
+        const surfaceAreaPreview = multiplier!=null ? planArea*multiplier : null
+        const equivDegDisplay = hasValidAngle ? `${angleDeg.toFixed(2)}°` : "—"
+        const equivRatioDisplay = hasValidAngle ? `${Math.round(12*Math.tan(angleDeg*Math.PI/180)*100)/100} : 12` : "—"
         const confirmPitch = () => {
-          if(!pending.value) return
-          const pitch = pending.mode==="ratio" ? `${pending.value}:12` : `${pending.value}`
+          if(pending.rawInput==="" || pitchError) return
+          const pitch = pending.mode==="ratio" ? `${pending.rawInput}:12` : `${pending.rawInput}°`
           setSections(prev=>prev.map(s=>s.id===sectionPitchModalId?{...s,pitch}:s))
           proceedToBrand()
         }
         return (
-        <Modal title="Roof Pitch" onClose={proceedToBrand} width={380}>
+        <Modal title="Roof Pitch" onClose={useUnknownPitch} width={380}>
           <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
             What's the pitch of <strong>{section?.name}</strong>? You can fine-tune this later in the sidebar or Estimate step.
           </div>
           <div style={{display:"flex",gap:8,marginBottom:12}}>
             {["ratio","degrees"].map(mode=>(
-              <button key={mode} type="button" onClick={()=>setPendingSectionPitch({...pending,mode})}
+              <button key={mode} type="button" onClick={()=>switchMode(mode)}
                 style={{flex:1,padding:"7px 0",borderRadius:8,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
                   border:pending.mode===mode?"2px solid #f59e0b":"1px solid #e2e8f0",
                   background:pending.mode===mode?"#fffbeb":"#fff"}}>
@@ -1869,17 +2471,39 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               </button>
             ))}
           </div>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:16}}>
-            <input type="number" min="0" step="any" autoFocus value={pending.value}
-              onChange={e=>setPendingSectionPitch({...pending,value:e.target.value})}
-              onKeyDown={e=>{ if(e.key==="Enter" && pending.value) confirmPitch() }}
-              placeholder={pending.mode==="ratio" ? "e.g. 6" : "e.g. 30"}
-              style={{...s.input,flex:1}}/>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:pitchError?4:14}}>
+            <span style={{fontSize:11,color:"#64748b",width:56,flexShrink:0}}>{pending.mode==="ratio"?"Rise":"Degrees"}</span>
+            <input type="number" min="0" max={pending.mode==="degrees"?MAX_PITCH_DEG:MAX_RATIO_RISE} step="any" autoFocus value={pending.rawInput}
+              onChange={e=>updateActive(e.target.value)}
+              onKeyDown={e=>{ if(e.key==="Enter" && pending.rawInput && !pitchError) confirmPitch() }}
+              placeholder={pending.mode==="ratio" ? "e.g. 5" : "e.g. 22.62"}
+              style={{...s.input,flex:1,...(pitchError?{borderColor:"#ef4444"}:{})}}/>
             <span style={{fontSize:13,color:"#64748b",fontWeight:600}}>{pending.mode==="ratio" ? ": 12" : "°"}</span>
           </div>
+          {pitchError && (
+            <div style={{fontSize:11,color:"#ef4444",marginBottom:12}}>{pitchError}</div>
+          )}
+          <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:8,padding:"10px 12px",marginBottom:16,display:"flex",flexDirection:"column",gap:6}}>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
+              <span style={{color:"#64748b"}}>{pending.mode==="ratio" ? "Equivalent Angle" : "Equivalent Ratio"}</span>
+              <span style={{fontWeight:600}}>{pending.mode==="ratio" ? equivDegDisplay : equivRatioDisplay}</span>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
+              <span style={{color:"#64748b"}}>Surface Multiplier</span>
+              <span style={{fontWeight:600}}>{multiplier!=null ? `×${multiplier.toFixed(3)}` : "—"}</span>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
+              <span style={{color:"#64748b"}}>Plan Area</span>
+              <span style={{fontWeight:600}}>{planArea.toFixed(2)} m²</span>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
+              <span style={{color:"#64748b"}}>Surface Area</span>
+              <span style={{fontWeight:700,color:"#f59e0b"}}>{surfaceAreaPreview!=null ? `${surfaceAreaPreview.toFixed(2)} m²` : "—"}</span>
+            </div>
+          </div>
           <div style={{display:"flex",justifyContent:"flex-end",gap:10}}>
-            <Btn onClick={proceedToBrand}>Skip</Btn>
-            <Btn primary style={{opacity:pending.value?1:.5}} onClick={confirmPitch}>Save</Btn>
+            <Btn onClick={useUnknownPitch}>Unknown Pitch</Btn>
+            <Btn primary style={{opacity:(pending.rawInput && !pitchError)?1:.5}} onClick={confirmPitch}>Save</Btn>
           </div>
         </Modal>
         )
@@ -1894,7 +2518,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           <MaterialPicker
             group="roof_sheet"
             value={pendingSectionMaterial?.label ?? sections.find(s=>s.id===sectionMaterialModalId)?.materialLabel ?? ""}
-            onSelect={({label,rate})=>setPendingSectionMaterial({label,rate})}
+            onSelect={({label,rate,coverWidth})=>setPendingSectionMaterial({label,rate,coverWidth})}
           />
           <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:16}}>
             <Btn primary style={{opacity:pendingSectionMaterial?1:.5}} onClick={()=>{
@@ -1904,7 +2528,16 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               //   so it reads meaningfully everywhere — sidebar, canvas
               //   label, and the Estimate step's per-section list — instead
               //   of a generic number no one can tell apart.
-              setSections(prev=>prev.map(s=>s.id===id?{...s,name:pendingSectionMaterial.label,materialLabel:pendingSectionMaterial.label,rate:pendingSectionMaterial.rate}:s))
+              setSections(prev=>prev.map(s=>s.id===id?{
+                ...s,
+                name: pendingSectionMaterial.label,
+                materialLabel: pendingSectionMaterial.label,
+                rate: pendingSectionMaterial.rate,
+                // ← Cutting list now spaces sheets using the picked product's
+                //   real cover width instead of a generic default — only
+                //   overwritten when the catalog row actually has one set.
+                sheetWidthMm: pendingSectionMaterial.coverWidth>0 ? pendingSectionMaterial.coverWidth : s.sheetWidthMm,
+              }:s))
               setSectionMaterialModalId(null); setPendingSectionMaterial(null)
             }}>Save</Btn>
           </div>
@@ -1941,6 +2574,49 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         </Modal>
         )
       })()}
+
+      {lineContextMenu && (
+        <>
+          <div onClick={()=>setLineContextMenu(null)}
+            style={{position:"fixed",inset:0,zIndex:998}}/>
+          <div style={{position:"fixed",left:lineContextMenu.x,top:lineContextMenu.y,zIndex:999,
+            background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,boxShadow:"0 4px 16px rgba(0,0,0,0.15)",
+            minWidth:120,padding:4,fontFamily:"inherit"}}>
+            <button onClick={()=>{ finishLine(); setLineContextMenu(null) }}
+              style={{display:"block",width:"100%",textAlign:"left",padding:"7px 10px",border:"none",background:"transparent",
+                borderRadius:6,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}
+              onMouseEnter={e=>e.currentTarget.style.background="#f1f5f9"}
+              onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+              New Line
+            </button>
+            <div style={{height:1,background:"#f1f5f9",margin:"2px 0"}}/>
+            <button onClick={()=>{ finishLine(); setActiveTool("select"); setLineContextMenu(null) }}
+              style={{display:"block",width:"100%",textAlign:"left",padding:"7px 10px",border:"none",background:"transparent",
+                borderRadius:6,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}
+              onMouseEnter={e=>e.currentTarget.style.background="#f1f5f9"}
+              onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+              Stop
+            </button>
+          </div>
+        </>
+      )}
+      {pastePopup && (
+        <>
+          <div onClick={()=>setPastePopup(null)}
+            style={{position:"fixed",inset:0,zIndex:998}}/>
+          <div style={{position:"fixed",left:pastePopup.x,top:pastePopup.y,zIndex:999,
+            background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,boxShadow:"0 4px 16px rgba(0,0,0,0.15)",
+            minWidth:120,padding:4,fontFamily:"inherit"}}>
+            <button onClick={()=>{ pasteShapes(pastePopup.worldPt); setPastePopup(null) }}
+              style={{display:"block",width:"100%",textAlign:"left",padding:"7px 10px",border:"none",background:"transparent",
+                borderRadius:6,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}
+              onMouseEnter={e=>e.currentTarget.style.background="#f1f5f9"}
+              onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+              📋 Paste
+            </button>
+          </div>
+        </>
+      )}
     </div>
   )
 });
@@ -2217,8 +2893,8 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
           //   otherwise reopening a project to edit would silently reset
           //   every section back to whatever the last trace happened to
           //   carry, discarding an Estimate-step pitch edit.
-          pitch: prev?.pitch ?? sec.pitch ?? "1.15",
-          pitchFactor: prev?.pitchFactor ?? sec.pitchFactor ?? 1.15,
+          pitch: prev?.pitch ?? sec.pitch ?? null,
+          pitchFactor: prev?.pitchFactor ?? sec.pitchFactor ?? null,
           footprint_m2: sec.footprint_m2 ?? prev?.footprint_m2 ?? 0,
           materialLabel: prev?.materialLabel ?? sec.materialLabel ?? "",
           rate: prev?.rate ?? sec.rate ?? 0,
@@ -2323,7 +2999,7 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
                 <div key={sec.id} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:10,marginBottom:8}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
                     <span style={{fontSize:13,fontWeight:600}}>{sec.name}</span>
-                    <span style={{fontSize:12,color:"#64748b"}}>{sec.surface_m2} m²</span>
+                    <span style={{fontSize:12,color:"#64748b"}}>{sec.surface_m2!=null ? `${sec.surface_m2} m²` : "no pitch set"}</span>
                   </div>
                   <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
                     <span style={{fontSize:11,color:"#64748b"}}>Pitch</span>
@@ -2351,7 +3027,7 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
                     value={sec.materialLabel}
                     onSelect={({label,rate})=>setE(prev=>({...prev,sections:prev.sections.map((s,si)=>si===i?{...s,name:label,materialLabel:label,rate}:s)}))}
                   />
-                  {sec.rate>0 && <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>{(sec.surface_m2*wasteFactor).toFixed(2)}m² (incl. {e.waste||0}% waste) × {cs}{sec.rate}/m² = {cs}{(sec.surface_m2*wasteFactor*sec.rate).toFixed(2)}</div>}
+                  {sec.rate>0 && sec.surface_m2!=null && <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>{(sec.surface_m2*wasteFactor).toFixed(2)}m² (incl. {e.waste||0}% waste) × {cs}{sec.rate}/m² = {cs}{(sec.surface_m2*wasteFactor*sec.rate).toFixed(2)}</div>}
                 </div>
               ))}
             </div>
@@ -2462,7 +3138,7 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
         <div style={{background:"#0f172a",borderRadius:12,padding:20,color:"#fff"}}>
           <div style={{fontFamily:"'Syne',sans-serif",fontSize:15,fontWeight:800,marginBottom:16,color:"#f59e0b"}}>Cost Breakdown</div>
           {e.sections.length>0
-            ? e.sections.map(sec=>sec.rate>0 && row(`${sec.name} (${(sec.surface_m2*wasteFactor).toFixed(2)}m² incl. ${e.waste||0}% waste × ${cs}${sec.rate})`, fmt(sec.surface_m2*wasteFactor*sec.rate)))
+            ? e.sections.map(sec=>sec.rate>0 && sec.surface_m2!=null && row(`${sec.name} (${(sec.surface_m2*wasteFactor).toFixed(2)}m² incl. ${e.waste||0}% waste × ${cs}${sec.rate})`, fmt(sec.surface_m2*wasteFactor*sec.rate)))
             : row(`Material (${result.adjArea.toFixed(1)} m² × ${cs}${e.materialRate})`, fmt(result.matCost))}
           {e.flashingRuns.length>0
             ? e.flashingRuns.map(r=>row(`${r.label} (${(r.length_m*wasteFactor).toFixed(2)}m incl. ${e.waste||0}% waste × ${cs}${r.rate||0})`, fmt(r.length_m*wasteFactor*(r.rate||0))))
@@ -2495,7 +3171,7 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
           <div style={{fontSize:12,color:"#64748b",lineHeight:2}}>
             <div>Adjusted area: <strong style={{color:"#0f172a"}}>{result.adjArea.toFixed(1)} m²</strong></div>
             {e.sections.length>0
-              ? e.sections.map(sec=><div key={sec.id}>{sec.name}: <strong style={{color:"#0f172a"}}>{sec.surface_m2}m²{sec.rate?` @ ${cs}${sec.rate}/m²`:" — no material chosen yet"}</strong></div>)
+              ? e.sections.map(sec=><div key={sec.id}>{sec.name}: <strong style={{color:"#0f172a"}}>{sec.surface_m2!=null ? `${sec.surface_m2}m²` : "no pitch set"}{sec.rate?` @ ${cs}${sec.rate}/m²`:" — no material chosen yet"}</strong></div>)
               : <div>Material: <strong style={{color:"#0f172a"}}>{e.materialLabel} @ {cs}{e.materialRate}/m²</strong></div>}
             {e.flashingRuns.length>0
               ? e.flashingRuns.map(r=><div key={r.subtype}>{r.label}: <strong style={{color:"#0f172a"}}>{r.length_m}m{r.rate?` @ ${cs}${r.rate}/m`:""}</strong></div>)
@@ -2623,7 +3299,7 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
   //   "materialLabel roofing" line, which never showed which brand/product
   //   was actually picked per section.
   const materialLines = e.sections?.length
-    ? e.sections.map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0) }))
+    ? e.sections.filter(sec=>sec.surface_m2!=null).map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0) }))
     : [{ desc:`${e.materialLabel} roofing — supply & install`, qty:`${e.adjArea?.toFixed(1)} m²`, unit:`${cs}${e.materialRate}`, total:e.matCost }]
 
   // ← Same fix as flashing above: show the actual product picked
@@ -3106,6 +3782,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
             geometryLoaded ? (
               <MeasurementTool ref={measurementToolRef} onGeometryChange={handleGeometryChange}
                 photoUrl={activeMeasurePhotoUrl || (geometryFull?.snapshot_url ? `${API_ORIGIN}${geometryFull.snapshot_url}` : null)}
+                onPhotoChange={setActiveMeasurePhotoUrl}
                 initialGeometry={geometryFull}/>
             ) : (
               <div style={{padding:"48px 20px",textAlign:"center",color:"#64748b",fontSize:13}}>Loading previous measurement…</div>
@@ -3604,7 +4281,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
       : [{ desc:"Flashings — ridge/hip/valley", qty:`${((e?.flashings||0)*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.flashings}/m`, total:e?.flashCost||0 }]
 
     const materialLines = e?.sections?.length
-      ? e.sections.map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0) }))
+      ? e.sections.filter(sec=>sec.surface_m2!=null).map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0) }))
       : [{ desc:`${e?.materialLabel} roofing — supply & install`, qty:`${e?.adjArea?.toFixed(1)} m²`, unit:`${cs}${e?.materialRate}/m²`, total:e?.matCost||0 }]
 
     const gutterLines = e?.gutterRuns?.length
