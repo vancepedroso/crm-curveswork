@@ -2376,7 +2376,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                         <span style={{fontSize:10,color:"#94a3b8"}}>mm cover</span>
                       </div>
                       <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
-                        <span style={{fontSize:10,color:"#64748b",width:64,flexShrink:0}}>Cut angle</span>
+                        <span style={{fontSize:10,color:"#64748b",width:64,flexShrink:0}}>Roof Direction</span>
                         <input type="number" min={0} max={179}
                           value={sec.cutAngleDeg ?? Math.round(gs?.pitchAngleDeg ?? 0)}
                           onChange={e=>{
