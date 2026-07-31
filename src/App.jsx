@@ -534,7 +534,11 @@ function parsePitch(str) {
   if(deg) return 1/Math.cos(Math.min(Math.max(parseFloat(deg[1]),0),89)*Math.PI/180)
   const d = parseFloat(s)
   if(!isNaN(d) && d<=5)  return d
-  if(!isNaN(d) && d<90)  return 1/Math.cos(d*Math.PI/180)
+  // ← Same 89° ceiling as the explicit-"°" branch above — a bare number
+  //   this close to 90 (e.g. "89.8" typed without the degree symbol) would
+  //   otherwise explode toward infinity here uncapped, producing a
+  //   nonsensical multiplier (and surface area) with no error shown.
+  if(!isNaN(d) && d<90)  return 1/Math.cos(Math.min(Math.max(d,0),89)*Math.PI/180)
   return 1.15
 }
 // Reverse of the string-building the Roof Pitch popup does — derives the
@@ -566,6 +570,14 @@ function polyAreaPx(pts) {
   let sum=0; const n=pts.length
   for(let i=0;i<n;i++){const j=(i+1)%n;sum+=pts[i].x*pts[j].y-pts[j].x*pts[i].y}
   return Math.abs(sum/2)
+}
+// ← Ortho snap: forces the segment from `prevPt` to `pt` to be perfectly
+//   horizontal or vertical — snaps to whichever axis the raw point is
+//   already further along, flattening the other axis to match `prevPt`.
+function orthoSnap(pt, prevPt) {
+  if(!prevPt) return pt
+  const dx = Math.abs(pt.x-prevPt.x), dy = Math.abs(pt.y-prevPt.y)
+  return dx>=dy ? { x:pt.x, y:prevPt.y } : { x:prevPt.x, y:pt.y }
 }
 // ← When horizontal/vertical calibration scales differ (anisotropic), every
 //   point fed into the existing area/length/clipping functions is squashed
@@ -608,13 +620,6 @@ function isRectangleLike(pts, angleTolDeg=6, lengthTolPct=8) {
   }
   return true
 }
-// ← Only a degree pitch (e.g. "30") doubles as an explicit stripe angle; a
-//   ratio pitch (e.g. "4:12") returns null here so callers fall back to
-//   shape-based direction detection instead of blocking the cutting list.
-function sectionAngleDeg(pitchStr) {
-  const d = deriveSectionPitchInput(pitchStr)
-  return d?.mode==="degrees" ? d.angleDeg : null
-}
 // ← Where a stripe line (p1→p2, spanning well past the polygon on both
 //   ends) actually crosses the polygon boundary — used to trim each sheet
 //   stripe down to its real in-roof length instead of a uniform bbox span
@@ -653,7 +658,7 @@ function clipSegmentToPolygon(p1, p2, pts) {
 //   (down-slope), clipped to the polygon so each stripe's length reflects
 //   how the roof section actually narrows/widens under it. Returns
 //   pixel-space segments plus the counts/lengths the sidebar reads.
-function sectionStripeInfo(pts, sheetWidthPx, angleDeg) {
+function sectionStripeInfo(pts, sheetWidthPx, angleDeg, anchorPt) {
   if(!pts || pts.length<3) return { stripes:[], count:0, dirLenPx:0, perpLenPx:0, longestEdgePx:0 }
   // ← Longest edge is computed unconditionally (not just for auto-direction)
   //   since RoofPlane summaries want it regardless of which direction mode
@@ -665,11 +670,22 @@ function sectionStripeInfo(pts, sheetWidthPx, angleDeg) {
     if(len>longest){ longest=len; longestDir={x:dx/len,y:dy/len}; longestA=a; longestB=b }
   }
   const usingAutoDirection = !(angleDeg!=null && !isNaN(angleDeg))
-  const dir = usingAutoDirection
-    ? longestDir
-    : { x:Math.cos(angleDeg*Math.PI/180), y:Math.sin(angleDeg*Math.PI/180) }
   if(!sheetWidthPx || sheetWidthPx<=0) return { stripes:[], count:0, dirLenPx:0, perpLenPx:0, longestEdgePx:longest }
-  const perp = { x:-dir.y, y:dir.x }
+  // ← Auto-detect: `dir` runs along the longest edge (the eave), sheets
+  //   (`perp`) run perpendicular to it — down-slope, the standard
+  //   convention. A manual angle instead specifies the direction the SHEETS
+  //   themselves should run (parallel to a drawn rafter/ridge line, or a
+  //   typed Cut Angle) — so `perp` is built directly from it, and `dir`
+  //   (the spacing axis sheets are laid out side-by-side along) is the
+  //   90°-rotated vector, the reverse of the auto-detect assignment.
+  let dir, perp
+  if(usingAutoDirection){
+    dir = longestDir
+    perp = { x:-dir.y, y:dir.x }
+  } else {
+    perp = { x:Math.cos(angleDeg*Math.PI/180), y:Math.sin(angleDeg*Math.PI/180) }
+    dir = { x:-perp.y, y:perp.x }
+  }
   const perpVals = pts.map(p=>p.x*perp.x+p.y*perp.y)
   // ← When direction is auto-detected (from the longest edge), anchor the
   //   run's start/end to that EDGE'S OWN two endpoints rather than the
@@ -712,8 +728,22 @@ function sectionStripeInfo(pts, sheetWidthPx, angleDeg) {
   //   Nudging only matters for those two ends — every interior sample is
   //   already comfortably clear of dirMin/dirMax and is unaffected.
   const EDGE_EPS = sheetWidthPx*0.01
+  // ← When a manual angle came with an anchor point (the "last end" of a
+  //   drawn cut-angle reference line), phase-shift the whole stripe grid so
+  //   a boundary lands exactly on the anchor's own position along `dir`,
+  //   instead of always starting from the polygon's own extreme corner —
+  //   lets a user's drawn line dictate exactly where sheets line up, not
+  //   just which direction they run. Anchor is meaningless for
+  //   auto-detected direction (nothing was drawn), so it's ignored there.
+  let stepStart = dirMin
+  if(anchorPt && !usingAutoDirection){
+    const anchorD = anchorPt.x*dir.x + anchorPt.y*dir.y
+    const offset = ((dirMin - anchorD) % sheetWidthPx + sheetWidthPx) % sheetWidthPx
+    stepStart = dirMin - offset
+  }
   const stripes=[]
-  for(let d=dirMin; d<=dirMax+1e-6; d+=sheetWidthPx){
+  for(let d=stepStart; d<=dirMax+1e-6; d+=sheetWidthPx){
+    if(d < dirMin-1e-6) continue // phase shift can start slightly before the polygon's own edge — skip until inside
     const dSafe = Math.min(Math.max(d, dirMin+EDGE_EPS), dirMax-EDGE_EPS)
     const p1={ x:dSafe*dir.x+perpMin*perp.x, y:dSafe*dir.y+perpMin*perp.y }
     const p2={ x:dSafe*dir.x+perpMax*perp.x, y:dSafe*dir.y+perpMax*perp.y }
@@ -758,6 +788,7 @@ function initialSectionsFrom(g) {
     materialLabel: sec.materialLabel || "", rate: sec.rate || 0,
     sheetWidthMm: sec.sheetWidthMm || 762,
     cutAngleDeg: sec.cutAngleDeg ?? null,
+    cutAngleAnchor: sec.cutAngleAnchor ?? null,
   }))
 }
 function initialLineItemsFrom(g) {
@@ -792,6 +823,19 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   const [imgSrc,    setImgSrc]    = useState(null)
   const [sections,  setSections]  = useState(() => initialSectionsFrom(initialGeometry))
   const [expandedCutSections, setExpandedCutSections] = useState({}) // {[sectionId]: boolean} — cutting-list panel toggle
+  // ← Per-section canvas visibility — a busy multi-plane roof (several
+  //   sections traced close together) gets very cluttered with every
+  //   section's outline/label/cutting-list all drawn at once; hiding one
+  //   temporarily lets you focus on another without losing its data.
+  const [hiddenSections, setHiddenSections] = useState({}) // {[sectionId]: boolean}
+  // ← "cutangle" is a temporary activeTool value: click a section's 🧭
+  //   button to enter it (cutAngleDrawSectionId records which section it's
+  //   for), then click two points directly on the photo — e.g. tracing an
+  //   actual visible rafter/ridge line — and that line's angle becomes the
+  //   section's Cut Angle. Mirrors the Calibrate Image tool's two-click
+  //   line-then-apply flow.
+  const [cutAngleDrawSectionId, setCutAngleDrawSectionId] = useState(null)
+  const [cutAngleLine, setCutAngleLine] = useState(null) // {p1, p2:null} while drawing
   // ← id of a just-closed section awaiting its "pick a roof sheet brand"
   //   popup — prompted immediately on close rather than only in Estimate.
   const [sectionMaterialModalId, setSectionMaterialModalId] = useState(null)
@@ -853,6 +897,12 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   const dragRef = useRef(null) // { kind, id, idx? } currently-dragged point
   const clickStartRef = useRef(null) // {x,y} client coords at mousedown — tells an actual drag apart from a stationary click that happened to land on an existing point
   const [editMode, setEditMode] = useState(false)
+  // ← "Ortho" (PlanSwift/CAD-style orthogonal snap): while tracing, forces
+  //   each new point's segment from the previous point to be perfectly
+  //   horizontal or vertical (whichever the raw cursor is closer to),
+  //   instead of landing wherever the mouse happened to click — fixes
+  //   freehand-traced rectangles coming out slightly skewed.
+  const [orthoMode, setOrthoMode] = useState(false)
 
   // ── Undo / Redo (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z or Ctrl+Y) ──────────────
   // A snapshot is pushed before every mutating action (adding a point to
@@ -980,14 +1030,24 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       const pitchUnknown = !sec.pitch
       const fac  = pitchUnknown ? null : parsePitch(sec.pitch)
       const sheetWidthMm = sec.sheetWidthMm || 762
-      // ← Direction priority: explicit per-section override > degree pitch > shape auto-detect
+      // ← Direction priority: explicit per-section Cut Angle override, else
+      //   auto-detect from the shape's own longest edge (inside
+      //   sectionStripeInfo). Pitch is a slope-steepness angle, not a 2D
+      //   bearing in the photo — it must never feed stripe direction (that
+      //   coupling used to exist here and produced skewed cutting-list
+      //   stripes on genuinely rectangular, correctly-traced sections).
       //   True (photo-space) angle is what's shown/restored in the UI;
       //   sectionStripeInfo needs the same angle re-expressed in the
       //   squashed space its points now live in, or the stripe direction
       //   would drift from what the slider/photo actually show.
-      const trueAngleDeg = sec.cutAngleDeg ?? sectionAngleDeg(sec.pitch)
+      const trueAngleDeg = sec.cutAngleDeg ?? null
       const stripeAngleDeg = squashAngleDeg(trueAngleDeg, squashRatio)
-      const stripeInfo = (sec.closed && !pitchUnknown) ? sectionStripeInfo(sqPts, (sheetWidthMm/1000)/sfY, stripeAngleDeg) : { stripes:[], count:0, perpLenPx:0, longestEdgePx:0 }
+      // ← The "last end" point of a manually-drawn cut-angle reference line
+      //   (see the cutangle tool) — re-expressed in the same squashed space
+      //   sqPts lives in, same reasoning as stripeAngleDeg above, so the
+      //   stripe grid can be phase-shifted to actually pass through it.
+      const sqCutAngleAnchor = sec.cutAngleAnchor ? squash([sec.cutAngleAnchor])[0] : null
+      const stripeInfo = (sec.closed && !pitchUnknown) ? sectionStripeInfo(sqPts, (sheetWidthMm/1000)/sfY, stripeAngleDeg, sqCutAngleAnchor) : { stripes:[], count:0, perpLenPx:0, longestEdgePx:0 }
       // ← RoofSheet objects: each clipped stripe becomes a structured sheet
       //   (not just a bare length) so future features (grouping, purchase
       //   lists) can be built on this without redoing the clipping algorithm.
@@ -1073,6 +1133,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         //   has nothing to restore and a manual Cut Angle silently reverts
         //   to auto-detected on remount.
         cutAngleDeg: sec.cutAngleDeg ?? null,
+        cutAngleAnchor: sec.cutAngleAnchor ?? null,
         pitchAngleDeg: trueAngleDeg,
         sheet_count: stripeInfo.count,
         sheets,
@@ -1352,7 +1413,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
 
     sections.forEach((sec,idx)=>{
-      if(!sec.pts.length) return
+      if(!sec.pts.length || hiddenSections[sec.id]) return
       const col=sec.color
       ctx.strokeStyle=col; ctx.lineWidth=lw(2)
       ctx.setLineDash(sec.closed?[]:[lw(6),lw(3)])
@@ -1399,7 +1460,15 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         nameRect = { x1:cx0-boxW0/2-lw(6), y1:cy0-boxH0/2-lw(6), x2:cx0+boxW0/2+lw(6), y2:cy0+boxH0/2+lw(16) }
       }
 
-      if(sec.closed && sec.pts.length>=3 && gs?.sheets?.length){
+      // ← Cutting-list stripes/pills only drawn on canvas when this
+      //   section's sidebar "Cutting list" panel is expanded — previously
+      //   always-on for every section, which on a busy multi-plane roof
+      //   (several sections traced close together) meant every sheet's
+      //   length pill from every section rendered simultaneously, totally
+      //   cluttering the photo. Reuses the same expand state the sidebar
+      //   panel already has, so expanding one section's list there also
+      //   reveals it here.
+      if(sec.closed && sec.pts.length>=3 && gs?.sheets?.length && expandedCutSections[sec.id]){
         const sheets = gs.sheets
         {
           ctx.save()
@@ -1517,13 +1586,18 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       // ← "closing snap": cursor is near the first point, close enough that a
       //   click would close the shape (matches the d<15 threshold in handleClick)
       const isClosing = drawPts.length>=3 && hoverPt && Math.hypot(hoverPt.x-drawPts[0].x,hoverPt.y-drawPts[0].y)<15
+      // ← The closing check above always uses the raw cursor position (so
+      //   "am I near the first point" isn't thrown off by snapping) — this
+      //   is the point actually used to draw the rubber-band preview, so a
+      //   click lands exactly where the preview showed.
+      const previewHoverPt = (hoverPt && orthoMode && !isClosing) ? orthoSnap(hoverPt, drawPts[drawPts.length-1]) : hoverPt
 
       // Live translucent fill — a "shadow" of the enclosed area that grows as
       // points are placed, instead of only appearing once the shape is closed.
       if(drawPts.length>=3){
         ctx.beginPath(); ctx.moveTo(drawPts[0].x,drawPts[0].y)
         drawPts.forEach(p=>ctx.lineTo(p.x,p.y))
-        if(hoverPt && !isClosing) ctx.lineTo(hoverPt.x,hoverPt.y)
+        if(previewHoverPt && !isClosing) ctx.lineTo(previewHoverPt.x,previewHoverPt.y)
         ctx.closePath()
         ctx.fillStyle=col+"2a"
         ctx.fill()
@@ -1533,12 +1607,12 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       ctx.setLineDash(isClosing?[]:[lw(6),lw(3)])
       ctx.beginPath(); ctx.moveTo(drawPts[0].x,drawPts[0].y)
       drawPts.forEach(p=>ctx.lineTo(p.x,p.y))
-      if(hoverPt) ctx.lineTo(isClosing?drawPts[0].x:hoverPt.x, isClosing?drawPts[0].y:hoverPt.y)
+      if(previewHoverPt) ctx.lineTo(isClosing?drawPts[0].x:previewHoverPt.x, isClosing?drawPts[0].y:previewHoverPt.y)
       ctx.stroke(); ctx.setLineDash([])
       // ← Live tick marks while still tracing — same treatment as
       //   Flashing/Gutter, following the same endpoint the preview line
       //   itself uses (snapped to the start point while closing).
-      if(hoverPt) drawMeterTicks([...drawPts, isClosing?drawPts[0]:hoverPt])
+      if(previewHoverPt) drawMeterTicks([...drawPts, isClosing?drawPts[0]:previewHoverPt])
       else drawMeterTicks(drawPts)
       drawPts.forEach((p,i)=>{
         ctx.fillStyle=i===0?col:"#fff"; ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?6:3.5),0,Math.PI*2); ctx.fill()
@@ -1567,7 +1641,8 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     if((activeTool==="flashing"||activeTool==="gutter")&&drawPts.length>0){
       const col=activeTool==="flashing"?"#f59e0b":"#06b6d4"
       ctx.strokeStyle=col; ctx.lineWidth=lw(2.5); ctx.setLineDash(activeTool==="flashing"?[lw(8),lw(4)]:[lw(4),lw(2)])
-      const previewPts = hoverPt ? [...drawPts, hoverPt] : drawPts
+      const previewHoverPt = (hoverPt && orthoMode) ? orthoSnap(hoverPt, drawPts[drawPts.length-1]) : hoverPt
+      const previewPts = previewHoverPt ? [...drawPts, previewHoverPt] : drawPts
       ctx.beginPath(); ctx.moveTo(previewPts[0].x,previewPts[0].y)
       previewPts.forEach(p=>ctx.lineTo(p.x,p.y))
       ctx.stroke(); ctx.setLineDash([])
@@ -1596,7 +1671,11 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       }
     })
 
-    const tick=p=>{ctx.beginPath();ctx.moveTo(p.x,p.y-lw(8));ctx.lineTo(p.x,p.y+lw(8));ctx.stroke()}
+    // ← A plain round endpoint dot, not a perpendicular cross-stroke — a
+    //   fixed vertical tick looked fine on a vertical calibration line but
+    //   read as a confusing extra little line sticking out of a horizontal
+    //   one (it never rotated to match the line's own direction).
+    const tick=p=>{ctx.beginPath();ctx.arc(p.x,p.y,lw(4),0,Math.PI*2);ctx.fillStyle="#10b981";ctx.fill();ctx.strokeStyle="#fff";ctx.lineWidth=lw(1.5);ctx.stroke()}
     const drawScaleLabel=(p1,p2,text)=>{
       const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2
       ctx.fillStyle="#10b981"
@@ -1625,6 +1704,25 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         // this specific line, so show a placeholder rather than a number
         // that looks like it's already been measured.
         drawScaleLabel(scaleLine.p1,scaleLine.p2,"? m")
+      }
+    }
+
+    if(cutAngleLine?.p1){
+      const p2 = cutAngleLine.p2||(activeTool==="cutangle"?hoverPt:null)
+      ctx.strokeStyle="#8b5cf6"; ctx.lineWidth=lw(2.5); ctx.setLineDash([lw(6),lw(3)])
+      ctx.beginPath(); ctx.moveTo(cutAngleLine.p1.x,cutAngleLine.p1.y)
+      if(p2) ctx.lineTo(p2.x,p2.y)
+      ctx.stroke(); ctx.setLineDash([])
+      tick(cutAngleLine.p1)
+      if(p2){
+        tick(p2)
+        const dx=p2.x-cutAngleLine.p1.x, dy=p2.y-cutAngleLine.p1.y
+        const liveAngle = ((Math.atan2(dy,dx)*180/Math.PI)%180+180)%180
+        const mx=(cutAngleLine.p1.x+p2.x)/2, my=(cutAngleLine.p1.y+p2.y)/2
+        ctx.fillStyle="#8b5cf6"
+        try{ctx.beginPath();ctx.roundRect(mx-lw(22),my-lw(10),lw(44),lw(16),lw(4));ctx.fill()}catch{ctx.fillRect(mx-lw(22),my-lw(10),lw(44),lw(16))}
+        ctx.fillStyle="#fff"; ctx.font=`bold ${10/view.zoom}px DM Sans`; ctx.textAlign="center"
+        ctx.fillText(`${liveAngle.toFixed(1)}°`,mx,my+lw(1))
       }
     }
 
@@ -1677,7 +1775,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
 
     ctx.restore()
-  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,scaleLines,knownM,calibModalOpen,geometry,imgSrc,view,editMode,selection,selectionCount,selectBox,mPerPx])
+  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,scaleLines,knownM,calibModalOpen,geometry,imgSrc,view,editMode,orthoMode,selection,selectionCount,selectBox,mPerPx,expandedCutSections,hiddenSections,cutAngleLine])
 
   useEffect(()=>{ drawCanvas() },[drawCanvas])
 
@@ -1881,7 +1979,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         const fp=drawPts[0], d=Math.hypot(pt.x-fp.x,pt.y-fp.y)
         if(d<15){
           const newId = uid()
-          setSections(prev=>[...prev,{id:newId,name:`Section ${prev.length+1}`,pts:drawPts,closed:true,pitch:null,color:SEC_COLORS[prev.length%SEC_COLORS.length],materialLabel:"",rate:0,sheetWidthMm:762,cutAngleDeg:null}])
+          setSections(prev=>[...prev,{id:newId,name:`Section ${prev.length+1}`,pts:drawPts,closed:true,pitch:null,color:SEC_COLORS[prev.length%SEC_COLORS.length],materialLabel:"",rate:0,sheetWidthMm:762,cutAngleDeg:null,cutAngleAnchor:null}])
           setDrawPts([])
           // ← Prompt for this section's pitch, then its roof sheet brand,
           //   right away while the roofer is still looking at it, instead
@@ -1892,9 +1990,9 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           return
         }
       }
-      setDrawPts(prev=>[...prev,pt])
+      setDrawPts(prev=>[...prev, orthoMode ? orthoSnap(pt, prev[prev.length-1]) : pt])
     }
-    else if(activeTool==="flashing"||activeTool==="gutter"){ setDrawPts(prev=>[...prev,pt]) }
+    else if(activeTool==="flashing"||activeTool==="gutter"){ setDrawPts(prev=>[...prev, orthoMode ? orthoSnap(pt, prev[prev.length-1]) : pt]) }
     else if(activeTool==="downpipe")    { const id=uid(); setPtItems(prev=>[...prev,{id,type:"downpipe",   materialLabel:"",rate:0,x:pt.x,y:pt.y}]); setAccessoryModal({kind:"downpipe",   id}) }
     else if(activeTool==="drain")       { const id=uid(); setPtItems(prev=>[...prev,{id,type:"drain",      materialLabel:"",rate:0,x:pt.x,y:pt.y}]); setAccessoryModal({kind:"drain",      id}) }
     else if(activeTool==="penetration") { const id=uid(); setPtItems(prev=>[...prev,{id,type:"penetration",subtype:penSub,materialLabel:"",rate:0,x:pt.x,y:pt.y}]); setAccessoryModal({kind:"penetration",id}) }
@@ -1907,6 +2005,20 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         //   real-world length, not see an old number that looks pre-confirmed.
         setCalibInput("")
         setCalibModalOpen(true)
+      }
+    }
+    else if(activeTool==="cutangle"){
+      if(!cutAngleLine?.p1) setCutAngleLine({p1:pt,p2:null})
+      else {
+        const dx=pt.x-cutAngleLine.p1.x, dy=pt.y-cutAngleLine.p1.y
+        const angleDeg = ((Math.atan2(dy,dx)*180/Math.PI)%180+180)%180
+        // ← Anchor is the line's own end point (where you finished the
+        //   drag) — the stripe grid gets phase-shifted so a boundary lands
+        //   exactly there, not just matching the angle (sectionStripeInfo).
+        setSections(prev=>prev.map(x=>x.id===cutAngleDrawSectionId?{...x,cutAngleDeg:angleDeg,cutAngleAnchor:pt}:x))
+        setCutAngleLine(null)
+        setCutAngleDrawSectionId(null)
+        setActiveTool("select")
       }
     }
   }
@@ -1927,6 +2039,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     else if(activeTool==="scale" && scaleLine?.p1 && !scaleLine?.p2) {
       // cancel an in-progress scale line
       setScaleLine(null)
+    }
+    else if(activeTool==="cutangle") {
+      // cancel drawing the cut-angle reference line and exit the tool entirely
+      setCutAngleLine(null); setCutAngleDrawSectionId(null); setActiveTool("select")
     }
     // Nothing else claimed this right-click — if there's a copied shape
     // waiting, offer to paste it right here instead of showing nothing.
@@ -2029,7 +2145,9 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   ]
 
   const tip = isPanMode ? "Drag to pan · release Space to resume drawing"
+    : activeTool==="cutangle" ? "Click two points on the photo (e.g. along a visible rafter/ridge line) to set this section's cut angle · right-click to cancel"
     : (TOOLS.find(t=>t.key===activeTool)?.hint||"")
+    + (orthoMode && ["section","flashing","gutter"].includes(activeTool) ? " · Ortho: new points snap to horizontal/vertical" : "")
 
   return (
     <div>
@@ -2067,6 +2185,17 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                 fontSize:11,fontWeight:editMode?600:400,cursor:"pointer",
                 display:"flex",alignItems:"center",gap:4,fontFamily:"inherit"}}>
               <span>✎</span>Edit Points
+            </button>
+            <button
+              onClick={()=>setOrthoMode(m=>!m)}
+              title="Ortho: snap each new traced point to horizontal/vertical from the previous point"
+              style={{padding:"5px 9px",borderRadius:6,
+                border:`1px solid ${orthoMode?"#fbbf24":"rgba(255,255,255,0.14)"}`,
+                background:orthoMode?"#fbbf2428":"transparent",
+                color:orthoMode?"#fbbf24":"#94a3b8",
+                fontSize:11,fontWeight:orthoMode?600:400,cursor:"pointer",
+                display:"flex",alignItems:"center",gap:4,fontFamily:"inherit"}}>
+              <span>⊥</span>Ortho
             </button>
             <div style={{marginLeft:"auto",display:"flex",gap:5,alignItems:"center"}}>
               {(activeTool==="flashing"||activeTool==="gutter")&&drawPts.length>=2&&(
@@ -2141,7 +2270,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 
           <div className="mt-canvas-wrap">
             <canvas ref={canvasRef}
-              style={{cursor:isPanMode?(panRef.current?"grabbing":"grab"):(["section","flashing","gutter","scale","select"].includes(activeTool)?"crosshair":"cell")}}
+              style={{cursor:isPanMode?(panRef.current?"grabbing":"grab"):(["section","flashing","gutter","scale","select","cutangle"].includes(activeTool)?"crosshair":"cell")}}
               onMouseDown={handleMouseDown}
               onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp}
@@ -2183,22 +2312,29 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
             {sections.map((sec,idx)=>{
               const gs=geometry.sections[idx]
               const expanded = !!expandedCutSections[sec.id]
+              const hidden = !!hiddenSections[sec.id]
               return(
-                <div key={sec.id} style={{marginBottom:10,paddingBottom:10,borderBottom:"1px solid #f1f5f9"}}>
+                <div key={sec.id} style={{marginBottom:10,paddingBottom:10,borderBottom:"1px solid #f1f5f9",opacity:hidden?0.5:1}}>
                   <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
                     <div style={{width:10,height:10,borderRadius:2,background:sec.color,flexShrink:0}}/>
                     <input value={sec.name}
                       onChange={e=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,name:e.target.value}:x))}
                       style={{flex:1,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:4,fontSize:11,fontFamily:"inherit"}}/>
+                    <button onClick={()=>setHiddenSections(prev=>({...prev,[sec.id]:!prev[sec.id]}))}
+                      title={hidden?"Show this section on the canvas":"Hide this section on the canvas"}
+                      style={{padding:"1px 6px",border:"none",background:hidden?"#e2e8f0":"#f1f5f9",color:hidden?"#64748b":"#475569",borderRadius:4,fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>
+                      {hidden?"🚫":"👁"}
+                    </button>
                     <button onClick={()=>setSections(prev=>prev.filter(x=>x.id!==sec.id))}
                       style={{padding:"1px 6px",border:"none",background:"#fee2e2",color:"#ef4444",borderRadius:4,fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>✕</button>
                   </div>
                   <div style={{display:"flex",alignItems:"center",gap:6}}>
-                    <span style={{fontSize:10,color:"#64748b",width:30,flexShrink:0}}>Pitch</span>
-                    <input value={sec.pitch ?? ""}
-                      onChange={e=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,pitch:e.target.value||null}:x))}
-                      placeholder="Not set — 4:12 or 30°"
-                      style={{width:62,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:4,fontSize:11,fontFamily:"inherit"}}/>
+                    <span style={{fontSize:10,color:"#64748b",width:44,flexShrink:0}}>Degrees</span>
+                    <button onClick={()=>setSectionPitchModalId(sec.id)}
+                      style={{width:62,textAlign:"left",padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:4,fontSize:11,fontFamily:"inherit",
+                        background:"#fff",cursor:"pointer",color:gs?.pitchUnknown?"#94a3b8":"#0f172a"}}>
+                      {gs?.pitchUnknown ? "Set…" : `${(deriveSectionPitchInput(sec.pitch)?.angleDeg ?? 0).toFixed(2)}°`}
+                    </button>
                     <span style={{fontSize:10,color:"#94a3b8"}}>{gs?.pitchUnknown ? "—" : `×${gs?.pitchFactor||1}`}</span>
                   </div>
                   <div style={{marginTop:5,fontSize:11,color:"#64748b",display:"flex",justifyContent:"space-between"}}>
@@ -2245,12 +2381,21 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                           value={sec.cutAngleDeg ?? Math.round(gs?.pitchAngleDeg ?? 0)}
                           onChange={e=>{
                             const v = e.target.value
-                            setSections(prev=>prev.map(x=>x.id===sec.id?{...x,cutAngleDeg:v===""?null:((parseFloat(v)%180+180)%180)}:x))
+                            // ← Typing a plain number means the section no longer
+                            //   follows a drawn line's exact position, only its
+                            //   angle — clear the stale anchor so the stripe grid
+                            //   goes back to starting at the shape's own edge.
+                            setSections(prev=>prev.map(x=>x.id===sec.id?{...x,cutAngleDeg:v===""?null:((parseFloat(v)%180+180)%180),cutAngleAnchor:null}:x))
                           }}
                           style={{width:56,padding:"2px 6px",border:"1px solid #e2e8f0",borderRadius:4,fontSize:11,fontFamily:"inherit"}}/>
                         <span style={{fontSize:10,color:"#94a3b8"}}>°</span>
+                        <button onClick={()=>{setCutAngleDrawSectionId(sec.id);setCutAngleLine(null);setDrawPts([]);setActiveTool("cutangle")}}
+                          title="Click two points on the photo (e.g. along a visible rafter/ridge line) to set this angle"
+                          style={{padding:"1px 6px",border:`1px solid ${activeTool==="cutangle"&&cutAngleDrawSectionId===sec.id?"#f59e0b":"#e2e8f0"}`,background:activeTool==="cutangle"&&cutAngleDrawSectionId===sec.id?"#fffbeb":"transparent",color:"#64748b",borderRadius:4,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+                          🧭
+                        </button>
                         {sec.cutAngleDeg!=null && (
-                          <button onClick={()=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,cutAngleDeg:null}:x))}
+                          <button onClick={()=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,cutAngleDeg:null,cutAngleAnchor:null}:x))}
                             style={{padding:"1px 6px",border:"1px solid #e2e8f0",background:"transparent",color:"#64748b",borderRadius:4,fontSize:10,cursor:"pointer",fontFamily:"inherit"}}>
                             Reset
                           </button>
@@ -2258,7 +2403,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                       </div>
                       <input type="range" min={0} max={179} step={1}
                         value={sec.cutAngleDeg ?? Math.round(gs?.pitchAngleDeg ?? 0)}
-                        onChange={e=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,cutAngleDeg:parseFloat(e.target.value)}:x))}
+                        onChange={e=>setSections(prev=>prev.map(x=>x.id===sec.id?{...x,cutAngleDeg:parseFloat(e.target.value),cutAngleAnchor:null}:x))}
                         style={{width:"100%",marginBottom:5}}/>
                       {gs?.sheetsTooMany && (
                         <div style={{fontSize:10,color:"#ef4444",marginBottom:4}}>
@@ -2386,58 +2531,32 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 
       {sectionPitchModalId && (() => {
         const section = sections.find(s=>s.id===sectionPitchModalId)
-        // ← Max ratio rise is a tighter, AU/NZ-practical bound (24:12 ≈
-        //   63.4°) sitting well under the hard physical ceiling for degrees
-        //   mode (85°, since a roof can't reach 90°/vertical — that's a
-        //   wall, not a roof plane, and 1/cos(90°) is undefined).
+        // ← A roof plane can't reach 90°/vertical — that's a wall, not a
+        //   roof — so the ceiling sits comfortably under that hard physical
+        //   limit (1/cos(90°) is undefined).
         const MAX_PITCH_DEG = 85
-        const MAX_RATIO_RISE = 24
-        const formatForMode = (mode, deg) => {
-          if(deg==null || isNaN(deg)) return ""
-          return mode==="ratio"
-            ? String(Math.round(12*Math.tan(deg*Math.PI/180)*100)/100)
-            : String(Math.round(deg*10)/10)
-        }
         // ← Canonical state while the dialog is open: `angleDeg` is the one
-        //   true numeric source of truth (full precision). `rawInput` is
-        //   exactly what's in the currently-editable field. Switching modes
-        //   never converts from displayed text — it only reformats the
-        //   other field fresh from `angleDeg`, so repeated switching can't
-        //   accumulate rounding error the way editing a chain of already-
-        //   rounded displayed numbers would.
+        //   true numeric source of truth (full precision), `rawInput` is
+        //   exactly what's in the editable field. Degrees-only — seeded via
+        //   deriveSectionPitchInput, which still understands a legacy
+        //   ratio-format string (e.g. "5:12") from before this dialog was
+        //   simplified, converting it to its equivalent angle so old data
+        //   keeps opening correctly even though editing is degrees-only now.
         const pending = pendingSectionPitch || (() => {
           const derived = deriveSectionPitchInput(section?.pitch)
           return derived
-            ? { mode: derived.mode, angleDeg: derived.angleDeg, rawInput: formatForMode(derived.mode, derived.angleDeg) }
-            : { mode: "ratio", angleDeg: null, rawInput: "" } // fresh section: Ratio is the AU/NZ default
+            ? { angleDeg: derived.angleDeg, rawInput: String(Math.round(derived.angleDeg*10)/10) }
+            : { angleDeg: null, rawInput: "" }
         })()
         const angleDeg = pending.angleDeg
-        const proceedToBrand = () => { setSectionPitchModalId(null); setPendingSectionPitch(null); setSectionMaterialModalId(sectionPitchModalId) }
-        // ← "Unknown Pitch" (was "Skip") — explicitly marks the section as
-        //   having no pitch yet, instead of silently leaving whatever
-        //   default it was created with. Also wired to the modal's own
-        //   close/X so dismissing any way lands in the same explicit state.
-        const useUnknownPitch = () => {
-          setSections(prev=>prev.map(s=>s.id===sectionPitchModalId?{...s,pitch:null}:s))
-          proceedToBrand()
-        }
-        const switchMode = (mode) => {
-          if(mode===pending.mode) return
-          setPendingSectionPitch({ mode, angleDeg, rawInput: formatForMode(mode, angleDeg) })
-        }
         const updateActive = (raw) => {
           const v = parseFloat(raw)
-          const newAngle = raw==="" ? null : (isNaN(v) ? angleDeg : (
-            pending.mode==="ratio" ? Math.atan(v/12)*180/Math.PI : v
-          ))
-          setPendingSectionPitch({ ...pending, rawInput: raw, angleDeg: newAngle })
+          const newAngle = raw==="" ? null : (isNaN(v) ? angleDeg : v)
+          setPendingSectionPitch({ rawInput: raw, angleDeg: newAngle })
         }
-        const riseVal = pending.mode==="ratio" ? parseFloat(pending.rawInput) : null
         let pitchError = null
         if(pending.rawInput!==""){
-          if(pending.mode==="ratio"){
-            if(isNaN(riseVal) || riseVal<0 || riseVal>MAX_RATIO_RISE) pitchError = `Enter a rise between 0 and ${MAX_RATIO_RISE} (over a 12 run).`
-          } else if(isNaN(angleDeg) || angleDeg<0 || angleDeg>=90){
+          if(isNaN(angleDeg) || angleDeg<0 || angleDeg>=90){
             pitchError = `A roof pitch cannot be 90°. A 90° surface is a wall, not a roof plane.`
           } else if(angleDeg>=MAX_PITCH_DEG){
             pitchError = `Enter an angle between 0° and ${MAX_PITCH_DEG}°.`
@@ -2448,45 +2567,41 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         const gsForModal = geometry.sections.find(x=>x.id===sectionPitchModalId)
         const planArea = gsForModal?.footprint_m2 ?? 0
         const surfaceAreaPreview = multiplier!=null ? planArea*multiplier : null
-        const equivDegDisplay = hasValidAngle ? `${angleDeg.toFixed(2)}°` : "—"
         const equivRatioDisplay = hasValidAngle ? `${Math.round(12*Math.tan(angleDeg*Math.PI/180)*100)/100} : 12` : "—"
+        const closeModal = () => { setSectionPitchModalId(null); setPendingSectionPitch(null) }
         const confirmPitch = () => {
           if(pending.rawInput==="" || pitchError) return
-          const pitch = pending.mode==="ratio" ? `${pending.rawInput}:12` : `${pending.rawInput}°`
-          setSections(prev=>prev.map(s=>s.id===sectionPitchModalId?{...s,pitch}:s))
-          proceedToBrand()
+          const id = sectionPitchModalId
+          const pitch = `${pending.rawInput}°`
+          setSections(prev=>prev.map(s=>s.id===id?{...s,pitch}:s))
+          closeModal()
+          // ← Only chain into the brand-picker for a section that doesn't
+          //   have a material yet (the original "just finished tracing"
+          //   flow) — re-editing an already-configured section's pitch from
+          //   the sidebar shouldn't force a re-pick of its material every time.
+          if(!section?.materialLabel) setSectionMaterialModalId(id)
         }
         return (
-        <Modal title="Roof Pitch" onClose={useUnknownPitch} width={380}>
+        <Modal title="Roof Pitch" onClose={closeModal} width={380}>
           <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
-            What's the pitch of <strong>{section?.name}</strong>? You can fine-tune this later in the sidebar or Estimate step.
-          </div>
-          <div style={{display:"flex",gap:8,marginBottom:12}}>
-            {["ratio","degrees"].map(mode=>(
-              <button key={mode} type="button" onClick={()=>switchMode(mode)}
-                style={{flex:1,padding:"7px 0",borderRadius:8,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
-                  border:pending.mode===mode?"2px solid #f59e0b":"1px solid #e2e8f0",
-                  background:pending.mode===mode?"#fffbeb":"#fff"}}>
-                {mode==="ratio" ? "Ratio (X:12)" : "Degrees (°)"}
-              </button>
-            ))}
+            What's the pitch of <strong>{section?.name}</strong>? You can fine-tune this later from the sidebar.
           </div>
           <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:pitchError?4:14}}>
-            <span style={{fontSize:11,color:"#64748b",width:56,flexShrink:0}}>{pending.mode==="ratio"?"Rise":"Degrees"}</span>
-            <input type="number" min="0" max={pending.mode==="degrees"?MAX_PITCH_DEG:MAX_RATIO_RISE} step="any" autoFocus value={pending.rawInput}
+            <span style={{fontSize:11,color:"#64748b",width:56,flexShrink:0}}>Degrees</span>
+            <input type="number" min="0" max={MAX_PITCH_DEG} step="any" autoFocus value={pending.rawInput}
               onChange={e=>updateActive(e.target.value)}
               onKeyDown={e=>{ if(e.key==="Enter" && pending.rawInput && !pitchError) confirmPitch() }}
-              placeholder={pending.mode==="ratio" ? "e.g. 5" : "e.g. 22.62"}
+              placeholder="e.g. 22.62"
               style={{...s.input,flex:1,...(pitchError?{borderColor:"#ef4444"}:{})}}/>
-            <span style={{fontSize:13,color:"#64748b",fontWeight:600}}>{pending.mode==="ratio" ? ": 12" : "°"}</span>
+            <span style={{fontSize:13,color:"#64748b",fontWeight:600}}>°</span>
           </div>
           {pitchError && (
             <div style={{fontSize:11,color:"#ef4444",marginBottom:12}}>{pitchError}</div>
           )}
           <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:8,padding:"10px 12px",marginBottom:16,display:"flex",flexDirection:"column",gap:6}}>
             <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
-              <span style={{color:"#64748b"}}>{pending.mode==="ratio" ? "Equivalent Angle" : "Equivalent Ratio"}</span>
-              <span style={{fontWeight:600}}>{pending.mode==="ratio" ? equivDegDisplay : equivRatioDisplay}</span>
+              <span style={{color:"#64748b"}}>Equivalent Ratio</span>
+              <span style={{fontWeight:600}}>{equivRatioDisplay}</span>
             </div>
             <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
               <span style={{color:"#64748b"}}>Surface Multiplier</span>
@@ -2502,7 +2617,6 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
             </div>
           </div>
           <div style={{display:"flex",justifyContent:"flex-end",gap:10}}>
-            <Btn onClick={useUnknownPitch}>Unknown Pitch</Btn>
             <Btn primary style={{opacity:(pending.rawInput && !pitchError)?1:.5}} onClick={confirmPitch}>Save</Btn>
           </div>
         </Modal>
