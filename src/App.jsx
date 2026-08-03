@@ -8,6 +8,7 @@ import { useAuth } from "./AuthContext"
 import LoginPage   from "./LoginPage"
 import SignupPage  from "./SignupPage"
 import { CurrencyProvider, useCurrency } from "./CurrencyContext"
+import { TaxProvider, useTax } from "./TaxContext"
 import jsPDF from "jspdf"
 import html2canvas from "html2canvas"
 import LiveCameraMeasurements from "./LiveCamera/LiveCameraMeasurement";
@@ -38,6 +39,10 @@ const PITCHES = [
 ]
 
 const RATES = { flashings: 28, guttering: 45, downpipe: 35, drain: 40, penetration: 65, underlayment: 8 }
+// ← Fallback only, for when no rate was resolved/threaded through (e.g. old
+//   saved estimates predating gst_rate). The real, dynamic rate now comes
+//   from the caller's organization's tax_country setting — see TaxContext
+//   and calcEst's `e.gstRate` below — not this constant.
 const GST_RATE = 0.15
 
 const DEFAULT_SETTINGS = {
@@ -130,9 +135,42 @@ function calcEst(e) {
   const sub       = matCost + flashCost + gutCost + downpipeCost + drainCost + penetrationCost + labCost
   const marginAmt = sub * ((e.margin||0)/100)
   const sellPrice = sub + marginAmt
-  const gst       = sellPrice * GST_RATE
+  const gstRate   = e.gstRate ?? GST_RATE
+  const gst       = sellPrice * gstRate
   const total     = sellPrice + gst
-  return { ...e, adjArea, matCost, flashCost, gutCost, downpipeCost, drainCost, penetrationCost, labCost, marginAmt, sellPrice, gst, total }
+  return { ...e, adjArea, matCost, flashCost, gutCost, downpipeCost, drainCost, penetrationCost, labCost, marginAmt, sellPrice, gst, gstRate, total }
+}
+
+// ← Every quote line's materialLabel is built by MaterialPicker.pick() as
+//   "{supplier} — {description}" — this pulls just the supplier/brand part
+//   back out, so it can be shown once as a group heading instead of
+//   repeating on every line that happens to use the same product.
+function extractBrand(materialLabel) {
+  if (!materialLabel) return null
+  const idx = materialLabel.indexOf(" — ")
+  return idx > 0 ? materialLabel.slice(0, idx) : null
+}
+// ← Display-only post-process on an already-built flat quote line list:
+//   when 2+ lines share the same brand, insert one header row for it and
+//   strip "{brand} — " out of each of those lines' own desc (wherever it
+//   appears — at the start for roof sections, after a label prefix like
+//   "Ridge Cap — " for flashing/gutter/accessory lines). A brand used by
+//   only one line is untouched — full description, no heading, exactly as
+//   before — this only kicks in where the repetition actually exists.
+function groupQuoteLinesByBrand(lines) {
+  const counts = {}
+  lines.forEach(l => { if (l.brand) counts[l.brand] = (counts[l.brand]||0) + 1 })
+  const seen = new Set()
+  const out = []
+  lines.forEach(l => {
+    if (l.brand && counts[l.brand] >= 2) {
+      if (!seen.has(l.brand)) { seen.add(l.brand); out.push({ isBrandHeader: true, brand: l.brand }) }
+      out.push({ ...l, desc: l.desc.replace(`${l.brand} — `, ""), indented: true })
+    } else {
+      out.push(l)
+    }
+  })
+  return out
 }
 
 function nextQuoteNum(projects) {
@@ -203,23 +241,6 @@ function Toast({ msg, onDone }) {
   return <div className="fixed bottom-6 right-6 bg-navy text-white px-5 py-3 rounded-xl text-[13px] font-medium z-[9999] flex items-center gap-2 shadow-lg">
     <span className="text-emerald-400 text-base">✓</span> {msg}
   </div>
-}
-
-// ─── Currency selector rendered in the topbar ────────────────────────────────
-function CurrencySelector() {
-  const { currency, currencies, updateCurrency } = useCurrency()
-  return (
-    <select
-      value={currency.code}
-      onChange={e => updateCurrency(e.target.value)}
-      title="Change display currency"
-      className="px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs font-sans bg-white cursor-pointer text-slate-900 font-medium outline-none"
-    >
-      {currencies.map(c => (
-        <option key={c.code} value={c.code}>{c.symbol} {c.code} — {c.name}</option>
-      ))}
-    </select>
-  )
 }
 
 // ─── Billing status banner — past-due payment or seat limit reached.
@@ -771,7 +792,7 @@ function distToSegment(pt, a, b) {
 // about the current zoom or pan.
 const MT_CANVAS_W = 490
 const MT_CANVAS_H = 330
-const MIN_ZOOM = 1
+const MIN_ZOOM = 0.4 // below 1 lets a large/wide roof that doesn't fit at 100% be zoomed out to see fully
 const MAX_ZOOM = 6
 const HIT_RADIUS = 9 // world-space px for grabbing an existing point
 
@@ -820,6 +841,10 @@ function initialScaleLinesFrom(g) {
 const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, photoUrl, onPhotoChange, initialGeometry }, ref) {
   const canvasRef   = useRef(null)
   const imgRef      = useRef(null)
+  // ← True only for the instant getSnapshot() redraws the canvas for capture,
+  //   so on-screen-only UI hints (the "Upload a roof photo…" prompt) are left
+  //   out of the PNG that gets embedded in client quotes.
+  const snapshotModeRef = useRef(false)
   const [imgSrc,    setImgSrc]    = useState(null)
   const [sections,  setSections]  = useState(() => initialSectionsFrom(initialGeometry))
   const [expandedCutSections, setExpandedCutSections] = useState({}) // {[sectionId]: boolean} — cutting-list panel toggle
@@ -896,6 +921,13 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   // ── Editable points ─────────────────────────────────────────────────
   const dragRef = useRef(null) // { kind, id, idx? } currently-dragged point
   const clickStartRef = useRef(null) // {x,y} client coords at mousedown — tells an actual drag apart from a stationary click that happened to land on an existing point
+  // ← Dragging a selected shape to reposition it (Select tool) — captures
+  //   the mousedown world point plus each selected item's ORIGINAL points,
+  //   so every mousemove translates from that fixed snapshot by a plain
+  //   (dx,dy) offset instead of compounding deltas onto already-moved
+  //   points (which drifts). `pushed` mirrors dragPushedRef's "only push
+  //   history on first real movement, not on a non-drag click" pattern.
+  const moveSelectionRef = useRef(null) // { startPt, origSections, origLines, origPoints, pushed }
   const [editMode, setEditMode] = useState(false)
   // ← "Ortho" (PlanSwift/CAD-style orthogonal snap): while tracing, forces
   //   each new point's segment from the previous point to be perfectly
@@ -947,6 +979,11 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   const [lineContextMenu, setLineContextMenu] = useState(null) // {x,y} | null
   const [selection, setSelection] = useState({ sections:[], lines:[], points:[], scale:false, scaleLineIds:[] })
   const selectionCount = selection.sections.length + selection.lines.length + selection.points.length + (selection.scale?1:0) + selection.scaleLineIds.length
+  // ← Explicit "Move" toggle — dragging inside a selection only repositions
+  //   it while this is on, so an accidental drag (e.g. while just trying to
+  //   click/select something) can't shift a shape unintentionally. Stays on
+  //   across multiple drags until clicked again, like a normal Move tool.
+  const [moveArmed, setMoveArmed] = useState(false)
 
   // ← In-app "duplicate shape" clipboard — holds the actual traced geometry
   //   (points/pitch/material/etc, same shape as `sections`/`lineItems`/
@@ -956,12 +993,6 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   const [shapeClipboard, setShapeClipboard] = useState(null) // {sections,lines,points} | null
   const [pastePopup, setPastePopup] = useState(null) // {x,y (screen), worldPt} | null — right-click "Paste" popup
   const [shapeCopyMsg, setShapeCopyMsg] = useState("") // short confirmation label shown on the Copy/Paste buttons
-
-  // ← Lets the parent wizard grab a PNG snapshot of the traced canvas (for
-  //   embedding in generated quotes) without owning the canvas ref itself.
-  useImperativeHandle(ref, () => ({
-    getSnapshot: () => canvasRef.current?.toDataURL("image/png") || null,
-  }))
 
   // ← Each confirmed reference line yields its own meters-per-pixel ratio;
   //   mPerPx is the average across all of them so a photo carrying more
@@ -1018,6 +1049,11 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     const sfY = axisScale ? axisScale.y : sfIso
     const squashRatio = sfX/sfY
     const squash = pts => squashRatio===1 ? pts : pts.map(p=>({x:p.x*squashRatio, y:p.y}))
+    // ← Letter only assigned to sections that actually produce sheets (a
+    //   section with no pitch yet has sheets:[] and consumes no letter), so
+    //   the exported Measurement Plan's A/B/C sequence stays gap-free
+    //   instead of skipping a letter for an incomplete section.
+    let sectionLetterCounter = 0
     const processedSections = sections.map((sec)=>{
       const sqPts = squash(sec.pts)
       const fpPx = sec.closed ? polyAreaPx(sqPts) : 0
@@ -1103,6 +1139,16 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           installationOrder: i+1,
         }))
       }
+      // ← Sheet codes (e.g. "A-S01") for the exported Measurement Plan only
+      //   — see drawCanvas's pill label and getSnapshot's legend composite.
+      //   Assigned here (not on-canvas) since installationOrder/section
+      //   identity are already resolved at this point.
+      let sectionCode = null
+      if(sheets.length){
+        sectionCode = String.fromCharCode(65+sectionLetterCounter)
+        sectionLetterCounter++
+        sheets = sheets.map(s=>({...s, sectionCode, sheetCode:`${sectionCode}-S${String(s.installationOrder).padStart(2,"0")}`}))
+      }
       const sheet_lengths_m = sheets.map(s=>s.lengthM)
       // ← Perimeter/longest edge/centroid: available as soon as the
       //   polygon closes, independent of pitch — matches how a roof
@@ -1186,8 +1232,81 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   // ← Lets the wizard grab a PNG of the traced canvas (sections, labels, m²)
   //   to embed in the generated quote — mirrors the marked-up roof plan
   //   images attached in the reference quotation template.
+  //   getOriginalPhoto returns the separate, UNDRAWN-ON photo so reopening
+  //   this project later traces on a clean image rather than the flattened
+  //   snapshot (which has the previous drawing baked into its pixels).
+  //   Two shapes, since a photo arrives either way:
+  //     · a freshly-picked local file → a `data:` URL needing upload
+  //     · one chosen from the job photo library → already a hosted http(s)
+  //       URL, so it's passed straight through with nothing to re-upload
+  //   (that second case previously returned null, leaving job-photo projects
+  //   with no original saved at all).
   useImperativeHandle(ref, () => ({
-    getSnapshot: () => canvasRef.current?.toDataURL("image/png") || null,
+    // ← Redraws once with the on-screen "Upload a roof photo…" placeholder
+    //   suppressed before capturing, then restores the normal view. That
+    //   prompt is UI guidance for the person tracing; baking it into the
+    //   saved PNG put it straight into the client-facing quote whenever a
+    //   project had no photo.
+    getSnapshot: () => {
+      const cv = canvasRef.current
+      if(!cv) return null
+      snapshotModeRef.current = true
+      drawCanvas()
+
+      // ← Sheet-code legend, composed only into the exported snapshot (never
+      //   the live canvas) — reflowing the live 490x330 canvas to reserve a
+      //   permanent column would touch the pan/zoom/hit-testing math used
+      //   throughout editing. Instead a second, wider canvas is built here
+      //   just for export, with the already-rendered base canvas copied in
+      //   via drawImage (canvas-to-canvas, synchronous — no data-URL/Image
+      //   round trip needed).
+      const legendSections = geometry.sections.filter(gs=>gs.sheets?.length)
+      let url
+      if(legendSections.length){
+        const dprScale = cv.width / MT_CANVAS_W
+        const legendW  = Math.round(130*dprScale)
+        const rowH     = Math.round(13*dprScale)
+        const padTop   = Math.round(14*dprScale)
+        const rowCount = legendSections.reduce((n,ls)=>n+1+ls.sheets.length,0)
+        const legendH  = padTop*2 + rowCount*rowH
+        const composite = document.createElement("canvas")
+        composite.width  = cv.width + legendW
+        composite.height = Math.max(cv.height, legendH)
+        const cctx = composite.getContext("2d")
+        cctx.fillStyle = "#ffffff"
+        cctx.fillRect(0,0,composite.width,composite.height)
+        cctx.textBaseline = "alphabetic"
+        let y = padTop
+        const headerFontPx = Math.round(10*dprScale)
+        const rowFontPx    = Math.round(9*dprScale)
+        legendSections.forEach(ls=>{
+          cctx.font = `bold ${headerFontPx}px DM Sans`
+          cctx.fillStyle = "#1e293b"
+          cctx.fillText(`SECTION ${ls.sheets[0].sectionCode}`, Math.round(10*dprScale), y)
+          y += rowH
+          cctx.font = `${rowFontPx}px DM Sans`
+          cctx.fillStyle = "#334155"
+          ls.sheets.forEach(s=>{
+            cctx.fillText(`${s.sheetCode}   ${s.lengthM.toFixed(2)}m`, Math.round(14*dprScale), y)
+            y += rowH
+          })
+        })
+        cctx.drawImage(cv, legendW, 0)
+        url = composite.toDataURL("image/png")
+      } else {
+        url = cv.toDataURL("image/png")
+      }
+
+      snapshotModeRef.current = false
+      drawCanvas()
+      return url
+    },
+    getOriginalPhoto: () => {
+      if(!imgSrc) return null
+      return imgSrc.startsWith("data:")
+        ? { dataUrl: imgSrc }
+        : { url: imgSrc.replace(/^https?:\/\/[^/]+/, "") } // store app-relative, same as snapshot_url
+    },
   }))
 
   // Screen (rendered CSS pixels) -> world (fixed MT_CANVAS_W x MT_CANVAS_H
@@ -1205,10 +1324,17 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 
   function clampView(v) {
     const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v.zoom))
-    const maxOffX = MT_CANVAS_W * (zoom - 1) + MT_CANVAS_W*0.3
-    const maxOffY = MT_CANVAS_H * (zoom - 1) + MT_CANVAS_H*0.3
-    const minOffX = -MT_CANVAS_W*(zoom-1) - MT_CANVAS_W*0.3
-    const minOffY = -MT_CANVAS_H*(zoom-1) - MT_CANVAS_H*0.3
+    // ← Math.max(0, zoom-1) instead of a bare (zoom-1): below 100% zoom that
+    //   term would go negative and invert these bounds (min > max), locking
+    //   panning to a single fixed offset. Below 100% the content already
+    //   fits the viewport, so it only needs the flat 0.3-canvas-width nudge
+    //   margin, not additional pan range.
+    const rangeX = MT_CANVAS_W * Math.max(0, zoom-1)
+    const rangeY = MT_CANVAS_H * Math.max(0, zoom-1)
+    const maxOffX = rangeX + MT_CANVAS_W*0.3
+    const maxOffY = rangeY + MT_CANVAS_H*0.3
+    const minOffX = -rangeX - MT_CANVAS_W*0.3
+    const minOffY = -rangeY - MT_CANVAS_H*0.3
     return { zoom, offX: Math.min(maxOffX, Math.max(minOffX, v.offX)), offY: Math.min(maxOffY, Math.max(minOffY, v.offY)) }
   }
 
@@ -1362,6 +1488,14 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     const ctx=cv.getContext("2d")
     ctx.setTransform(1,0,0,1,0,0)
     ctx.clearRect(0,0,cv.width,cv.height)
+    // ← Fixed white backdrop, drawn before the pan/zoom transform below (raw
+    //   device-pixel space) so it always fully covers the canvas regardless
+    //   of view.zoom/offX/offY — otherwise, zoomed out with no photo loaded,
+    //   the old MT_CANVAS_W×MT_CANVAS_H fill (inside the transform) shrinks
+    //   smaller than the visible canvas and exposes whatever's behind it.
+    //   Only the photo/drawing themselves should zoom/pan, not this backdrop.
+    ctx.fillStyle="#fff"
+    ctx.fillRect(0,0,cv.width,cv.height)
     ctx.save()
     // ← Backing store is now sized to the canvas's actual displayed CSS size
     //   × devicePixelRatio (see the resize effect below), not the fixed
@@ -1405,8 +1539,12 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
 
     if(imgRef.current){ ctx.drawImage(imgRef.current,0,0,MT_CANVAS_W,MT_CANVAS_H) }
-    else{
-      ctx.fillStyle="#fff"; ctx.fillRect(0,0,MT_CANVAS_W,MT_CANVAS_H)
+    else if(!snapshotModeRef.current){
+      // ← No separate fill needed here anymore — the fixed white backdrop
+      //   drawn above (outside the pan/zoom transform) already covers this.
+      //   Skipped entirely during snapshot capture: this is an on-screen
+      //   prompt for whoever's tracing, not something a client should see
+      //   printed across the roof plan in their quote.
       ctx.fillStyle="rgba(15,23,42,0.35)"; ctx.font=`${12/view.zoom}px DM Sans`; ctx.textAlign="center"
       ctx.fillText("Upload a roof photo or aerial image above",MT_CANVAS_W/2,MT_CANVAS_H/2-10)
       ctx.fillText("then click to trace sections, flashings & accessories",MT_CANVAS_W/2,MT_CANVAS_H/2+10)
@@ -1467,8 +1605,11 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       //   length pill from every section rendered simultaneously, totally
       //   cluttering the photo. Reuses the same expand state the sidebar
       //   panel already has, so expanding one section's list there also
-      //   reveals it here.
-      if(sec.closed && sec.pts.length>=3 && gs?.sheets?.length && expandedCutSections[sec.id]){
+      //   reveals it here. Snapshot capture (the exported Measurement Plan)
+      //   forces every section's pills on regardless of that toggle — sheet
+      //   codes are meant to always be on the on-site reference, live
+      //   editing keeps the opt-in clutter control.
+      if(sec.closed && sec.pts.length>=3 && gs?.sheets?.length && (expandedCutSections[sec.id] || snapshotModeRef.current)){
         const sheets = gs.sheets
         {
           ctx.save()
@@ -1498,7 +1639,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
             const ay = top.y + (bot.y-top.y)*t
             let ang = Math.atan2(bot.y-top.y, bot.x-top.x)
             if(ang>Math.PI/2) ang-=Math.PI; else if(ang<-Math.PI/2) ang+=Math.PI
-            const label = `${s.lengthM.toFixed(2)}m`
+            const label = s.sheetCode || `${s.lengthM.toFixed(2)}m`
             ctx.save()
             ctx.translate(ax,ay); ctx.rotate(ang)
             const fontPx=9/view.zoom
@@ -1908,6 +2049,33 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       }
     }
     if(activeTool==="select"){
+      // ← Clicking inside the existing selection's highlighted bounding box
+      //   (same box drawn around a selection, see drawCanvas) starts a move
+      //   instead of a brand new marquee — lets a selected shape be dragged
+      //   to reposition it, not just selected/copied/deleted. Gated behind
+      //   the explicit Move toggle so an ordinary click/drag while selecting
+      //   things can't shift a shape by accident.
+      if(moveArmed && selectionCount>0){
+        const selPts = [
+          ...sections.filter(s=>selection.sections.includes(s.id)).flatMap(s=>s.pts),
+          ...lineItems.filter(l=>selection.lines.includes(l.id)).flatMap(l=>l.pts),
+          ...ptItems.filter(p=>selection.points.includes(p.id)).map(p=>({x:p.x,y:p.y})),
+        ]
+        if(selPts.length){
+          const x1=Math.min(...selPts.map(p=>p.x))-6, x2=Math.max(...selPts.map(p=>p.x))+6
+          const y1=Math.min(...selPts.map(p=>p.y))-6, y2=Math.max(...selPts.map(p=>p.y))+6
+          if(pt.x>=x1 && pt.x<=x2 && pt.y>=y1 && pt.y<=y2){
+            moveSelectionRef.current = {
+              startPt: pt,
+              origSections: sections.filter(s=>selection.sections.includes(s.id)).map(s=>({id:s.id,pts:s.pts,cutAngleAnchor:s.cutAngleAnchor||null})),
+              origLines: lineItems.filter(l=>selection.lines.includes(l.id)).map(l=>({id:l.id,pts:l.pts})),
+              origPoints: ptItems.filter(p=>selection.points.includes(p.id)).map(p=>({id:p.id,x:p.x,y:p.y})),
+              pushed: false,
+            }
+            return
+          }
+        }
+      }
       setSelectBox({ start:pt, current:pt })
       return
     }
@@ -1936,9 +2104,30 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       moveHit(dragRef.current, pt)
       return
     }
+    if(moveSelectionRef.current){
+      const m = moveSelectionRef.current
+      if(!m.pushed){ pushHistory(); m.pushed = true }
+      const dx = pt.x-m.startPt.x, dy = pt.y-m.startPt.y
+      if(m.origSections.length) setSections(prev=>prev.map(s=>{
+        const orig = m.origSections.find(o=>o.id===s.id)
+        if(!orig) return s
+        return { ...s, pts:orig.pts.map(p=>({x:p.x+dx,y:p.y+dy})),
+          cutAngleAnchor: orig.cutAngleAnchor ? {x:orig.cutAngleAnchor.x+dx,y:orig.cutAngleAnchor.y+dy} : s.cutAngleAnchor }
+      }))
+      if(m.origLines.length) setLineItems(prev=>prev.map(l=>{
+        const orig = m.origLines.find(o=>o.id===l.id)
+        return orig ? { ...l, pts:orig.pts.map(p=>({x:p.x+dx,y:p.y+dy})) } : l
+      }))
+      if(m.origPoints.length) setPtItems(prev=>prev.map(p=>{
+        const orig = m.origPoints.find(o=>o.id===p.id)
+        return orig ? { ...p, x:orig.x+dx, y:orig.y+dy } : p
+      }))
+      return
+    }
     setHoverPt(pt)
   }
   function handleMouseUp(e){
+    if(moveSelectionRef.current){ moveSelectionRef.current = null; return }
     if(selectBox){
       const x1=Math.min(selectBox.start.x,selectBox.current.x), x2=Math.max(selectBox.start.x,selectBox.current.x)
       const y1=Math.min(selectBox.start.y,selectBox.current.y), y2=Math.max(selectBox.start.y,selectBox.current.y)
@@ -1970,7 +2159,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
     panRef.current = null; dragRef.current = null; clickStartRef.current = null
   }
-  function handleMouseLeave(){ panRef.current = null; dragRef.current = null; clickStartRef.current = null; setSelectBox(null); setHoverPt(null) }
+  function handleMouseLeave(){ panRef.current = null; dragRef.current = null; clickStartRef.current = null; moveSelectionRef.current = null; setSelectBox(null); setHoverPt(null) }
 
   function handleClick(pt){
     pushHistory()
@@ -2140,7 +2329,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     {key:"drain",      label:"Roof Drain",  icon:"⊙",color:"#6366f1",hint:"Click canvas to place a roof drain (DR) marker"},
     {key:"penetration",label:"Penetration", icon:"◇",color:"#8b5cf6",hint:"Click to place — select type below"},
     {key:"scale",      label:"Calibrate Image", icon:"📏",color:"#10b981",hint:"Click two points over a known dimension · right-click to cancel"},
-    {key:"select",     label:"Select",      icon:"⬚",color:"#ef4444",hint:"Drag a box over items to select them · Delete to remove · Ctrl+C to copy · Ctrl+V or right-click to paste a duplicate"},
+    {key:"select",     label:"Select",      icon:"⬚",color:"#ef4444",hint:"Drag a box over items to select them, then drag inside the selection to move it · Delete to remove · Ctrl+C to copy · Ctrl+V or right-click to paste a duplicate"},
     {key:"pan",        label:"Pan",         icon:"✋",color:"#64748b",hint:"Drag to pan the image (or hold Space with any tool)"},
   ]
 
@@ -2154,9 +2343,9 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       <div style={{border:"2px dashed #e2e8f0",borderRadius:10,padding:"13px 18px",cursor:"pointer",marginBottom:12,background:"#f8fafc",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}
         onClick={()=>document.getElementById("mt-upload").click()}>
         <input id="mt-upload" type="file" accept="image/*" style={{display:"none"}} onChange={e=>e.target.files[0]&&loadImage(e.target.files[0])}/>
-        <span style={{fontSize:13,color:"#64748b"}}>📷 Upload aerial or site photo <span style={{color:"#94a3b8",fontSize:11}}>(JPG / PNG / HEIC)</span></span>
+        <span style={{fontSize:13,color:"#64748b"}}>📷 {imgSrc ? "Replace photo" : "Upload aerial or site photo"} <span style={{color:"#94a3b8",fontSize:11}}>(JPG / PNG / HEIC)</span></span>
         {imgSrc
-          ? <span style={{fontSize:11,color:"#10b981",fontWeight:500}}>✓ Photo loaded</span>
+          ? <span style={{fontSize:11,color:"#10b981",fontWeight:500}}>✓ Photo loaded — click to replace</span>
           : <span style={{fontSize:11,color:"#94a3b8"}}>or draw on blank canvas →</span>}
       </div>
 
@@ -2165,7 +2354,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           <div className="mt-toolbar" style={{display:"flex",alignItems:"center",gap:5,padding:"8px 10px",background:"#1e293b",flexWrap:"wrap"}}>
             {TOOLS.map(t=>(
               <button key={t.key}
-                onClick={()=>{setActiveTool(t.key);setDrawPts([]); if(t.key!=="select"){setSelection({sections:[],lines:[],points:[],scale:false,scaleLineIds:[]});setSelectBox(null)}}}
+                onClick={()=>{setActiveTool(t.key);setDrawPts([]); if(t.key!=="select"){setSelection({sections:[],lines:[],points:[],scale:false,scaleLineIds:[]});setSelectBox(null);setMoveArmed(false)}}}
                 style={{padding:"5px 9px",borderRadius:6,
                   border:`1px solid ${activeTool===t.key?t.color:"rgba(255,255,255,0.14)"}`,
                   background:activeTool===t.key?t.color+"28":"transparent",
@@ -2223,6 +2412,13 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                   title="Copy the selected shape(s) — then press Ctrl+V or right-click anywhere to paste a duplicate"
                   style={{padding:"5px 10px",borderRadius:6,border:`1px solid ${shapeCopyMsg?"#10b981":"#475569"}`,background:shapeCopyMsg?"#10b98122":"transparent",color:shapeCopyMsg?"#10b981":"#94a3b8",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:4}}>
                   {shapeCopyMsg || `⧉ Copy (${selectionCount})`}
+                </button>
+              )}
+              {activeTool==="select"&&selectionCount>0&&(
+                <button onClick={()=>setMoveArmed(a=>!a)}
+                  title={moveArmed ? "Move mode on — click and hold inside the selection, then drag" : "Turn on Move, then click and hold inside the selection to drag it"}
+                  style={{padding:"5px 10px",borderRadius:6,border:`1px solid ${moveArmed?"#3b82f6":"#475569"}`,background:moveArmed?"#3b82f622":"transparent",color:moveArmed?"#3b82f6":"#94a3b8",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:4}}>
+                  🤚 Move{moveArmed?" (on)":""}
                 </button>
               )}
               {activeTool==="select"&&selectionCount>0&&(
@@ -2307,7 +2503,24 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 
         <div className="mt-sidepanel" style={{display:"flex",flexDirection:"column",gap:10,overflowY:"auto",maxHeight:720}}>
           <div style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,padding:12}}>
-            <div style={{fontSize:11,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:.5,marginBottom:10}}>Roof Sections</div>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+              <div style={{fontSize:11,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:.5}}>Roof Sections</div>
+              {sections.length>0 && (() => {
+                // ← Convenience on top of the existing per-section ▸/▾
+                //   toggle, not a replacement — expands/collapses every
+                //   section's cutting list at once (sidebar + canvas, same
+                //   expandedCutSections state) so a multi-section roof
+                //   doesn't need opening one by one to review them all.
+                const allExpanded = sections.every(s=>expandedCutSections[s.id])
+                return (
+                  <button
+                    onClick={()=>setExpandedCutSections(allExpanded ? {} : Object.fromEntries(sections.map(s=>[s.id,true])))}
+                    style={{padding:"2px 8px",border:"1px solid #e2e8f0",background:"transparent",color:"#3b82f6",borderRadius:4,fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+                    {allExpanded ? "Hide all cutting lists" : "Show all cutting lists"}
+                  </button>
+                )
+              })()}
+            </div>
             {sections.length===0&&<div style={{fontSize:11,color:"#94a3b8",textAlign:"center",padding:"8px 0"}}>No sections yet — use ▲ Section tool</div>}
             {sections.map((sec,idx)=>{
               const gs=geometry.sections[idx]
@@ -2967,6 +3180,13 @@ function MaterialPicker({ value, onSelect, unit="m2", group="", catalogUnit="" }
 function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstimateChange }) {
   const { formatMoney: fmt, currency } = useCurrency()   // ← currency-aware fmt
   const cs = currency?.symbol || "$"   // ← for labels/inline strings fmt() can't be used on (not a full money value)
+  // ← Live org setting, recalculated on every render — same as currency
+  //   display, so editing an in-progress estimate always reflects the
+  //   organization's current GST/VAT country. Only an already-saved,
+  //   finalized quote (ProjectDetail/print view) uses the frozen gst_rate
+  //   that was actually applied at save time, so a past quote never
+  //   silently reprices itself if the org's setting changes later.
+  const { gstRate } = useTax()
 
   // ← Job Complexity multipliers are a global, editable list now (Job
   //   Complexity settings page) instead of a hardcoded constant — fetched
@@ -3053,7 +3273,7 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
   //   any other rate in this app (RATES.*) — not pinned to whatever the
   //   factor was when this estimate was first created.
   const complexityFactorValue = complexityLevels.find(c=>c.key===e.complexity)?.factor ?? 1
-  const result = useMemo(()=>calcEst({...e, complexityFactor:complexityFactorValue}),[e, complexityFactorValue])
+  const result = useMemo(()=>calcEst({...e, complexityFactor:complexityFactorValue, gstRate}),[e, complexityFactorValue, gstRate])
   useEffect(()=>{ onEstimateChange?.(result) },[result, onEstimateChange])
 
   // Same wastage % calcEst applies to flashing/gutter cost — recomputed
@@ -3273,7 +3493,7 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
           {row(`Margin (${e.margin}%)`, fmt(result.marginAmt))}
           <div style={{borderTop:"1px solid rgba(255,255,255,0.15)",paddingTop:12,marginTop:4}}>
             {row("Sell Price (excl. GST)", fmt(result.sellPrice), true, true)}
-            {row(`GST (${GST_RATE*100}%)`, fmt(result.gst))}
+            {row(`GST (${(result.gstRate*100).toFixed(0)}%)`, fmt(result.gst))}
             <div style={{display:"flex",justifyContent:"space-between",padding:"12px 0 0",alignItems:"center"}}>
               <span style={{color:"#fff",fontWeight:700,fontSize:15}}>Total inc. GST</span>
               <Money value={fmt(result.total)} size={24} color="#f59e0b"/>
@@ -3388,7 +3608,10 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
       .then(g => { if(!cancelled) { setSnapshotUrl(g?.snapshot_url || null); setHasAsbestosRisk(!!g?.asbestos) } })
       .catch(()=>{ if(!cancelled) { setSnapshotUrl(null); setHasAsbestosRisk(false) } })
     return () => { cancelled = true }
-  },[project?.id, asbestosOverride])
+    // ← `project` (not project?.id) for the same reason as ProjectDetail's
+    //   fetch: re-saving the same project must refresh the quote's roof-plan
+    //   image, and only the object reference changes in that case.
+  },[project, asbestosOverride])
 
   const showAsbestosWarning = asbestosOverride !== undefined ? !!asbestosOverride : hasAsbestosRisk
 
@@ -3405,7 +3628,7 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
   const wasteFactor = 1 + (e.waste||0)/100
 
   const flashingLines = e.flashingRuns?.length
-    ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel} — supply & install`:`${r.label} flashing — supply & install`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0) }))
+    ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel} — supply & install`:`${r.label} flashing — supply & install`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0), brand:extractBrand(r.materialLabel) }))
     : [{ desc:"Flashings — ridge/hip/valley", qty:`${(e.flashings*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.flashings}/m`, total:e.flashCost }]
 
   // ← Each traced roof section gets its own line (brand/name + its own
@@ -3413,26 +3636,26 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
   //   "materialLabel roofing" line, which never showed which brand/product
   //   was actually picked per section.
   const materialLines = e.sections?.length
-    ? e.sections.filter(sec=>sec.surface_m2!=null).map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0) }))
+    ? e.sections.filter(sec=>sec.surface_m2!=null).map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0), brand:extractBrand(sec.materialLabel) }))
     : [{ desc:`${e.materialLabel} roofing — supply & install`, qty:`${e.adjArea?.toFixed(1)} m²`, unit:`${cs}${e.materialRate}`, total:e.matCost }]
 
   // ← Same fix as flashing above: show the actual product picked
   //   (materialLabel, supplier included) instead of a generic "Guttering"/
   //   "Downpipe #1" line with no indication of what was actually quoted.
   const gutterLines = e.gutterRuns?.length
-    ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel} — supply & install`:"Guttering — supply & install", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0) }))
+    ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel} — supply & install`:"Guttering — supply & install", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0), brand:extractBrand(g.materialLabel) }))
     : [{ desc:"Guttering", qty:`${(e.guttering*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.guttering}/m`, total:e.gutCost }]
   const downpipeLines = e.downpipeItems?.length
-    ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel} — supply & install`:`Downpipe #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0 }))
+    ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel} — supply & install`:`Downpipe #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
     : [{ desc:"Downpipes", qty:`${e.downpipes||0} each`, unit:`${cs}${RATES.downpipe}/each`, total:e.downpipeCost||0 }]
   const drainLines = e.drainItems?.length
-    ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel} — supply & install`:`Drain #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0 }))
+    ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel} — supply & install`:`Drain #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
     : [{ desc:"Drains", qty:`${e.drains||0} each`, unit:`${cs}${RATES.drain}/each`, total:e.drainCost||0 }]
   const penetrationLines = e.penetrationItems?.length
-    ? e.penetrationItems.map((p,i)=>({ desc:p.materialLabel?`Penetration #${i+1} — ${p.materialLabel} — supply & seal`:`Penetration #${i+1} — supply & seal`, qty:"1 each", unit:`${cs}${p.rate||0}`, total:p.rate||0 }))
+    ? e.penetrationItems.map((p,i)=>({ desc:p.materialLabel?`Penetration #${i+1} — ${p.materialLabel} — supply & seal`:`Penetration #${i+1} — supply & seal`, qty:"1 each", unit:`${cs}${p.rate||0}`, total:p.rate||0, brand:extractBrand(p.materialLabel) }))
     : [{ desc:"Penetrations", qty:`${e.penetrations||0} each`, unit:`${cs}${RATES.penetration}/each`, total:e.penetrationCost||0 }]
 
-  const quoteLines = [
+  const quoteLines = groupQuoteLinesByBrand([
     ...materialLines,
     ...flashingLines,
     ...gutterLines,
@@ -3440,7 +3663,7 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
     ...drainLines,
     ...penetrationLines,
     { desc:`Labour — installation (${e.days} days)`,        qty:"—",                            unit:"—",                     total:e.labCost   },
-  ].filter(l=>l.total>0)
+  ].filter(l=>l.total>0))
 
   return (
     <div style={{maxWidth:660,width:"100%",background:"#fff",border:"1px solid #e2e8f0",borderRadius:14,padding:32}} className="quote-view-responsive">
@@ -3478,19 +3701,25 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
         <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:420}}>
           <thead>
             <tr>
-              {["Description","Qty","Unit","Total"].map(h=>(
-                <th key={h} style={{textAlign:h==="Total"||h==="Unit"?"right":"left",padding:"8px 10px",fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:.5,color:"#64748b",borderBottom:"1px solid #e2e8f0"}}>{h}</th>
+              {["Description","Qty","Rate","Amount"].map(h=>(
+                <th key={h} style={{textAlign:h==="Amount"||h==="Rate"?"right":"left",padding:"8px 10px",fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:.5,color:"#64748b",borderBottom:"1px solid #e2e8f0"}}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {quoteLines.map((li,i)=>(
-              <tr key={i}>
-                <td style={{padding:"10px",borderBottom:"1px solid #f1f5f9"}}>{li.desc}</td>
-                <td style={{padding:"10px",borderBottom:"1px solid #f1f5f9",whiteSpace:"nowrap"}}>{li.qty}</td>
-                <td style={{padding:"10px",borderBottom:"1px solid #f1f5f9",textAlign:"right"}}>{li.unit}</td>
-                <td style={{padding:"10px",borderBottom:"1px solid #f1f5f9",textAlign:"right",fontWeight:500}}>{fmt(li.total)}</td>
-              </tr>
+              li.isBrandHeader ? (
+                <tr key={i}>
+                  <td colSpan={4} style={{padding:"10px 10px 4px",borderBottom:"1px solid #f1f5f9",fontWeight:700}}>{li.brand}</td>
+                </tr>
+              ) : (
+                <tr key={i}>
+                  <td style={{padding:"10px",paddingLeft:li.indented?22:10,borderBottom:"1px solid #f1f5f9"}}>{li.desc}</td>
+                  <td style={{padding:"10px",borderBottom:"1px solid #f1f5f9",whiteSpace:"nowrap"}}>{li.qty}</td>
+                  <td style={{padding:"10px",borderBottom:"1px solid #f1f5f9",textAlign:"right"}}>{li.unit}</td>
+                  <td style={{padding:"10px",borderBottom:"1px solid #f1f5f9",textAlign:"right",fontWeight:500}}>{fmt(li.total)}</td>
+                </tr>
+              )
             ))}
           </tbody>
         </table>
@@ -3498,7 +3727,7 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
 
       <div style={{display:"flex",justifyContent:"flex-end"}}>
         <div style={{minWidth:240,width:"100%",maxWidth:280}}>
-          {[["Subtotal (excl. GST)", fmt(e.sellPrice)],[`GST (${GST_RATE*100}%)`, fmt(e.gst)]].map(([l,v])=>(
+          {[["Subtotal (excl. GST)", fmt(e.sellPrice)],[`GST (${((e.gstRate ?? GST_RATE)*100).toFixed(0)}%)`, fmt(e.gst)]].map(([l,v])=>(
             <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid #f1f5f9",fontSize:13}}>
               <span style={{color:"#64748b"}}>{l}</span><span style={{fontWeight:500}}>{v}</span>
             </div>
@@ -3571,6 +3800,15 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
   const [geometryFull, setGeometryFull] = useState(null)
   const [geometryLoaded, setGeometryLoaded] = useState(!existingProject)
   const [geometrySnapshotDataUrl, setGeometrySnapshotDataUrl] = useState(null)
+  // ← The clean, undrawn-on photo — separate from geometrySnapshotDataUrl
+  //   (the flattened photo+drawing composite) — captured the same way, so
+  //   reopening this project to edit later has a real photo to trace on top
+  //   of instead of the previous drawing baked into the snapshot's pixels.
+  const [originalPhotoDataUrl, setOriginalPhotoDataUrl] = useState(null)
+  // ← Set instead of the above when the photo came from the job library —
+  //   it's already a hosted asset, so its URL is stored as-is with no upload.
+  const [originalPhotoUrl, setOriginalPhotoUrl] = useState(null)
+
   const measurementToolRef = useRef(null)
 
   const [selectedJobId,       setSelectedJobId]       = useState(existingProject?.jobId||"")
@@ -3642,7 +3880,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
       jobPhotoIds: selectedJobPhotos,
       area: area||0,
       estimate,
-      geometry: geometryFull ? { ...geometryFull, snapshotDataUrl: geometrySnapshotDataUrl } : null,
+      geometry: geometryFull ? { ...geometryFull, snapshotDataUrl: geometrySnapshotDataUrl, originalPhotoDataUrl, originalPhotoUrl } : null,
       quoteNum:  existingProject?.quoteNum  || (estimate ? nextQuoteNum(projects) : ""),
       quoteDate: existingProject?.quoteDate || (estimate ? today() : ""),
       createdAt: existingProject?.createdAt || today(),
@@ -3674,6 +3912,11 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
     if(step===1 && measureMethod==="upload") {
       const snap = measurementToolRef.current?.getSnapshot?.()
       if(snap) setGeometrySnapshotDataUrl(snap)
+      // ← A local file needs uploading (dataUrl); a job-library photo is
+      //   already hosted, so its URL is stored directly (see getOriginalPhoto).
+      const orig = measurementToolRef.current?.getOriginalPhoto?.()
+      if(orig?.dataUrl) { setOriginalPhotoDataUrl(orig.dataUrl); setOriginalPhotoUrl(null) }
+      else if(orig?.url) { setOriginalPhotoUrl(orig.url); setOriginalPhotoDataUrl(null) }
     }
     setStep(n=>n+1)
   }
@@ -3892,10 +4135,37 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
             ))}
           </div>
 
+          {/* ← Older projects were saved before the clean original photo was
+              kept separately from the flattened quote snapshot, so there's
+              genuinely no photo left to restore for them. Say so plainly
+              instead of silently showing a blank canvas (or, as before,
+              showing the flattened snapshot — which painted the old drawing
+              in as uneditable pixels). Traced shapes still restore fine and
+              stay fully editable either way. */}
+          {measureMethod==="upload" && geometryLoaded && !activeMeasurePhotoUrl
+            && !geometryFull?.original_photo_url && geometryFull?.sections?.length>0 && (
+            <div style={{padding:"9px 12px",marginBottom:12,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,fontSize:11.5,color:"#92400e",lineHeight:1.55}}>
+              The original photo wasn't saved for this project (it predates that being stored), so the
+              canvas starts blank. Your traced measurements are all still here and fully editable —
+              upload the photo again above if you want to trace against the image.
+            </div>
+          )}
+
           {measureMethod==="upload" && (
             geometryLoaded ? (
               <MeasurementTool ref={measurementToolRef} onGeometryChange={handleGeometryChange}
-                photoUrl={activeMeasurePhotoUrl || (geometryFull?.snapshot_url ? `${API_ORIGIN}${geometryFull.snapshot_url}` : null)}
+                // ← ONLY the clean original photo is ever used as the tracing
+                //   background. `snapshot_url` must never be used here: it's
+                //   the FLATTENED photo+drawing composite (for embedding in
+                //   quotes), so loading it as a background paints the previous
+                //   session's shapes in as pixels — they look identical to real
+                //   traced shapes but can't be selected, edited or deleted,
+                //   which made deleting a section look permanently broken.
+                //   Each save also re-captured that baked image, compounding it.
+                //   No photo (older projects, saved before originals were kept)
+                //   correctly means a blank canvas + the notice below.
+                photoUrl={activeMeasurePhotoUrl
+                  || (geometryFull?.original_photo_url ? `${API_ORIGIN}${geometryFull.original_photo_url}` : null)}
                 onPhotoChange={setActiveMeasurePhotoUrl}
                 initialGeometry={geometryFull}/>
             ) : (
@@ -4347,13 +4617,18 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
   const [geometrySnapshotUrl, setGeometrySnapshotUrl] = useState(null)
   const [hasAsbestosRisk,     setHasAsbestosRisk]     = useState(false)
 
+  // ← Keyed on the whole `project` object, not `project.id`: saving an edit
+  //   returns to the SAME project, so an id-only dependency never re-ran and
+  //   the Measurement Plan / asbestos flag kept showing the pre-edit values
+  //   until a full page reload. Saving calls setSelectedProject() with a
+  //   fresh object, so the reference change is what signals "refetch now".
   useEffect(()=>{
     let cancelled = false
     estimatesApi.getGeometry(project.id)
       .then(g => { if(!cancelled) { setGeometrySnapshotUrl(g?.snapshot_url || null); setHasAsbestosRisk(!!g?.asbestos) } })
       .catch(()=>{ if(!cancelled) { setGeometrySnapshotUrl(null); setHasAsbestosRisk(false) } })
     return () => { cancelled = true }
-  },[project.id])
+  },[project])
 
   async function updateStatus(newStatus) {
     try {
@@ -4391,27 +4666,27 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
     const wasteFactor = 1 + (e?.waste||0)/100
 
     const flashingLines = e?.flashingRuns?.length
-      ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel} — supply & install`:`${r.label} flashing — supply & install`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0) }))
+      ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel} — supply & install`:`${r.label} flashing — supply & install`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0), brand:extractBrand(r.materialLabel) }))
       : [{ desc:"Flashings — ridge/hip/valley", qty:`${((e?.flashings||0)*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.flashings}/m`, total:e?.flashCost||0 }]
 
     const materialLines = e?.sections?.length
-      ? e.sections.filter(sec=>sec.surface_m2!=null).map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0) }))
+      ? e.sections.filter(sec=>sec.surface_m2!=null).map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0), brand:extractBrand(sec.materialLabel) }))
       : [{ desc:`${e?.materialLabel} roofing — supply & install`, qty:`${e?.adjArea?.toFixed(1)} m²`, unit:`${cs}${e?.materialRate}/m²`, total:e?.matCost||0 }]
 
     const gutterLines = e?.gutterRuns?.length
-      ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel} — supply & install`:"Guttering — supply & install", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0) }))
+      ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel} — supply & install`:"Guttering — supply & install", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0), brand:extractBrand(g.materialLabel) }))
       : [{ desc:"Guttering", qty:`${((e?.guttering||0)*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.guttering}/m`, total:e?.gutCost||0 }]
     const downpipeLines = e?.downpipeItems?.length
-      ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel} — supply & install`:`Downpipe #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0 }))
+      ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel} — supply & install`:`Downpipe #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
       : [{ desc:"Downpipes", qty:`${e?.downpipes||0} each`, unit:`${cs}${RATES.downpipe}/each`, total:e?.downpipeCost||0 }]
     const drainLines = e?.drainItems?.length
-      ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel} — supply & install`:`Drain #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0 }))
+      ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel} — supply & install`:`Drain #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
       : [{ desc:"Drains", qty:`${e?.drains||0} each`, unit:`${cs}${RATES.drain}/each`, total:e?.drainCost||0 }]
     const penetrationLines = e?.penetrationItems?.length
-      ? e.penetrationItems.map((p,i)=>({ desc:p.materialLabel?`Penetration #${i+1} — ${p.materialLabel} — supply & seal`:`Penetration #${i+1} — supply & seal`, qty:"1 each", unit:`${cs}${p.rate||0}`, total:p.rate||0 }))
+      ? e.penetrationItems.map((p,i)=>({ desc:p.materialLabel?`Penetration #${i+1} — ${p.materialLabel} — supply & seal`:`Penetration #${i+1} — supply & seal`, qty:"1 each", unit:`${cs}${p.rate||0}`, total:p.rate||0, brand:extractBrand(p.materialLabel) }))
       : [{ desc:"Penetrations", qty:`${e?.penetrations||0} each`, unit:`${cs}${RATES.penetration}/each`, total:e?.penetrationCost||0 }]
 
-    const quoteLines = e ? [
+    const quoteLines = e ? groupQuoteLinesByBrand([
       ...materialLines,
       ...flashingLines,
       ...gutterLines,
@@ -4419,11 +4694,14 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
       ...drainLines,
       ...penetrationLines,
       { desc:`Labour — installation (${e.days} days)`,        qty:"—",                           unit:"—",                     total:e.labCost   },
-    ].filter(l => l.total > 0) : []
+    ].filter(l => l.total > 0)) : []
 
-    const lineRowsHTML = quoteLines.map(li => `
+    const lineRowsHTML = quoteLines.map(li => li.isBrandHeader ? `
       <tr>
-        <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;">${li.desc}</td>
+        <td colspan="4" style="padding:10px 12px 4px;border-bottom:1px solid #f1f5f9;font-size:13px;font-weight:700;">${li.brand}</td>
+      </tr>` : `
+      <tr>
+        <td style="padding:10px 12px;padding-left:${li.indented?"24px":"12px"};border-bottom:1px solid #f1f5f9;font-size:13px;">${li.desc}</td>
         <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;">${li.qty}</td>
         <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;">${li.unit}</td>
         <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;font-weight:500;">${fmt_local(li.total)}</td>
@@ -4485,8 +4763,8 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
         <thead><tr style="background:#f8fafc;">
           <th style="text-align:left;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Description</th>
           <th style="text-align:left;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Qty</th>
-          <th style="text-align:right;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Unit</th>
-          <th style="text-align:right;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Total</th>
+          <th style="text-align:right;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Rate</th>
+          <th style="text-align:right;padding:10px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#64748b;border-bottom:1px solid #e2e8f0;">Amount</th>
         </tr></thead>
         <tbody>${lineRowsHTML}</tbody>
       </table>
@@ -4494,7 +4772,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
     <div style="display:flex;justify-content:flex-end;margin-bottom:24px;">
       <div style="min-width:260px;">
         <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;"><span style="color:#64748b;">Subtotal (excl. GST)</span><span style="font-weight:500;">${fmt_local(e.sellPrice)}</span></div>
-        <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;"><span style="color:#64748b;">GST (${GST_RATE*100}%)</span><span style="font-weight:500;">${fmt_local(e.gst)}</span></div>
+        <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;"><span style="color:#64748b;">GST (${((e.gstRate ?? GST_RATE)*100).toFixed(0)}%)</span><span style="font-weight:500;">${fmt_local(e.gst)}</span></div>
         <div style="background:#0f172a;border-radius:8px;padding:14px 16px;margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
           <span style="color:#fff;font-weight:700;font-size:14px;">Total inc. GST</span>
           <span style="color:#f59e0b;font-family:'DM Sans',Arial,sans-serif;font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;">${fmt_local(e.total)}</span>
@@ -5310,7 +5588,7 @@ function MyProfileModal({ user, onClose, onSaved }) {
 
 // ─────────────────────────── SETTINGS ───────────────────────────
 function Settings({ settings, onSave }) {
-  const { currency } = useCurrency()
+  const { currency, regions, region, updateRegion } = useCurrency()
   const cs = currency?.symbol || "$"
   const [form,  setForm]  = useState(settings)
   const [saved, setSaved] = useState(false)
@@ -5404,7 +5682,13 @@ function Settings({ settings, onSave }) {
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
           <FG label={`Default Day Rate (${cs})`}><input style={s.input} type="number" value={form.dayRate}  onChange={updNum("dayRate")}/></FG>
           <FG label="Default Margin %">   <input style={s.input} type="number" value={form.margin}   onChange={updNum("margin")}/></FG>
-          <FG label="GST Rate %">         <input style={{...s.input,background:"#f8fafc",color:"#64748b"}} type="number" value={GST_RATE*100} readOnly/></FG>
+          <FG label="Business Region (currency + GST/VAT)">
+            <select style={s.input} value={region?.countryCode || ""} onChange={e=>updateRegion(e.target.value)}>
+              {regions.map(r=>(
+                <option key={r.countryCode} value={r.countryCode}>{r.countryName} — {r.currencyCode} — GST {(r.gstRate*100).toFixed(0)}%</option>
+              ))}
+            </select>
+          </FG>
           <FG label="Default Wastage %">  <input style={s.input} type="number" value={form.wastage}  onChange={updNum("wastage")}/></FG>
         </div>
       </div>
@@ -6299,7 +6583,8 @@ export default function App() {
       ])
       const [projectsResult, customersResult, jobsResult, profileResult] = results
 
-      if (projectsResult.status === "fulfilled") setProjects(projectsResult.value.map(normalizeProject))
+      const loadedProjects = projectsResult.status === "fulfilled" ? projectsResult.value.map(normalizeProject) : []
+      if (projectsResult.status === "fulfilled") setProjects(loadedProjects)
       if (customersResult.status === "fulfilled") setCustomers(customersResult.value.map(normalizeKeys))
       if (jobsResult.status === "fulfilled") setJobs(jobsResult.value)
       if (profileResult.status === "fulfilled") setSettings({...DEFAULT_SETTINGS,...profileResult.value})
@@ -6309,6 +6594,20 @@ export default function App() {
         results.forEach(r => { if (r.status === "rejected") console.error("Failed to load data:", r.reason) })
         setToast("Couldn't load some data — check your connection and refresh")
       }
+
+      // ← Landing spot after the reload triggered by saving an Edit Project —
+      //   see handleSaveProject. Consumed once, then cleared, so a manual
+      //   browser refresh afterward doesn't keep jumping back here.
+      const reopenId = sessionStorage.getItem("reopenProjectId")
+      if(reopenId) {
+        sessionStorage.removeItem("reopenProjectId")
+        const reopenToast = sessionStorage.getItem("reopenToast")
+        sessionStorage.removeItem("reopenToast")
+        const proj = loadedProjects.find(p=>p.id===reopenId)
+        if(proj) { setSelectedProject(proj); setView("project") }
+        if(reopenToast) setToast(reopenToast)
+      }
+
       setLoaded(true)
     }
     loadData()
@@ -6380,17 +6679,45 @@ export default function App() {
 
       // Persist the traced measurement geometry + canvas snapshot (used to
       // embed the roof plan image in the generated quote) now that we know
-      // the real backend-assigned project id.
+      // the real backend-assigned project id. Awaited (not fire-and-forget)
+      // and given its own honest success/failure toast — this used to be a
+      // swallowed .catch(console.error) that let the wizard close and show
+      // "Project updated!" even when this specific save failed, making
+      // measurement edits (e.g. a deleted section) silently never persist
+      // while looking successful.
+      let geometrySaveFailed = false
       if (project.geometry) {
-        estimatesApi.saveGeometry(savedProject.id, project.geometry)
-          .catch(err => console.error("Geometry snapshot save failed:", err))
+        try {
+          await estimatesApi.saveGeometry(savedProject.id, project.geometry)
+        } catch(err) {
+          console.error("Geometry save failed:", err)
+          geometrySaveFailed = true
+        }
+      }
+
+      const toastMsg = geometrySaveFailed
+        ? "Project saved, but the measurement/roof plan failed to save — please reopen and try saving again."
+        : (isEdit?"Project updated!":"Project created!")
+
+      if(isEdit) {
+        // ← A full reload instead of relying on in-memory state to reflect
+        //   the save — the project list/detail/measurement plan all refetch
+        //   from scratch on load, guaranteeing what's shown afterward is
+        //   exactly what the server has, not whatever the client's own
+        //   patched-together state happens to believe. Reopen target + toast
+        //   are stashed across the reload since there's no URL routing here
+        //   to carry them (view/selectedProject are plain in-memory state).
+        sessionStorage.setItem("reopenProjectId", savedProject.id)
+        sessionStorage.setItem("reopenToast", toastMsg)
+        window.location.reload()
+        return
       }
 
       setShowWizard(false)
       setEditingProject(null)
       setSelectedProject(savedProject)
       setView("project")
-      setToast(isEdit?"Project updated!":"Project created!")
+      setToast(toastMsg)
     } catch(err) {
       console.error("Save failed:", err)
       setToast(err.status ? `Error saving project: ${err.message}` : "Error saving project. Is the backend running?")
@@ -6412,10 +6739,11 @@ export default function App() {
     </div>
   )
 
-  // ─── Everything below is wrapped in CurrencyProvider so all child
-  //     components can call useCurrency() safely. ───────────────────
+  // ─── Everything below is wrapped in CurrencyProvider/TaxProvider so all
+  //     child components can call useCurrency()/useTax() safely. ─────────
   return (
     <CurrencyProvider user={user}>
+    <TaxProvider>
       <div className="app-shell flex h-screen overflow-hidden font-sans text-[14px] text-slate-900 bg-slate-50">
         <div data-sidebar className={"app-sidebar w-[220px] min-w-[220px] bg-navy flex flex-col h-full"+(mobileNavOpen?" nav-open":"")}>
           <button
@@ -6488,8 +6816,6 @@ export default function App() {
             <div className="flex gap-2.5 items-center flex-wrap">
               {view==="project"&&currentProject&&<StatusBadge status={currentProject.status}/>}
               {view==="projects"&&<span className="text-[13px] text-slate-500">{projects.length} total</span>}
-              {/* ← Currency selector lives here, always visible in the topbar */}
-              <CurrencySelector />
               <Btn onClick={()=>{ setEditingProject(null); setShowWizard(true) }} primary>
                 📸 New Project
               </Btn>
@@ -6551,6 +6877,7 @@ export default function App() {
           onSaved={(partial)=>{ updateUser(partial); setShowProfileModal(false) }}
         />
       )}
+    </TaxProvider>
     </CurrencyProvider>
   )
 }

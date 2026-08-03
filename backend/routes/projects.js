@@ -50,6 +50,10 @@ function serializeProject(row) {
       marginAmt:     parseFloat(row.margin_amt)    || 0,
       sellPrice:     parseFloat(row.sell_price)    || 0,
       gst:           parseFloat(row.gst)           || 0,
+      // ← The rate actually applied when this quote was saved, not the
+      //   organization's current tax_country setting — a saved quote must
+      //   not silently reprice itself if that setting changes later.
+      gstRate:       parseFloat(row.gst_rate)      || 0.15,
       total:         parseFloat(row.total)         || 0,
     } : null,
 
@@ -75,7 +79,7 @@ const PROJECT_SELECT = `
          e.day_rate, e.days, e.margin, e.complexity, e.flashing_runs,
          e.adj_area, e.mat_cost, e.flash_cost, e.gut_cost,
          e.downpipe_cost, e.drain_cost, e.penetration_cost, e.lab_cost,
-         e.margin_amt, e.sell_price, e.gst, e.total,
+         e.margin_amt, e.sell_price, e.gst, e.gst_rate, e.total,
          c.name    AS customer_name,
          c.email   AS customer_email,
          c.phone   AS customer_phone,
@@ -170,8 +174,8 @@ router.post("/", async (req, res) => {
             flashings, guttering, downpipes, drains, penetrations,
             day_rate, days, margin, complexity, flashing_runs,
             adj_area, mat_cost, flash_cost, gut_cost, downpipe_cost, drain_cost, penetration_cost, lab_cost,
-            margin_amt, sell_price, gst, total, organization_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)`,
+            margin_amt, sell_price, gst, gst_rate, total, organization_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)`,
         [
           project.id, estimate.area, estimate.pitch, estimate.waste,
           estimate.materialRate, estimate.materialLabel,
@@ -181,7 +185,7 @@ router.post("/", async (req, res) => {
           JSON.stringify(estimate.flashingRuns || []),
           estimate.adjArea, estimate.matCost, estimate.flashCost,
           estimate.gutCost, estimate.downpipeCost || 0, estimate.drainCost || 0, estimate.penetrationCost || 0, estimate.labCost,
-          estimate.marginAmt, estimate.sellPrice, estimate.gst, estimate.total,
+          estimate.marginAmt, estimate.sellPrice, estimate.gst, estimate.gstRate || 0.15, estimate.total,
           req.user.organizationId,
         ]
       );
@@ -252,8 +256,8 @@ router.put("/:id", async (req, res) => {
             flashings, guttering, downpipes, drains, penetrations,
             day_rate, days, margin, complexity, flashing_runs,
             adj_area, mat_cost, flash_cost, gut_cost, downpipe_cost, drain_cost, penetration_cost, lab_cost,
-            margin_amt, sell_price, gst, total, organization_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
+            margin_amt, sell_price, gst, gst_rate, total, organization_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
          ON CONFLICT (project_id) DO UPDATE SET
            area=EXCLUDED.area, pitch=EXCLUDED.pitch, waste=EXCLUDED.waste,
            material_rate=EXCLUDED.material_rate, material_label=EXCLUDED.material_label,
@@ -266,7 +270,7 @@ router.put("/:id", async (req, res) => {
            downpipe_cost=EXCLUDED.downpipe_cost, drain_cost=EXCLUDED.drain_cost,
            penetration_cost=EXCLUDED.penetration_cost,
            lab_cost=EXCLUDED.lab_cost, margin_amt=EXCLUDED.margin_amt,
-           sell_price=EXCLUDED.sell_price, gst=EXCLUDED.gst, total=EXCLUDED.total`,
+           sell_price=EXCLUDED.sell_price, gst=EXCLUDED.gst, gst_rate=EXCLUDED.gst_rate, total=EXCLUDED.total`,
         [
           req.params.id, estimate.area, estimate.pitch, estimate.waste,
           estimate.materialRate, estimate.materialLabel,
@@ -276,7 +280,7 @@ router.put("/:id", async (req, res) => {
           JSON.stringify(estimate.flashingRuns || []),
           estimate.adjArea, estimate.matCost, estimate.flashCost,
           estimate.gutCost, estimate.downpipeCost || 0, estimate.drainCost || 0, estimate.penetrationCost || 0, estimate.labCost,
-          estimate.marginAmt, estimate.sellPrice, estimate.gst, estimate.total,
+          estimate.marginAmt, estimate.sellPrice, estimate.gst, estimate.gstRate || 0.15, estimate.total,
           req.user.organizationId,
         ]
       );

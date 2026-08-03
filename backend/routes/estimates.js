@@ -6,18 +6,28 @@ const router = Router();
 
 const SNAPSHOT_DIR = path.join(__dirname, "..", "uploads", "geometry-snapshots");
 fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+// ← Separate from SNAPSHOT_DIR on purpose: the snapshot is the flattened
+//   photo+drawing composite (for embedding in quotes); this is the clean,
+//   undrawn-on original photo, kept so re-editing a project has something
+//   real to trace over instead of the previous session's drawing baked in.
+const ORIGINAL_PHOTO_DIR = path.join(__dirname, "..", "uploads", "original-photos");
+fs.mkdirSync(ORIGINAL_PHOTO_DIR, { recursive: true });
 
-// Decodes a "data:image/png;base64,...." string and writes it to disk,
-// returning the public URL. Returns null if no data URL was provided.
-function saveSnapshot(projectId, dataUrl) {
+// Decodes a "data:image/png;base64,...." string and writes it to disk under
+// `dir`, returning the public URL under `publicPath`. Returns null if no
+// data URL was provided. Shared by both the geometry snapshot and the
+// original-photo save paths below.
+function saveDataUrlImage(dir, publicPath, projectId, dataUrl) {
   if (!dataUrl || !dataUrl.startsWith("data:image/")) return null;
   const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
   if (!match) return null;
   const [, ext, base64] = match;
   const filename = `${projectId}-${Date.now()}.${ext}`;
-  fs.writeFileSync(path.join(SNAPSHOT_DIR, filename), Buffer.from(base64, "base64"));
-  return `/uploads/geometry-snapshots/${filename}`;
+  fs.writeFileSync(path.join(dir, filename), Buffer.from(base64, "base64"));
+  return `${publicPath}/${filename}`;
 }
+const saveSnapshot      = (projectId, dataUrl) => saveDataUrlImage(SNAPSHOT_DIR, "/uploads/geometry-snapshots", projectId, dataUrl);
+const saveOriginalPhoto = (projectId, dataUrl) => saveDataUrlImage(ORIGINAL_PHOTO_DIR, "/uploads/original-photos", projectId, dataUrl);
 
 // Every route below hangs off :projectId — confirm it's actually a project
 // in the caller's own organization before touching its estimate/geometry,
@@ -113,22 +123,31 @@ router.post("/:projectId/geometry", async (req, res) => {
       return res.status(404).json({ error: "Project not found" });
     const g = req.body;
     const newSnapshotUrl = saveSnapshot(req.params.projectId, g.snapshotDataUrl);
+    // A locally-picked file arrives as a data URL and needs writing to disk;
+    // a photo chosen from the job library is already a hosted asset, so its
+    // URL is taken as-is (originalPhotoUrl) with nothing to re-upload.
+    const newOriginalPhotoUrl =
+      saveOriginalPhoto(req.params.projectId, g.originalPhotoDataUrl) ||
+      (typeof g.originalPhotoUrl === "string" && g.originalPhotoUrl.startsWith("/") ? g.originalPhotoUrl : null);
 
-    // Preserve the existing snapshot if this save didn't include a new one
-    // (e.g. geometry re-saved without re-capturing the canvas).
+    // Preserve the existing snapshot/original photo if this save didn't
+    // include a new one (e.g. geometry re-saved without re-capturing the
+    // canvas, or without picking a new photo this session).
     let snapshotUrl = newSnapshotUrl;
-    if (!snapshotUrl) {
+    let originalPhotoUrl = newOriginalPhotoUrl;
+    if (!snapshotUrl || !originalPhotoUrl) {
       const { rows: existing } = await pool.query(
-        "SELECT snapshot_url FROM project_geometries WHERE project_id = $1 AND organization_id = $2",
+        "SELECT snapshot_url, original_photo_url FROM project_geometries WHERE project_id = $1 AND organization_id = $2",
         [req.params.projectId, req.user.organizationId]
       );
-      snapshotUrl = existing[0]?.snapshot_url || null;
+      snapshotUrl = snapshotUrl || existing[0]?.snapshot_url || null;
+      originalPhotoUrl = originalPhotoUrl || existing[0]?.original_photo_url || null;
     }
 
     const { rows } = await pool.query(
       `INSERT INTO project_geometries (project_id, sections, accessories, asbestos,
-         scale_m_per_px, total_footprint_m2, total_surface_m2, total_flashing_m, total_gutter_m, snapshot_url, organization_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         scale_m_per_px, total_footprint_m2, total_surface_m2, total_flashing_m, total_gutter_m, snapshot_url, original_photo_url, organization_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        ON CONFLICT (project_id) DO UPDATE SET
          sections=EXCLUDED.sections, accessories=EXCLUDED.accessories,
          asbestos=EXCLUDED.asbestos, scale_m_per_px=EXCLUDED.scale_m_per_px,
@@ -136,13 +155,14 @@ router.post("/:projectId/geometry", async (req, res) => {
          total_surface_m2=EXCLUDED.total_surface_m2,
          total_flashing_m=EXCLUDED.total_flashing_m,
          total_gutter_m=EXCLUDED.total_gutter_m,
-         snapshot_url=EXCLUDED.snapshot_url
+         snapshot_url=EXCLUDED.snapshot_url,
+         original_photo_url=EXCLUDED.original_photo_url
        RETURNING *`,
       [req.params.projectId, JSON.stringify(g.sections || []),
        JSON.stringify(g.accessories || {}), g.asbestos || false,
        g.scale_m_per_px || 0.05, g.total_footprint_m2 || 0,
        g.total_surface_m2 || 0, g.total_flashing_m || 0, g.total_gutter_m || 0,
-       snapshotUrl, req.user.organizationId]
+       snapshotUrl, originalPhotoUrl, req.user.organizationId]
     );
     res.json(rows[0]);
   } catch (err) {

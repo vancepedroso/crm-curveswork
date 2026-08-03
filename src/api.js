@@ -245,10 +245,10 @@ export const usersApi = {
 };
 
 // ---------------------------------------------------------------------------
-// Settings  (currency preferences)
+// Settings  (business region — currency + GST/VAT rate, linked as one setting)
 // ---------------------------------------------------------------------------
 export const settingsApi = {
-  getCurrencies:   ()     => get("/settings/currencies"),
-  getUserCurrency: ()     => get("/settings/user-currency"),
-  setUserCurrency: (code) => put("/settings/user-currency", { code }),
+  getBusinessRegions:   ()            => get("/settings/business-regions"),
+  getOrgBusinessRegion: ()            => get("/settings/org-business-region"),
+  setOrgBusinessRegion: (countryCode) => put("/settings/org-business-region", { countryCode }),
 };
