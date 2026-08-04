@@ -837,6 +837,16 @@ function initialKnownMFrom(g) {
 function initialScaleLinesFrom(g) {
   return (g?.scaleLines||[]).map(l => ({ ...l, id: l.id || uid() }))
 }
+// ← Dimension Tool reference lines (PlanSwift-style click-two-points
+//   measurement annotations) — visual-only, carries no rate/cost, never
+//   feeds the estimate. Structurally identical to scaleLines (just p1/p2),
+//   restored the same way.
+function initialDimensionLinesFrom(g) {
+  // ← DB column is snake_case (dimension_lines) and this object comes
+  //   straight off a `SELECT *` row, not a camelCased API response —
+  //   matches how scale_m_per_px is read directly elsewhere in this file.
+  return (g?.dimension_lines||[]).map(l => ({ ...l, id: l.id || uid() }))
+}
 
 const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, photoUrl, onPhotoChange, initialGeometry }, ref) {
   const canvasRef   = useRef(null)
@@ -853,6 +863,12 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   //   section's outline/label/cutting-list all drawn at once; hiding one
   //   temporarily lets you focus on another without losing its data.
   const [hiddenSections, setHiddenSections] = useState({}) // {[sectionId]: boolean}
+  // ← Same per-item hide toggle as hiddenSections above, for Dimension Tool
+  //   lines — a plan with several reference measurements gets cluttered
+  //   fast, so any one of them can be temporarily hidden without deleting
+  //   it. Not part of undo/redo history, same as hiddenSections (a view
+  //   toggle, not a data mutation).
+  const [hiddenDimensionLines, setHiddenDimensionLines] = useState({}) // {[dimensionLineId]: boolean}
   // ← "cutangle" is a temporary activeTool value: click a section's 🧭
   //   button to enter it (cutAngleDrawSectionId records which section it's
   //   for), then click two points directly on the photo — e.g. tracing an
@@ -898,6 +914,13 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   //   here and cleared, ready for the next reference.
   const [scaleLines, setScaleLines] = useState(() => initialScaleLinesFrom(initialGeometry)) // [{id, p1, p2, knownM}]
   const [knownM,    setKnownM]    = useState(() => initialKnownMFrom(initialGeometry))
+  // ← Dimension Tool: `dimensionLine` is the in-progress line being drawn
+  //   (mirrors scaleLine/cutAngleLine's draft pattern) — click 1 sets p1,
+  //   click 2 sets p2 and immediately commits into `dimensionLines` below
+  //   (no confirmation modal needed, unlike Calibrate Image, since the
+  //   length is read off the already-calibrated scale, not typed in).
+  const [dimensionLine, setDimensionLine] = useState(null) // {p1, p2:null} while drawing
+  const [dimensionLines, setDimensionLines] = useState(() => initialDimensionLinesFrom(initialGeometry)) // [{id, p1, p2}]
   // ← Postgres DECIMAL columns come back as strings (e.g. "0.05000000"), not
   //   numbers — without parseFloat here, downstream math like sf.toFixed()
   //   throws since sf would be a string.
@@ -935,7 +958,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   //   instead of landing wherever the mouse happened to click — fixes
   //   freehand-traced rectangles coming out slightly skewed.
   const [orthoMode, setOrthoMode] = useState(false)
-
+  const [arrayMode, setArrayMode] = useState(false)
   // ── Undo / Redo (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z or Ctrl+Y) ──────────────
   // A snapshot is pushed before every mutating action (adding a point to
   // a line, finishing a shape, deleting, dragging, calibrating scale), so
@@ -944,11 +967,12 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   const redoRef = useRef([]) // states popped by undo, so redo can restore them — cleared on any new action
   const dragPushedRef = useRef(false) // whether the current drag gesture has already pushed its pre-drag snapshot
   function snapshot(){
-    return { sections, lineItems, ptItems, scaleLine, scaleLines, knownM, asbestos, drawPts }
+    return { sections, lineItems, ptItems, scaleLine, scaleLines, dimensionLine, dimensionLines, knownM, asbestos, drawPts }
   }
   function applySnapshot(snap){
     setSections(snap.sections); setLineItems(snap.lineItems); setPtItems(snap.ptItems)
     setScaleLine(snap.scaleLine); setScaleLines(snap.scaleLines||[]); setKnownM(snap.knownM); setAsbestos(snap.asbestos)
+    setDimensionLine(snap.dimensionLine||null); setDimensionLines(snap.dimensionLines||[])
     setDrawPts(snap.drawPts)
   }
   function pushHistory(){
@@ -977,8 +1001,8 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   //   line; this instead offers an explicit choice — screen coords (not
   //   world coords) since it's positioned as a fixed-position popup.
   const [lineContextMenu, setLineContextMenu] = useState(null) // {x,y} | null
-  const [selection, setSelection] = useState({ sections:[], lines:[], points:[], scale:false, scaleLineIds:[] })
-  const selectionCount = selection.sections.length + selection.lines.length + selection.points.length + (selection.scale?1:0) + selection.scaleLineIds.length
+  const [selection, setSelection] = useState({ sections:[], lines:[], points:[], scale:false, scaleLineIds:[], dimensionLineIds:[] })
+  const selectionCount = selection.sections.length + selection.lines.length + selection.points.length + (selection.scale?1:0) + selection.scaleLineIds.length + selection.dimensionLineIds.length
   // ← Explicit "Move" toggle — dragging inside a selection only repositions
   //   it while this is on, so an accidental drag (e.g. while just trying to
   //   click/select something) can't shift a shape unintentionally. Stays on
@@ -1220,12 +1244,17 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       scaleLines,
       scale_m_per_px: parseFloat(sfIso.toFixed(6)),
       axisScale,
+      // ← Dimension Tool reference lines — visual-only annotations, never
+      //   used in any area/cost calculation above, but still need to be
+      //   part of the persisted payload (and this memo's deps) or they'd
+      //   silently vanish on save/reload, same reasoning as scaleLines.
+      dimensionLines,
       total_footprint_m2: parseFloat(processedSections.reduce((a,sec)=>a+sec.footprint_m2,0).toFixed(2)),
       total_surface_m2:   parseFloat(processedSections.reduce((a,sec)=>a+(sec.surface_m2||0),0).toFixed(2)),
       total_flashing_m:   parseFloat(flashings.reduce((a,f)=>a+f.length_m,0).toFixed(2)),
       total_gutter_m:     parseFloat(gutters.reduce((a,g)=>a+g.length_m,0).toFixed(2)),
     }
-  },[sections,lineItems,ptItems,asbestos,mPerPx,scaleLines,axisScale])
+  },[sections,lineItems,ptItems,asbestos,mPerPx,scaleLines,axisScale,dimensionLines])
 
   useEffect(()=>{ onGeometryChange?.(geometry) },[geometry, onGeometryChange])
 
@@ -1367,7 +1396,8 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     if(selection.points.length)   setPtItems(prev=>prev.filter(p=>!selection.points.includes(p.id)))
     if(selection.scale)           setScaleLine(null)
     if(selection.scaleLineIds.length) setScaleLines(prev=>prev.filter(l=>!selection.scaleLineIds.includes(l.id)))
-    setSelection({ sections:[], lines:[], points:[], scale:false, scaleLineIds:[] })
+    if(selection.dimensionLineIds.length) setDimensionLines(prev=>prev.filter(l=>!selection.dimensionLineIds.includes(l.id)))
+    setSelection({ sections:[], lines:[], points:[], scale:false, scaleLineIds:[], dimensionLineIds:[] })
   }
 
   // Snapshots the currently-selected sections/lines/points (their full
@@ -1418,7 +1448,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       sections: newSections.map(s=>s.id),
       lines:    newLines.map(l=>l.id),
       points:   newPoints.map(p=>p.id),
-      scale: false, scaleLineIds: [],
+      scale: false, scaleLineIds: [], dimensionLineIds: [],
     })
     setShapeCopyMsg("Pasted!")
     setTimeout(()=>setShapeCopyMsg(""), 2000)
@@ -1711,7 +1741,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         ctx.textBaseline="alphabetic"
         if(gs?.pitchUnknown || gs?.surface_m2){
           ctx.font=`bold ${9/view.zoom}px DM Sans`
-          const areaLabel = gs.pitchUnknown ? "⚠ Pitch not set" : gs.surface_m2+" m²"
+          const areaLabel = gs.pitchUnknown ? "⚠ Pitch not set" : `${gs.surface_m2} m² @ ${Math.round(deriveSectionPitchInput(gs.pitch)?.angleDeg ?? 0)}°`
           const areaY = cy+boxH/2+lw(11)
           ctx.lineWidth=lw(2.5)
           ctx.strokeText(areaLabel,cx,areaY)
@@ -1867,6 +1897,46 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       }
     }
 
+    // ← Dimension Tool (PlanSwift-style click-two-points reference
+    //   measurement) — deliberately styled differently from every other
+    //   line on this canvas (pink, dashed, its own end-tick color) so it
+    //   reads as an added annotation, not a traced/priced shape or the
+    //   automatic edge-length labels every section/line already shows.
+    //   Length is read straight off the same calibrated scale (`sf`) as
+    //   everywhere else — no separate calibration, and it carries no
+    //   rate/cost so it never touches the estimate.
+    const dimTick=p=>{ctx.beginPath();ctx.arc(p.x,p.y,lw(4),0,Math.PI*2);ctx.fillStyle="#ec4899";ctx.fill();ctx.strokeStyle="#fff";ctx.lineWidth=lw(1.5);ctx.stroke()}
+    const drawDimLabel=(p1,p2,text)=>{
+      const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2
+      ctx.fillStyle="#ec4899"
+      const boxW=Math.max(lw(30),ctx.measureText(text).width+lw(12))
+      try{ctx.beginPath();ctx.roundRect(mx-boxW/2,my-lw(10),boxW,lw(16),lw(4));ctx.fill()}catch{ctx.fillRect(mx-boxW/2,my-lw(10),boxW,lw(16))}
+      ctx.fillStyle="#fff"; ctx.font=`bold ${10/view.zoom}px DM Sans`; ctx.textAlign="center"
+      ctx.fillText(text,mx,my+lw(1))
+    }
+    dimensionLines.forEach(l=>{
+      if(hiddenDimensionLines[l.id]) return
+      ctx.strokeStyle="#ec4899"; ctx.lineWidth=lw(2); ctx.setLineDash([lw(5),lw(3)])
+      ctx.beginPath(); ctx.moveTo(l.p1.x,l.p1.y); ctx.lineTo(l.p2.x,l.p2.y); ctx.stroke()
+      ctx.setLineDash([])
+      dimTick(l.p1); dimTick(l.p2)
+      const distM = Math.hypot(l.p2.x-l.p1.x,l.p2.y-l.p1.y)*sf
+      drawDimLabel(l.p1,l.p2,`${distM.toFixed(2)}m`)
+    })
+    if(dimensionLine?.p1){
+      const p2 = dimensionLine.p2||(activeTool==="dimension"?hoverPt:null)
+      ctx.strokeStyle="#ec4899"; ctx.lineWidth=lw(2); ctx.setLineDash([lw(5),lw(3)])
+      ctx.beginPath(); ctx.moveTo(dimensionLine.p1.x,dimensionLine.p1.y)
+      if(p2) ctx.lineTo(p2.x,p2.y)
+      ctx.stroke(); ctx.setLineDash([])
+      dimTick(dimensionLine.p1)
+      if(p2){
+        dimTick(p2)
+        const distM = Math.hypot(p2.x-dimensionLine.p1.x,p2.y-dimensionLine.p1.y)*sf
+        drawDimLabel(dimensionLine.p1,p2,`${distM.toFixed(2)}m`)
+      }
+    }
+
     if(hoverPt&&["downpipe","drain","penetration"].includes(activeTool)){
       ctx.strokeStyle="rgba(255,255,255,0.35)"; ctx.lineWidth=lw(1); ctx.setLineDash([lw(4),lw(2)])
       ctx.beginPath();ctx.moveTo(hoverPt.x-lw(14),hoverPt.y);ctx.lineTo(hoverPt.x+lw(14),hoverPt.y);ctx.stroke()
@@ -1902,6 +1972,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         const b=bboxOf([l.p1,l.p2])
         ctx.strokeRect(b.x1-lw(6),b.y1-lw(6),(b.x2-b.x1)+lw(12),(b.y2-b.y1)+lw(12))
       })
+      dimensionLines.filter(l=>selection.dimensionLineIds.includes(l.id)).forEach(l=>{
+        const b=bboxOf([l.p1,l.p2])
+        ctx.strokeRect(b.x1-lw(6),b.y1-lw(6),(b.x2-b.x1)+lw(12),(b.y2-b.y1)+lw(12))
+      })
       ctx.setLineDash([])
     }
 
@@ -1916,7 +1990,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
 
     ctx.restore()
-  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,scaleLines,knownM,calibModalOpen,geometry,imgSrc,view,editMode,orthoMode,selection,selectionCount,selectBox,mPerPx,expandedCutSections,hiddenSections,cutAngleLine])
+  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,scaleLines,dimensionLine,dimensionLines,hiddenDimensionLines,knownM,calibModalOpen,geometry,imgSrc,view,editMode,orthoMode,selection,selectionCount,selectBox,mPerPx,expandedCutSections,hiddenSections,cutAngleLine])
 
   useEffect(()=>{ drawCanvas() },[drawCanvas])
 
@@ -1967,6 +2041,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       if(Math.hypot(l.p1.x-pt.x, l.p1.y-pt.y) <= HIT_RADIUS) return { kind:"scaleRef", id:l.id, which:"p1" }
       if(Math.hypot(l.p2.x-pt.x, l.p2.y-pt.y) <= HIT_RADIUS) return { kind:"scaleRef", id:l.id, which:"p2" }
     }
+    for(const l of dimensionLines){
+      if(Math.hypot(l.p1.x-pt.x, l.p1.y-pt.y) <= HIT_RADIUS) return { kind:"dimensionRef", id:l.id, which:"p1" }
+      if(Math.hypot(l.p2.x-pt.x, l.p2.y-pt.y) <= HIT_RADIUS) return { kind:"dimensionRef", id:l.id, which:"p2" }
+    }
     return null
   }
 
@@ -2003,6 +2081,8 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       setScaleLine(prev=> prev ? { ...prev, [hit.which]: pt } : prev)
     } else if(hit.kind==="scaleRef"){
       setScaleLines(prev=>prev.map(l=> l.id!==hit.id ? l : { ...l, [hit.which]: pt }))
+    } else if(hit.kind==="dimensionRef"){
+      setDimensionLines(prev=>prev.map(l=> l.id!==hit.id ? l : { ...l, [hit.which]: pt }))
     }
   }
 
@@ -2141,9 +2221,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           points:   ptItems.filter(inBox).map(p=>p.id),
           scale:    !!(scaleLine?.p1 && scaleLine?.p2 && (inBox(scaleLine.p1) || inBox(scaleLine.p2))),
           scaleLineIds: scaleLines.filter(l=>inBox(l.p1) || inBox(l.p2)).map(l=>l.id),
+          dimensionLineIds: dimensionLines.filter(l=>inBox(l.p1) || inBox(l.p2)).map(l=>l.id),
         })
       } else {
-        setSelection({ sections:[], lines:[], points:[], scale:false, scaleLineIds:[] })
+        setSelection({ sections:[], lines:[], points:[], scale:false, scaleLineIds:[], dimensionLineIds:[] })
       }
       setSelectBox(null)
     }
@@ -2196,6 +2277,17 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         setCalibModalOpen(true)
       }
     }
+    else if(activeTool==="dimension"){
+      if(!dimensionLine?.p1) setDimensionLine({p1:pt,p2:null})
+      else {
+        // ← Unlike Calibrate Image, no modal — the length is read straight
+        //   off the already-established scale, not typed in, so the second
+        //   click commits the dimension immediately and the tool is ready
+        //   to measure another one right away.
+        setDimensionLines(prev=>[...prev,{id:uid(),p1:dimensionLine.p1,p2:pt}])
+        setDimensionLine(null)
+      }
+    }
     else if(activeTool==="cutangle"){
       if(!cutAngleLine?.p1) setCutAngleLine({p1:pt,p2:null})
       else {
@@ -2229,6 +2321,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       // cancel an in-progress scale line
       setScaleLine(null)
     }
+    else if(activeTool==="dimension" && dimensionLine?.p1) {
+      // cancel an in-progress dimension line
+      setDimensionLine(null)
+    }
     else if(activeTool==="cutangle") {
       // cancel drawing the cut-angle reference line and exit the tool entirely
       setCutAngleLine(null); setCutAngleDrawSectionId(null); setActiveTool("select")
@@ -2259,7 +2355,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     pushHistory()
     setSections([]); setLineItems([]); setPtItems([])
     setScaleLine(null); setScaleLines([]); setDrawPts([]); setAsbestos(false)
-    setSelection({sections:[],lines:[],points:[],scale:false,scaleLineIds:[]}); setSelectBox(null)
+    setSelection({sections:[],lines:[],points:[],scale:false,scaleLineIds:[],dimensionLineIds:[]}); setSelectBox(null)
     resetView()
   }
 
@@ -2329,6 +2425,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     {key:"drain",      label:"Roof Drain",  icon:"⊙",color:"#6366f1",hint:"Click canvas to place a roof drain (DR) marker"},
     {key:"penetration",label:"Penetration", icon:"◇",color:"#8b5cf6",hint:"Click to place — select type below"},
     {key:"scale",      label:"Calibrate Image", icon:"📏",color:"#10b981",hint:"Click two points over a known dimension · right-click to cancel"},
+    {key:"dimension",  label:"Dimension",   icon:"↔",color:"#ec4899",hint:"Click two points to measure a distance for reference · right-click to cancel · not used in pricing"},
     {key:"select",     label:"Select",      icon:"⬚",color:"#ef4444",hint:"Drag a box over items to select them, then drag inside the selection to move it · Delete to remove · Ctrl+C to copy · Ctrl+V or right-click to paste a duplicate"},
     {key:"pan",        label:"Pan",         icon:"✋",color:"#64748b",hint:"Drag to pan the image (or hold Space with any tool)"},
   ]
@@ -2354,7 +2451,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           <div className="mt-toolbar" style={{display:"flex",alignItems:"center",gap:5,padding:"8px 10px",background:"#1e293b",flexWrap:"wrap"}}>
             {TOOLS.map(t=>(
               <button key={t.key}
-                onClick={()=>{setActiveTool(t.key);setDrawPts([]); if(t.key!=="select"){setSelection({sections:[],lines:[],points:[],scale:false,scaleLineIds:[]});setSelectBox(null);setMoveArmed(false)}}}
+                onClick={()=>{setActiveTool(t.key);setDrawPts([]); if(t.key!=="select"){setSelection({sections:[],lines:[],points:[],scale:false,scaleLineIds:[],dimensionLineIds:[]});setSelectBox(null);setMoveArmed(false)}}}
                 style={{padding:"5px 9px",borderRadius:6,
                   border:`1px solid ${activeTool===t.key?t.color:"rgba(255,255,255,0.14)"}`,
                   background:activeTool===t.key?t.color+"28":"transparent",
@@ -2385,6 +2482,17 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                 fontSize:11,fontWeight:orthoMode?600:400,cursor:"pointer",
                 display:"flex",alignItems:"center",gap:4,fontFamily:"inherit"}}>
               <span>⊥</span>Ortho
+            </button>
+            <button
+              onClick={()=>setArrayMode(m=>!m)}
+              title="Array: create multiple instances of the selected shape"
+              style={{padding:"5px 9px",borderRadius:6,
+                border:`1px solid ${arrayMode?"#e2dbc7":"rgba(255,255,255,0.14)"}`,
+                background:arrayMode?"rgba(224, 213, 184, 0.16)":"transparent",
+                color:arrayMode?"#cabea0":"#94a3b8",
+                fontSize:11,fontWeight:arrayMode?600:400,cursor:"pointer",
+                display:"flex",alignItems:"center",gap:4,fontFamily:"inherit"}}>
+              <span>⊥</span>Array
             </button>
             <div style={{marginLeft:"auto",display:"flex",gap:5,alignItems:"center"}}>
               {(activeTool==="flashing"||activeTool==="gutter")&&drawPts.length>=2&&(
@@ -2466,7 +2574,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 
           <div className="mt-canvas-wrap">
             <canvas ref={canvasRef}
-              style={{cursor:isPanMode?(panRef.current?"grabbing":"grab"):(["section","flashing","gutter","scale","select","cutangle"].includes(activeTool)?"crosshair":"cell")}}
+              style={{cursor:isPanMode?(panRef.current?"grabbing":"grab"):(["section","flashing","gutter","scale","dimension","select","cutangle"].includes(activeTool)?"crosshair":"cell")}}
               onMouseDown={handleMouseDown}
               onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp}
@@ -2678,6 +2786,29 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               </div>
             )}
           </div>
+
+          {dimensionLines.length>0 && (
+            <div style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,padding:12}}>
+              <div style={{fontSize:11,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:.5,marginBottom:10}}>Dimensions</div>
+              {dimensionLines.map(l=>{
+                const hidden = !!hiddenDimensionLines[l.id]
+                const distM = Math.hypot(l.p2.x-l.p1.x,l.p2.y-l.p1.y)*(mPerPx||0.05)
+                return (
+                  <div key={l.id} style={{display:"flex",alignItems:"center",gap:6,marginBottom:6,opacity:hidden?0.5:1}}>
+                    <div style={{width:10,height:10,borderRadius:2,background:"#ec4899",flexShrink:0}}/>
+                    <span style={{flex:1,fontSize:12,color:"#0f172a",fontWeight:600}}>{distM.toFixed(2)}m</span>
+                    <button onClick={()=>setHiddenDimensionLines(prev=>({...prev,[l.id]:!prev[l.id]}))}
+                      title={hidden?"Show this dimension on the canvas":"Hide this dimension on the canvas"}
+                      style={{padding:"1px 6px",border:"none",background:hidden?"#e2e8f0":"#f1f5f9",color:hidden?"#64748b":"#475569",borderRadius:4,fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>
+                      {hidden?"🚫":"👁"}
+                    </button>
+                    <button onClick={()=>setDimensionLines(prev=>prev.filter(x=>x.id!==l.id))}
+                      style={{padding:"1px 6px",border:"none",background:"#fee2e2",color:"#ef4444",borderRadius:4,fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>✕</button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
 
           <div style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,padding:12}}>
             <div style={{fontSize:11,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:.5,marginBottom:8}}>Accessories</div>
@@ -3628,7 +3759,7 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
   const wasteFactor = 1 + (e.waste||0)/100
 
   const flashingLines = e.flashingRuns?.length
-    ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel} — supply & install`:`${r.label} flashing — supply & install`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0), brand:extractBrand(r.materialLabel) }))
+    ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel}`:`${r.label} flashing`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0), brand:extractBrand(r.materialLabel) }))
     : [{ desc:"Flashings — ridge/hip/valley", qty:`${(e.flashings*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.flashings}/m`, total:e.flashCost }]
 
   // ← Each traced roof section gets its own line (brand/name + its own
@@ -3636,20 +3767,20 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
   //   "materialLabel roofing" line, which never showed which brand/product
   //   was actually picked per section.
   const materialLines = e.sections?.length
-    ? e.sections.filter(sec=>sec.surface_m2!=null).map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0), brand:extractBrand(sec.materialLabel) }))
-    : [{ desc:`${e.materialLabel} roofing — supply & install`, qty:`${e.adjArea?.toFixed(1)} m²`, unit:`${cs}${e.materialRate}`, total:e.matCost }]
+    ? e.sections.filter(sec=>sec.surface_m2!=null).map(sec=>({ desc:`${sec.name}`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0), brand:extractBrand(sec.materialLabel) }))
+    : [{ desc:`${e.materialLabel} roofing`, qty:`${e.adjArea?.toFixed(1)} m²`, unit:`${cs}${e.materialRate}`, total:e.matCost }]
 
   // ← Same fix as flashing above: show the actual product picked
   //   (materialLabel, supplier included) instead of a generic "Guttering"/
   //   "Downpipe #1" line with no indication of what was actually quoted.
   const gutterLines = e.gutterRuns?.length
-    ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel} — supply & install`:"Guttering — supply & install", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0), brand:extractBrand(g.materialLabel) }))
+    ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel}`:"Guttering", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0), brand:extractBrand(g.materialLabel) }))
     : [{ desc:"Guttering", qty:`${(e.guttering*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.guttering}/m`, total:e.gutCost }]
   const downpipeLines = e.downpipeItems?.length
-    ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel} — supply & install`:`Downpipe #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
+    ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel}`:`Downpipe #${i+1}`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
     : [{ desc:"Downpipes", qty:`${e.downpipes||0} each`, unit:`${cs}${RATES.downpipe}/each`, total:e.downpipeCost||0 }]
   const drainLines = e.drainItems?.length
-    ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel} — supply & install`:`Drain #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
+    ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel}`:`Drain #${i+1}`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
     : [{ desc:"Drains", qty:`${e.drains||0} each`, unit:`${cs}${RATES.drain}/each`, total:e.drainCost||0 }]
   const penetrationLines = e.penetrationItems?.length
     ? e.penetrationItems.map((p,i)=>({ desc:p.materialLabel?`Penetration #${i+1} — ${p.materialLabel} — supply & seal`:`Penetration #${i+1} — supply & seal`, qty:"1 each", unit:`${cs}${p.rate||0}`, total:p.rate||0, brand:extractBrand(p.materialLabel) }))
@@ -3770,7 +3901,7 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
 
       {company.badgesUrl && (
         <div style={{marginTop:16}}>
-          <img src={`${API_ORIGIN}${company.badgesUrl}`} alt="" style={{maxWidth:"100%",maxHeight:60,objectFit:"contain"}}/>
+          <img src={`${API_ORIGIN}${company.badgesUrl}`} alt="" style={{width:"100%",height:"auto",display:"block"}}/>
         </div>
       )}
 
@@ -4216,9 +4347,11 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
       <div style={{display:"flex",justifyContent:"space-between",marginTop:24,paddingTop:18,borderTop:"1px solid #e2e8f0",flexWrap:"wrap",gap:10}}>
         <Btn onClick={step===0?onCancel:stepBack}>{step===0?"Cancel":"← Back"}</Btn>
         <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
-          {step<STEPS.length-1 && (
+          {/* {step<STEPS.length-1 && (
             <Btn onClick={stepNext}>Skip →</Btn>
-          )}
+          )} */}
+          {/* to be removed 08/04/2026  */}
+
           {step<STEPS.length-1
             ? <Btn primary onClick={stepNext}>Next →</Btn>
             : <Btn primary onClick={save}>{saving?"Saving…":(isEdit?"Update Project":"Save Project ✓")}</Btn>
@@ -4666,21 +4799,21 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
     const wasteFactor = 1 + (e?.waste||0)/100
 
     const flashingLines = e?.flashingRuns?.length
-      ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel} — supply & install`:`${r.label} flashing — supply & install`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0), brand:extractBrand(r.materialLabel) }))
+      ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel}`:`${r.label} flashing`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0), brand:extractBrand(r.materialLabel) }))
       : [{ desc:"Flashings — ridge/hip/valley", qty:`${((e?.flashings||0)*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.flashings}/m`, total:e?.flashCost||0 }]
 
     const materialLines = e?.sections?.length
-      ? e.sections.filter(sec=>sec.surface_m2!=null).map(sec=>({ desc:`${sec.name} — supply & install`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0), brand:extractBrand(sec.materialLabel) }))
-      : [{ desc:`${e?.materialLabel} roofing — supply & install`, qty:`${e?.adjArea?.toFixed(1)} m²`, unit:`${cs}${e?.materialRate}/m²`, total:e?.matCost||0 }]
+      ? e.sections.filter(sec=>sec.surface_m2!=null).map(sec=>({ desc:`${sec.name}`, qty:`${(sec.surface_m2*wasteFactor).toFixed(2)} m²`, unit:`${cs}${sec.rate||0}/m²`, total:sec.surface_m2*wasteFactor*(sec.rate||0), brand:extractBrand(sec.materialLabel) }))
+      : [{ desc:`${e?.materialLabel} roofing`, qty:`${e?.adjArea?.toFixed(1)} m²`, unit:`${cs}${e?.materialRate}/m²`, total:e?.matCost||0 }]
 
     const gutterLines = e?.gutterRuns?.length
-      ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel} — supply & install`:"Guttering — supply & install", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0), brand:extractBrand(g.materialLabel) }))
+      ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel}`:"Guttering", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0), brand:extractBrand(g.materialLabel) }))
       : [{ desc:"Guttering", qty:`${((e?.guttering||0)*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.guttering}/m`, total:e?.gutCost||0 }]
     const downpipeLines = e?.downpipeItems?.length
-      ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel} — supply & install`:`Downpipe #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
+      ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel}`:`Downpipe #${i+1}`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
       : [{ desc:"Downpipes", qty:`${e?.downpipes||0} each`, unit:`${cs}${RATES.downpipe}/each`, total:e?.downpipeCost||0 }]
     const drainLines = e?.drainItems?.length
-      ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel} — supply & install`:`Drain #${i+1} — supply & install`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
+      ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel}`:`Drain #${i+1}`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
       : [{ desc:"Drains", qty:`${e?.drains||0} each`, unit:`${cs}${RATES.drain}/each`, total:e?.drainCost||0 }]
     const penetrationLines = e?.penetrationItems?.length
       ? e.penetrationItems.map((p,i)=>({ desc:p.materialLabel?`Penetration #${i+1} — ${p.materialLabel} — supply & seal`:`Penetration #${i+1} — supply & seal`, qty:"1 each", unit:`${cs}${p.rate||0}`, total:p.rate||0, brand:extractBrand(p.materialLabel) }))
@@ -4711,7 +4844,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
     // be absolute (relative /uploads/... paths won't resolve there).
     const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
     const logoHTML   = co.logoUrl   ? `<img src="${API_ORIGIN}${co.logoUrl}" alt="" style="width:48px;height:48px;object-fit:contain;margin-right:14px;"/>` : ""
-    const badgesHTML = co.badgesUrl ? `<div style="margin-top:16px;"><img src="${API_ORIGIN}${co.badgesUrl}" alt="" style="max-width:100%;max-height:56px;object-fit:contain;"/></div>` : ""
+    const badgesHTML = co.badgesUrl ? `<div style="margin-top:16px;"><img src="${API_ORIGIN}${co.badgesUrl}" alt="" style="width:100%;height:auto;display:block;"/></div>` : ""
     const signOffHTML = (co.estimatorName || co.estimatorTitle) ? `
       <div style="margin-top:24px;font-size:13px;color:#0f172a;line-height:1.8;">
         Ngā mihi,<br/>

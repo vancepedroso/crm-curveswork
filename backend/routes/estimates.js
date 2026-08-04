@@ -146,8 +146,8 @@ router.post("/:projectId/geometry", async (req, res) => {
 
     const { rows } = await pool.query(
       `INSERT INTO project_geometries (project_id, sections, accessories, asbestos,
-         scale_m_per_px, total_footprint_m2, total_surface_m2, total_flashing_m, total_gutter_m, snapshot_url, original_photo_url, organization_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         scale_m_per_px, total_footprint_m2, total_surface_m2, total_flashing_m, total_gutter_m, snapshot_url, original_photo_url, dimension_lines, organization_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        ON CONFLICT (project_id) DO UPDATE SET
          sections=EXCLUDED.sections, accessories=EXCLUDED.accessories,
          asbestos=EXCLUDED.asbestos, scale_m_per_px=EXCLUDED.scale_m_per_px,
@@ -156,13 +156,14 @@ router.post("/:projectId/geometry", async (req, res) => {
          total_flashing_m=EXCLUDED.total_flashing_m,
          total_gutter_m=EXCLUDED.total_gutter_m,
          snapshot_url=EXCLUDED.snapshot_url,
-         original_photo_url=EXCLUDED.original_photo_url
+         original_photo_url=EXCLUDED.original_photo_url,
+         dimension_lines=EXCLUDED.dimension_lines
        RETURNING *`,
       [req.params.projectId, JSON.stringify(g.sections || []),
        JSON.stringify(g.accessories || {}), g.asbestos || false,
        g.scale_m_per_px || 0.05, g.total_footprint_m2 || 0,
        g.total_surface_m2 || 0, g.total_flashing_m || 0, g.total_gutter_m || 0,
-       snapshotUrl, originalPhotoUrl, req.user.organizationId]
+       snapshotUrl, originalPhotoUrl, JSON.stringify(g.dimensionLines || []), req.user.organizationId]
     );
     res.json(rows[0]);
   } catch (err) {
