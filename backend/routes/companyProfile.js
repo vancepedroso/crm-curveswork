@@ -48,6 +48,12 @@ function serializeProfile(row) {
     dayRate:        parseFloat(row.day_rate) || 850,
     margin:         parseFloat(row.margin)   || 20,
     wastage:        parseFloat(row.wastage)  || 10,
+    discountEnabled: !!row.discount_enabled,
+    discountType:    row.discount_type || "percent",
+    discountValue:   parseFloat(row.discount_value) || 0,
+    downpipeStockLengths: row.downpipe_stock_lengths || "1.8,2.4",
+    downpipeBendRate: parseFloat(row.downpipe_bend_rate) || 15,
+    spreaderRate:     parseFloat(row.spreader_rate)      || 45,
   };
 }
 
@@ -80,19 +86,26 @@ router.put("/", async (req, res) => {
       companyName, companyAddress, companyPhone, companyEmail,
       companyGst, companyBank, estimatorName, estimatorTitle,
       dayRate, margin, wastage,
+      discountEnabled, discountType, discountValue,
+      downpipeStockLengths, downpipeBendRate, spreaderRate,
     } = req.body;
 
     const { rows } = await pool.query(
       `UPDATE company_profiles SET
          company_name=$1, company_address=$2, company_phone=$3, company_email=$4,
          company_gst=$5, company_bank=$6, estimator_name=$7, estimator_title=$8,
-         day_rate=$9, margin=$10, wastage=$11, updated_at=NOW()
-       WHERE organization_id=$12
+         day_rate=$9, margin=$10, wastage=$11,
+         discount_enabled=$12, discount_type=$13, discount_value=$14,
+         downpipe_stock_lengths=$15, downpipe_bend_rate=$16, spreader_rate=$17,
+         updated_at=NOW()
+       WHERE organization_id=$18
        RETURNING *`,
       [
         companyName || "", companyAddress || "", companyPhone || "", companyEmail || "",
         companyGst || "", companyBank || "", estimatorName || "", estimatorTitle || "",
         dayRate || 850, margin || 20, wastage || 10,
+        discountEnabled || false, discountType || "percent", discountValue || 0,
+        downpipeStockLengths || "1.8,2.4", downpipeBendRate || 15, spreaderRate || 45,
         req.user.organizationId,
       ]
     );

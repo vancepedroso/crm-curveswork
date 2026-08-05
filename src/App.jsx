@@ -39,6 +39,29 @@ const PITCHES = [
 ]
 
 const RATES = { flashings: 28, guttering: 45, downpipe: 35, drain: 40, penetration: 65, underlayment: 8 }
+
+// Given a traced downpipe run length and the stock lengths a supplier cuts
+// downpipe in, picks whichever stock length needs the fewest pieces (ties
+// broken by less waste) and returns how many pieces to buy.
+function calculateDownpipe(lengthM, stockLengths) {
+  const lengths = (stockLengths?.length ? stockLengths : [1.8, 2.4]).filter(n=>n>0)
+  let best = null
+  for (const stock of lengths) {
+    const quantity = Math.ceil(lengthM / stock)
+    const waste = quantity * stock - lengthM
+    if (!best || quantity < best.quantity || (quantity === best.quantity && waste < best.waste)) {
+      best = { preferredLength: stock, quantity, waste }
+    }
+  }
+  return { inputLength: lengthM, preferredLength: best.preferredLength, quantity: best.quantity, waste: Number(best.waste.toFixed(2)) }
+}
+// Full cost of one downpipe item: stock pieces (rate × calculated quantity)
+// plus bends/elbows and an optional spreader, each at their own flat rate —
+// bendRate/spreaderRate are per-organization Settings values (with the
+// organization's own defaults as the fallback here), not hardcoded constants.
+function downpipeItemTotal(d, bendRate=15, spreaderRate=45) {
+  return (d.rate||0)*(d.quantity||1) + (d.bends||0)*bendRate + (d.spreader?spreaderRate:0)
+}
 // ← Fallback only, for when no rate was resolved/threaded through (e.g. old
 //   saved estimates predating gst_rate). The real, dynamic rate now comes
 //   from the caller's organization's tax_country setting — see TaxContext
@@ -55,6 +78,12 @@ const DEFAULT_SETTINGS = {
   dayRate:850,
   margin:20,
   wastage:10,
+  discountEnabled:false,
+  discountType:"percent",
+  discountValue:0,
+  downpipeStockLengths:"1.8,2.4",
+  downpipeBendRate:15,
+  spreaderRate:45,
 }
 
 // ─────────────────────────── HELPERS ───────────────────────────
@@ -112,7 +141,7 @@ function calcEst(e) {
   //   flashings number. Falls back to the flat rate when there are no
   //   runs (old saved estimates / seed data predating this feature).
   const flashCost = (e.flashingRuns?.length ? e.flashingRuns : null)
-    ?.reduce((a,r)=>a+(r.length_m||0)*wasteFactor*(r.rate||0),0)
+    ?.reduce((a,r)=>a+flashingQtyM(r)*wasteFactor*(r.rate||0),0)
     ?? (e.flashings||0) * wasteFactor * RATES.flashings
   // ← Same pattern as sections/flashing runs: each traced gutter run,
   //   downpipe, drain, and penetration can carry its own picked brand/rate
@@ -123,7 +152,7 @@ function calcEst(e) {
     ?.reduce((a,g)=>a+(g.length_m||0)*wasteFactor*(g.rate||0),0)
     ?? (e.guttering||0) * wasteFactor * RATES.guttering
   const downpipeCost = (e.downpipeItems?.length ? e.downpipeItems : null)
-    ?.reduce((a,d)=>a+(d.rate||0),0)
+    ?.reduce((a,d)=>a+downpipeItemTotal(d, e.downpipeBendRate, e.spreaderRate),0)
     ?? (e.downpipes||0) * RATES.downpipe
   const drainCost = (e.drainItems?.length ? e.drainItems : null)
     ?.reduce((a,d)=>a+(d.rate||0),0)
@@ -134,11 +163,19 @@ function calcEst(e) {
   const labCost   = (e.dayRate||850) * (e.days||0) * (e.complexityFactor||1)
   const sub       = matCost + flashCost + gutCost + downpipeCost + drainCost + penetrationCost + labCost
   const marginAmt = sub * ((e.margin||0)/100)
-  const sellPrice = sub + marginAmt
+  const preDiscountSell = sub + marginAmt
+  // ← General Customer Discount — a promo-style discount off the marked-up
+  //   price (not a cost adjustment), applied before GST so tax is only
+  //   charged on what the customer actually pays. Math.max guards a fixed
+  //   discount larger than the price.
+  const discountAmt = e.discountEnabled
+    ? (e.discountType==="fixed" ? (e.discountValue||0) : preDiscountSell * ((e.discountValue||0)/100))
+    : 0
+  const sellPrice = Math.max(0, preDiscountSell - discountAmt)
   const gstRate   = e.gstRate ?? GST_RATE
   const gst       = sellPrice * gstRate
   const total     = sellPrice + gst
-  return { ...e, adjArea, matCost, flashCost, gutCost, downpipeCost, drainCost, penetrationCost, labCost, marginAmt, sellPrice, gst, gstRate, total }
+  return { ...e, adjArea, matCost, flashCost, gutCost, downpipeCost, drainCost, penetrationCost, labCost, marginAmt, preDiscountSell, discountAmt, sellPrice, gst, gstRate, total }
 }
 
 // ← Every quote line's materialLabel is built by MaterialPicker.pick() as
@@ -504,6 +541,16 @@ const FLASHING_TYPES = [
 ]
 const flashingLabel = key => FLASHING_TYPES.find(f=>f.key===key)?.label || "Flashing"
 
+// Hip/Valley/Apron/Barge/Eaves flashing physically follows the roof's
+// slope, so its traced (plan-view) length under-states real material
+// needed — same 1/cos(angle) correction sections already use for surface
+// area. No angle set (null/0) = no adjustment.
+function flashingQtyM(r) {
+  const a = parseFloat(r.angleDeg)
+  return (a>0 && a<90) ? (r.length_m||0)/Math.cos(a*Math.PI/180) : (r.length_m||0)
+}
+const FLASHING_ANGLE_SUBTYPES = ["hip_cap","valley","side_apron","barge","eaves"]
+
 // Units offered when calibrating the scale line — covers both metric and
 // imperial so the tool reads like a proper survey/civil measurement app,
 // not just "metres". Every unit converts to metres (the internal unit all
@@ -785,6 +832,17 @@ function distToSegment(pt, a, b) {
   const t = Math.max(0, Math.min(1, ((pt.x-a.x)*dx+(pt.y-a.y)*dy)/lenSq))
   return Math.hypot(pt.x-(a.x+t*dx), pt.y-(a.y+t*dy))
 }
+// Standard ray-casting point-in-polygon test — used to hit-test a click
+// landing inside a closed section's fill, not just on/near its outline.
+function pointInPolygon(pt, poly) {
+  let inside = false
+  for(let i=0, j=poly.length-1; i<poly.length; j=i++){
+    const xi=poly[i].x, yi=poly[i].y, xj=poly[j].x, yj=poly[j].y
+    const intersect = ((yi>pt.y)!==(yj>pt.y)) && (pt.x < (xj-xi)*(pt.y-yi)/(yj-yi)+xi)
+    if(intersect) inside = !inside
+  }
+  return inside
+}
 
 // Fixed internal drawing resolution (world / image space). Zoom & pan are
 // applied as a view transform on top of this — stored points always stay in
@@ -848,7 +906,7 @@ function initialDimensionLinesFrom(g) {
   return (g?.dimension_lines||[]).map(l => ({ ...l, id: l.id || uid() }))
 }
 
-const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, photoUrl, onPhotoChange, initialGeometry }, ref) {
+const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, photoUrl, onPhotoChange, initialGeometry, company }, ref) {
   const canvasRef   = useRef(null)
   const imgRef      = useRef(null)
   // ← True only for the instant getSnapshot() redraws the canvas for capture,
@@ -898,6 +956,11 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   //   ACCESSORY_MODAL_CONFIG below.
   const [accessoryModal, setAccessoryModal] = useState(null)
   const [pendingAccessoryMaterial, setPendingAccessoryMaterial] = useState(null)
+  // ← Chained in front of the downpipe brand modal right after placement —
+  //   see confirmPitch()'s "Roof Pitch → Roof Sheet Brand" chain for the
+  //   same pattern.
+  const [downpipeLengthModalId, setDownpipeLengthModalId] = useState(null)
+  const [pendingDownpipeLength, setPendingDownpipeLength] = useState("")
   const [lineItems, setLineItems] = useState(() => initialLineItemsFrom(initialGeometry))
   const [ptItems,   setPtItems]   = useState(() => initialPtItemsFrom(initialGeometry))
   // ← No on-canvas scale line is fabricated when restoring a saved project —
@@ -958,7 +1021,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   //   instead of landing wherever the mouse happened to click — fixes
   //   freehand-traced rectangles coming out slightly skewed.
   const [orthoMode, setOrthoMode] = useState(false)
-  const [arrayMode, setArrayMode] = useState(false)
+  // ← "Align": purely visual crosshair guide lines + X/Y coordinate readout
+  //   through the cursor, independent of Ortho's snap behavior — helps
+  //   trace straight lines by eye without changing where points land.
+  const [alignMode, setAlignMode] = useState(false)
   // ── Undo / Redo (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z or Ctrl+Y) ──────────────
   // A snapshot is pushed before every mutating action (adding a point to
   // a line, finishing a shape, deleting, dragging, calibrating scale), so
@@ -1296,29 +1362,64 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         const legendW  = Math.round(130*dprScale)
         const rowH     = Math.round(13*dprScale)
         const padTop   = Math.round(14*dprScale)
-        const rowCount = legendSections.reduce((n,ls)=>n+1+ls.sheets.length,0)
-        const legendH  = padTop*2 + rowCount*rowH
+        const headerFontPx = Math.round(10*dprScale)
+        const rowFontPx    = Math.round(9*dprScale)
+        const brandFontPx  = Math.round(9.5*dprScale)
+        const maxTextW      = legendW - Math.round(18*dprScale)
+
+        // ← Sections sharing the same picked brand/product are grouped under
+        //   one wrapped brand-name heading (so "Armorsteel — 0.55bmt..." only
+        //   prints once), with each section's own "SECTION A/B/C" + sheet
+        //   codes nested underneath — a section with no brand chosen yet
+        //   falls back to the old flat "SECTION X" listing with no heading.
         const composite = document.createElement("canvas")
+        const cctx = composite.getContext("2d")
+        const wrapLines = (text, font) => {
+          cctx.font = font
+          const words = text.split(" ")
+          const lines = []
+          let current = ""
+          words.forEach(word=>{
+            const test = current ? current+" "+word : word
+            if(current && cctx.measureText(test).width>maxTextW){ lines.push(current); current = word }
+            else current = test
+          })
+          if(current) lines.push(current)
+          return lines
+        }
+        const groups = []
+        const groupIndex = new Map()
+        legendSections.forEach(ls=>{
+          const key = ls.materialLabel || ""
+          if(!groupIndex.has(key)){ groupIndex.set(key, groups.length); groups.push({ materialLabel:key, sections:[] }) }
+          groups[groupIndex.get(key)].sections.push(ls)
+        })
+        const drawOps = []
+        groups.forEach(g=>{
+          const nested = !!g.materialLabel
+          if(nested){
+            wrapLines(g.materialLabel, `bold ${brandFontPx}px DM Sans`).forEach(line=>
+              drawOps.push({ text:line, font:`bold ${brandFontPx}px DM Sans`, color:"#0f172a", indent:10 }))
+          }
+          g.sections.forEach(ls=>{
+            drawOps.push({ text:`SECTION ${ls.sheets[0].sectionCode}`, font:`bold ${headerFontPx}px DM Sans`, color:"#1e293b", indent: nested?16:10 })
+            ls.sheets.forEach(s=>
+              drawOps.push({ text:`${s.sheetCode}   ${s.lengthM.toFixed(2)}m`, font:`${rowFontPx}px DM Sans`, color:"#334155", indent: nested?20:14 }))
+          })
+        })
+
+        const legendH = padTop*2 + drawOps.length*rowH
         composite.width  = cv.width + legendW
         composite.height = Math.max(cv.height, legendH)
-        const cctx = composite.getContext("2d")
         cctx.fillStyle = "#ffffff"
         cctx.fillRect(0,0,composite.width,composite.height)
         cctx.textBaseline = "alphabetic"
         let y = padTop
-        const headerFontPx = Math.round(10*dprScale)
-        const rowFontPx    = Math.round(9*dprScale)
-        legendSections.forEach(ls=>{
-          cctx.font = `bold ${headerFontPx}px DM Sans`
-          cctx.fillStyle = "#1e293b"
-          cctx.fillText(`SECTION ${ls.sheets[0].sectionCode}`, Math.round(10*dprScale), y)
+        drawOps.forEach(op=>{
+          cctx.font = op.font
+          cctx.fillStyle = op.color
+          cctx.fillText(op.text, Math.round(op.indent*dprScale), y)
           y += rowH
-          cctx.font = `${rowFontPx}px DM Sans`
-          cctx.fillStyle = "#334155"
-          ls.sheets.forEach(s=>{
-            cctx.fillText(`${s.sheetCode}   ${s.lengthM.toFixed(2)}m`, Math.round(14*dprScale), y)
-            y += rowH
-          })
         })
         cctx.drawImage(cv, legendW, 0)
         url = composite.toDataURL("image/png")
@@ -1589,6 +1690,17 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       sec.pts.forEach(p=>ctx.lineTo(p.x,p.y))
       if(sec.closed) ctx.closePath()
       ctx.stroke()
+      ctx.setLineDash([])
+      // ← Point markers drawn before the perimeter length tick/label below,
+      //   so that label's dark pill always paints on top of a corner marker
+      //   instead of being partly hidden under it — for a closed section the
+      //   total-length label anchors right at the start/close corner, and
+      //   the bigger i===0 marker circle used to be drawn afterward, on top,
+      //   covering part of the digits (e.g. "38.15m" reading as "3.15m").
+      sec.pts.forEach((p,i)=>{
+        ctx.fillStyle=i===0?col:"#fff"; ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?5:3),0,Math.PI*2); ctx.fill()
+        ctx.strokeStyle=editMode?"#fff88f":col; ctx.lineWidth=lw(editMode?2.5:1.5); ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?5:3),0,Math.PI*2); ctx.stroke()
+      })
       // ← Same metre tick marks as Flashing/Gutter — include the closing
       //   edge (back to the first point) for a closed section so the
       //   ticks wrap all the way around the outline, not just the open path.
@@ -1688,11 +1800,6 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           })
         }
       }
-      ctx.setLineDash([])
-      sec.pts.forEach((p,i)=>{
-        ctx.fillStyle=i===0?col:"#fff"; ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?5:3),0,Math.PI*2); ctx.fill()
-        ctx.strokeStyle=editMode?"#fff88f":col; ctx.lineWidth=lw(editMode?2.5:1.5); ctx.beginPath(); ctx.arc(p.x,p.y,lw(i===0?5:3),0,Math.PI*2); ctx.stroke()
-      })
       if(sec.closed){
         const cx=gs?.centroid?.x ?? sec.pts.reduce((a,p)=>a+p.x,0)/sec.pts.length
         const cy=gs?.centroid?.y ?? sec.pts.reduce((a,p)=>a+p.y,0)/sec.pts.length
@@ -1899,13 +2006,23 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 
     // ← Dimension Tool (PlanSwift-style click-two-points reference
     //   measurement) — deliberately styled differently from every other
-    //   line on this canvas (pink, dashed, its own end-tick color) so it
-    //   reads as an added annotation, not a traced/priced shape or the
-    //   automatic edge-length labels every section/line already shows.
-    //   Length is read straight off the same calibrated scale (`sf`) as
-    //   everywhere else — no separate calibration, and it carries no
+    //   line on this canvas (light gray, solid, architectural T-bar end
+    //   caps) so it reads as an added annotation, not a traced/priced shape
+    //   or the automatic edge-length labels every section/line already
+    //   shows. Length is read straight off the same calibrated scale (`sf`)
+    //   as everywhere else — no separate calibration, and it carries no
     //   rate/cost so it never touches the estimate.
-    const dimTick=p=>{ctx.beginPath();ctx.arc(p.x,p.y,lw(4),0,Math.PI*2);ctx.fillStyle="#ec4899";ctx.fill();ctx.strokeStyle="#fff";ctx.lineWidth=lw(1.5);ctx.stroke()}
+    const dimTick=(p,dir)=>{
+      const perp={x:-dir.y,y:dir.x}, len=lw(6)
+      ctx.beginPath()
+      ctx.moveTo(p.x-perp.x*len,p.y-perp.y*len)
+      ctx.lineTo(p.x+perp.x*len,p.y+perp.y*len)
+      ctx.stroke()
+    }
+    const dimLineDir=(p1,p2)=>{
+      const dx=p2.x-p1.x, dy=p2.y-p1.y, len=Math.hypot(dx,dy)
+      return len>0 ? {x:dx/len,y:dy/len} : {x:1,y:0}
+    }
     const drawDimLabel=(p1,p2,text)=>{
       const mx=(p1.x+p2.x)/2,my=(p1.y+p2.y)/2
       ctx.fillStyle="#ec4899"
@@ -1916,22 +2033,22 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
     dimensionLines.forEach(l=>{
       if(hiddenDimensionLines[l.id]) return
-      ctx.strokeStyle="#ec4899"; ctx.lineWidth=lw(2); ctx.setLineDash([lw(5),lw(3)])
+      ctx.strokeStyle="#94a3b8"; ctx.lineWidth=lw(1.25)
       ctx.beginPath(); ctx.moveTo(l.p1.x,l.p1.y); ctx.lineTo(l.p2.x,l.p2.y); ctx.stroke()
-      ctx.setLineDash([])
-      dimTick(l.p1); dimTick(l.p2)
+      const dir=dimLineDir(l.p1,l.p2)
+      dimTick(l.p1,dir); dimTick(l.p2,dir)
       const distM = Math.hypot(l.p2.x-l.p1.x,l.p2.y-l.p1.y)*sf
       drawDimLabel(l.p1,l.p2,`${distM.toFixed(2)}m`)
     })
     if(dimensionLine?.p1){
       const p2 = dimensionLine.p2||(activeTool==="dimension"?hoverPt:null)
-      ctx.strokeStyle="#ec4899"; ctx.lineWidth=lw(2); ctx.setLineDash([lw(5),lw(3)])
+      ctx.strokeStyle="#94a3b8"; ctx.lineWidth=lw(1.25)
       ctx.beginPath(); ctx.moveTo(dimensionLine.p1.x,dimensionLine.p1.y)
       if(p2) ctx.lineTo(p2.x,p2.y)
-      ctx.stroke(); ctx.setLineDash([])
-      dimTick(dimensionLine.p1)
+      ctx.stroke()
       if(p2){
-        dimTick(p2)
+        const dir=dimLineDir(dimensionLine.p1,p2)
+        dimTick(dimensionLine.p1,dir); dimTick(p2,dir)
         const distM = Math.hypot(p2.x-dimensionLine.p1.x,p2.y-dimensionLine.p1.y)*sf
         drawDimLabel(dimensionLine.p1,p2,`${distM.toFixed(2)}m`)
       }
@@ -1942,6 +2059,29 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       ctx.beginPath();ctx.moveTo(hoverPt.x-lw(14),hoverPt.y);ctx.lineTo(hoverPt.x+lw(14),hoverPt.y);ctx.stroke()
       ctx.beginPath();ctx.moveTo(hoverPt.x,hoverPt.y-lw(14));ctx.lineTo(hoverPt.x,hoverPt.y+lw(14));ctx.stroke()
       ctx.setLineDash([])
+    }
+
+    // ← Alignment tool: full-length horizontal/vertical guide lines through
+    //   the cursor plus an X/Y coordinate readout, for any active tool.
+    //   Purely visual — does not affect point placement/snapping (that's
+    //   what Ortho does). Excluded from the exported quote snapshot the
+    //   same way the "Upload a roof photo" prompt is (line ~1572).
+    if(alignMode&&hoverPt&&!snapshotModeRef.current){
+      ctx.strokeStyle="rgba(59,130,246,0.55)"; ctx.lineWidth=lw(1); ctx.setLineDash([lw(5),lw(3)])
+      ctx.beginPath(); ctx.moveTo(0,hoverPt.y); ctx.lineTo(MT_CANVAS_W,hoverPt.y); ctx.stroke()
+      ctx.beginPath(); ctx.moveTo(hoverPt.x,0); ctx.lineTo(hoverPt.x,MT_CANVAS_H); ctx.stroke()
+      ctx.setLineDash([])
+
+      const xM = (hoverPt.x*sf).toFixed(2), yM = (hoverPt.y*sf).toFixed(2)
+      const label = `X: ${xM}m  Y: ${yM}m`
+      ctx.font=`600 ${9/view.zoom}px DM Sans`; ctx.textAlign="left"; ctx.textBaseline="bottom"
+      const lx = hoverPt.x+lw(8), ly = hoverPt.y-lw(8)
+      const boxW = ctx.measureText(label).width+lw(8), boxH = lw(14)
+      ctx.fillStyle="rgba(15,23,42,0.8)"
+      try{ ctx.beginPath(); ctx.roundRect(lx, ly-boxH, boxW, boxH, lw(3)); ctx.fill() }
+      catch{ ctx.fillRect(lx, ly-boxH, boxW, boxH) }
+      ctx.fillStyle="#60a5fa"
+      ctx.fillText(label, lx+lw(4), ly-lw(3))
     }
 
     // ── Marquee-selected items get a dashed bounding-box highlight — blue,
@@ -1990,7 +2130,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     }
 
     ctx.restore()
-  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,scaleLines,dimensionLine,dimensionLines,hiddenDimensionLines,knownM,calibModalOpen,geometry,imgSrc,view,editMode,orthoMode,selection,selectionCount,selectBox,mPerPx,expandedCutSections,hiddenSections,cutAngleLine])
+  },[sections,lineItems,ptItems,activeTool,drawPts,hoverPt,scaleLine,scaleLines,dimensionLine,dimensionLines,hiddenDimensionLines,knownM,calibModalOpen,geometry,imgSrc,view,editMode,orthoMode,alignMode,selection,selectionCount,selectBox,mPerPx,expandedCutSections,hiddenSections,cutAngleLine])
 
   useEffect(()=>{ drawCanvas() },[drawCanvas])
 
@@ -2070,6 +2210,31 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     return null
   }
 
+  // Whole-shape hit-testing (not a single vertex/edge) — a click anywhere
+  // inside a closed section's fill, on/near a line item's path, or on a
+  // point item. Used by the Select tool's right-click-and-hold shortcut so
+  // any shape can be grabbed and moved instantly, without first marquee-
+  // selecting it.
+  function findShapeHit(pt) {
+    for(const sec of sections){
+      if(sec.pts.length<2) continue
+      if(sec.closed && sec.pts.length>=3 && pointInPolygon(pt, sec.pts)) return { kind:"section", id:sec.id }
+      const n = sec.closed ? sec.pts.length : sec.pts.length-1
+      for(let i=0;i<n;i++){
+        if(distToSegment(pt, sec.pts[i], sec.pts[(i+1)%sec.pts.length]) <= HIT_RADIUS) return { kind:"section", id:sec.id }
+      }
+    }
+    for(const li of lineItems){
+      for(let i=0;i<li.pts.length-1;i++){
+        if(distToSegment(pt, li.pts[i], li.pts[i+1]) <= HIT_RADIUS) return { kind:"line", id:li.id }
+      }
+    }
+    for(const pi of ptItems){
+      if(Math.hypot(pi.x-pt.x, pi.y-pt.y) <= HIT_RADIUS) return { kind:"point", id:pi.id }
+    }
+    return null
+  }
+
   function moveHit(hit, pt) {
     if(hit.kind==="section"){
       setSections(prev=>prev.map(sec=> sec.id!==hit.id ? sec : { ...sec, pts: sec.pts.map((p,i)=> i===hit.idx ? pt : p) }))
@@ -2092,6 +2257,65 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       return
     }
     const pt = getWorldPt(e.clientX, e.clientY)
+
+    // ← Right-click-and-hold: grab & move whatever shape is directly under
+    //   the cursor, from ANY active tool — not just Select — without
+    //   needing to select it first. Handled here, before findHit/edge-
+    //   insert/handleClick below, so a right-click never drags a single
+    //   vertex, inserts a point, or starts a new trace; it only ever means
+    //   "move this shape" (or, if it misses everything, falls through to
+    //   handleContextMenu's existing cancel/paste-popup behavior). Skipped
+    //   while something is actively being traced/calibrated (in-progress
+    //   section/flashing/gutter/scale/dimension/cut-angle line) since
+    //   right-click already means "cancel" there.
+    if(e.button===2){
+      const midTrace = drawPts.length>0
+        || (scaleLine?.p1 && !scaleLine?.p2)
+        || (dimensionLine?.p1 && !dimensionLine?.p2)
+        || !!cutAngleLine?.p1
+      if(!midTrace){
+        const startMove = (secIds, lineIds, ptIds) => {
+          moveSelectionRef.current = {
+            startPt: pt,
+            origSections: sections.filter(s=>secIds.includes(s.id)).map(s=>({id:s.id,pts:s.pts,cutAngleAnchor:s.cutAngleAnchor||null})),
+            origLines: lineItems.filter(l=>lineIds.includes(l.id)).map(l=>({id:l.id,pts:l.pts})),
+            origPoints: ptItems.filter(p=>ptIds.includes(p.id)).map(p=>({id:p.id,x:p.x,y:p.y})),
+            pushed: false,
+          }
+        }
+        // Prefer moving the existing selection if the cursor is over it
+        // (keeps a multi-shape selection moving together); otherwise grab +
+        // auto-select whichever single shape is directly under the cursor.
+        let grabbed = false
+        if(selectionCount>0){
+          const selPts = [
+            ...sections.filter(s=>selection.sections.includes(s.id)).flatMap(s=>s.pts),
+            ...lineItems.filter(l=>selection.lines.includes(l.id)).flatMap(l=>l.pts),
+            ...ptItems.filter(p=>selection.points.includes(p.id)).map(p=>({x:p.x,y:p.y})),
+          ]
+          if(selPts.length){
+            const x1=Math.min(...selPts.map(p=>p.x))-6, x2=Math.max(...selPts.map(p=>p.x))+6
+            const y1=Math.min(...selPts.map(p=>p.y))-6, y2=Math.max(...selPts.map(p=>p.y))+6
+            if(pt.x>=x1 && pt.x<=x2 && pt.y>=y1 && pt.y<=y2){ startMove(selection.sections, selection.lines, selection.points); grabbed = true }
+          }
+        }
+        if(!grabbed){
+          const shapeHit = findShapeHit(pt)
+          if(shapeHit){
+            const secIds  = shapeHit.kind==="section" ? [shapeHit.id] : []
+            const lineIds = shapeHit.kind==="line"    ? [shapeHit.id] : []
+            const ptIds   = shapeHit.kind==="point"   ? [shapeHit.id] : []
+            setSelection({ sections:secIds, lines:lineIds, points:ptIds, scale:false, scaleLineIds:[], dimensionLineIds:[] })
+            startMove(secIds, lineIds, ptIds)
+            grabbed = true
+          }
+        }
+        if(grabbed) return
+      }
+      return // any other right-click: let handleContextMenu (cancel in-progress trace / paste-duplicate popup) handle it
+    }
+
+    // ── everything below only ever runs for left-click (button 0) ──
     // Point/edge hit-testing runs before the Select tool's marquee-box —
     // otherwise having Select active (a natural choice when trying to click
     // on an existing shape) while Edit Points is on silently swallowed every
@@ -2134,7 +2358,8 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       //   instead of a brand new marquee — lets a selected shape be dragged
       //   to reposition it, not just selected/copied/deleted. Gated behind
       //   the explicit Move toggle so an ordinary click/drag while selecting
-      //   things can't shift a shape by accident.
+      //   things can't shift a shape by accident. (Right-click-and-hold is a
+      //   separate, zero-setup shortcut handled at the top of this function.)
       if(moveArmed && selectionCount>0){
         const selPts = [
           ...sections.filter(s=>selection.sections.includes(s.id)).flatMap(s=>s.pts),
@@ -2263,7 +2488,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       setDrawPts(prev=>[...prev, orthoMode ? orthoSnap(pt, prev[prev.length-1]) : pt])
     }
     else if(activeTool==="flashing"||activeTool==="gutter"){ setDrawPts(prev=>[...prev, orthoMode ? orthoSnap(pt, prev[prev.length-1]) : pt]) }
-    else if(activeTool==="downpipe")    { const id=uid(); setPtItems(prev=>[...prev,{id,type:"downpipe",   materialLabel:"",rate:0,x:pt.x,y:pt.y}]); setAccessoryModal({kind:"downpipe",   id}) }
+    else if(activeTool==="downpipe")    { const id=uid(); setPtItems(prev=>[...prev,{id,type:"downpipe",   materialLabel:"",rate:0,x:pt.x,y:pt.y,length_m:0,quantity:1,preferredLength:null,waste:0,bends:0,spreader:false}]); setDownpipeLengthModalId(id) }
     else if(activeTool==="drain")       { const id=uid(); setPtItems(prev=>[...prev,{id,type:"drain",      materialLabel:"",rate:0,x:pt.x,y:pt.y}]); setAccessoryModal({kind:"drain",      id}) }
     else if(activeTool==="penetration") { const id=uid(); setPtItems(prev=>[...prev,{id,type:"penetration",subtype:penSub,materialLabel:"",rate:0,x:pt.x,y:pt.y}]); setAccessoryModal({kind:"penetration",id}) }
     else if(activeTool==="scale"){
@@ -2306,6 +2531,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
 
   function handleContextMenu(e) {
     e.preventDefault() // stop the browser's right-click menu
+    // A right-click-and-hold inside the current selection just armed a move
+    // in handleMouseDown (fires first in the browser's event order) — don't
+    // also pop the paste-duplicate menu on top of that drag.
+    if(moveSelectionRef.current) return
     if(activeTool==="section" && drawPts.length>0) {
       // right-click cancels the in-progress section (not enough points to auto-close)
       setDrawPts([])
@@ -2426,13 +2655,14 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     {key:"penetration",label:"Penetration", icon:"◇",color:"#8b5cf6",hint:"Click to place — select type below"},
     {key:"scale",      label:"Calibrate Image", icon:"📏",color:"#10b981",hint:"Click two points over a known dimension · right-click to cancel"},
     {key:"dimension",  label:"Dimension",   icon:"↔",color:"#ec4899",hint:"Click two points to measure a distance for reference · right-click to cancel · not used in pricing"},
-    {key:"select",     label:"Select",      icon:"⬚",color:"#ef4444",hint:"Drag a box over items to select them, then drag inside the selection to move it · Delete to remove · Ctrl+C to copy · Ctrl+V or right-click to paste a duplicate"},
+    {key:"select",     label:"Select",      icon:"⬚",color:"#ef4444",hint:"Drag a box over items to select them, then drag inside the selection to move it · Delete to remove · Ctrl+C to copy · Ctrl+V or right-click empty space to paste a duplicate"},
     {key:"pan",        label:"Pan",         icon:"✋",color:"#64748b",hint:"Drag to pan the image (or hold Space with any tool)"},
   ]
 
   const tip = isPanMode ? "Drag to pan · release Space to resume drawing"
     : activeTool==="cutangle" ? "Click two points on the photo (e.g. along a visible rafter/ridge line) to set this section's cut angle · right-click to cancel"
     : (TOOLS.find(t=>t.key===activeTool)?.hint||"")
+    + " · right-click and hold directly on any shape to grab and move it instantly, from any tool"
     + (orthoMode && ["section","flashing","gutter"].includes(activeTool) ? " · Ortho: new points snap to horizontal/vertical" : "")
 
   return (
@@ -2474,7 +2704,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
             </button>
             <button
               onClick={()=>setOrthoMode(m=>!m)}
-              title="Ortho: snap each new traced point to horizontal/vertical from the previous point"
+              title={`Ortho: snap each new traced point to horizontal/vertical from the previous point — ${orthoMode?"ON":"OFF"} (click to turn ${orthoMode?"off":"on"})`}
               style={{padding:"5px 9px",borderRadius:6,
                 border:`1px solid ${orthoMode?"#fbbf24":"rgba(255,255,255,0.14)"}`,
                 background:orthoMode?"#fbbf2428":"transparent",
@@ -2484,15 +2714,15 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               <span>⊥</span>Ortho
             </button>
             <button
-              onClick={()=>setArrayMode(m=>!m)}
-              title="Array: create multiple instances of the selected shape"
+              onClick={()=>setAlignMode(m=>!m)}
+              title={`Alignment guides: show horizontal/vertical crosshair lines and coordinates through the cursor — ${alignMode?"ON":"OFF"} (click to turn ${alignMode?"off":"on"})`}
               style={{padding:"5px 9px",borderRadius:6,
-                border:`1px solid ${arrayMode?"#e2dbc7":"rgba(255,255,255,0.14)"}`,
-                background:arrayMode?"rgba(224, 213, 184, 0.16)":"transparent",
-                color:arrayMode?"#cabea0":"#94a3b8",
-                fontSize:11,fontWeight:arrayMode?600:400,cursor:"pointer",
+                border:`1px solid ${alignMode?"#fbbf24":"rgba(255,255,255,0.14)"}`,
+                background:alignMode?"#fbbf2428":"transparent",
+                color:alignMode?"#fbbf24":"#94a3b8",
+                fontSize:11,fontWeight:alignMode?600:400,cursor:"pointer",
                 display:"flex",alignItems:"center",gap:4,fontFamily:"inherit"}}>
-              <span>⊥</span>Array
+              <span>✛</span>Align
             </button>
             <div style={{marginLeft:"auto",display:"flex",gap:5,alignItems:"center"}}>
               {(activeTool==="flashing"||activeTool==="gutter")&&drawPts.length>=2&&(
@@ -2524,7 +2754,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               )}
               {activeTool==="select"&&selectionCount>0&&(
                 <button onClick={()=>setMoveArmed(a=>!a)}
-                  title={moveArmed ? "Move mode on — click and hold inside the selection, then drag" : "Turn on Move, then click and hold inside the selection to drag it"}
+                  title={moveArmed ? "Move mode on — click and hold inside the selection, then drag" : "Turn on Move, then click and hold inside the selection to drag it — or skip this entirely and right-click-hold directly on any shape instead"}
                   style={{padding:"5px 10px",borderRadius:6,border:`1px solid ${moveArmed?"#3b82f6":"#475569"}`,background:moveArmed?"#3b82f622":"transparent",color:moveArmed?"#3b82f6":"#94a3b8",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:4}}>
                   🤚 Move{moveArmed?" (on)":""}
                 </button>
@@ -3002,6 +3232,49 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         </Modal>
       )}
 
+      {downpipeLengthModalId && (() => {
+        const stockLengths = (company?.downpipeStockLengths || "1.8,2.4").split(",").map(Number).filter(n=>n>0)
+        const lengthM = parseFloat(pendingDownpipeLength)
+        const preview = lengthM>0 ? calculateDownpipe(lengthM, stockLengths) : null
+        const closeModal = () => { setDownpipeLengthModalId(null); setPendingDownpipeLength("") }
+        const confirmLength = () => {
+          if(!(lengthM>0)) return
+          const calc = calculateDownpipe(lengthM, stockLengths)
+          const id = downpipeLengthModalId
+          setPtItems(prev=>prev.map(p=>p.id===id?{...p,length_m:lengthM,quantity:calc.quantity,preferredLength:calc.preferredLength,waste:calc.waste}:p))
+          closeModal()
+          // ← Chains straight into the existing, unmodified brand-picker
+          //   flow (ACCESSORY_MODAL_CONFIG.downpipe below) — same "confirm
+          //   this, then open the next modal" shape as Roof Pitch → Roof
+          //   Sheet Brand above.
+          setAccessoryModal({kind:"downpipe", id})
+        }
+        return (
+        <Modal title="Downpipe Length" onClose={closeModal} width={380}>
+          <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
+            How long is this downpipe run? Used to work out how many stock lengths ({stockLengths.join("m / ")}m) to order and how much gets wasted.
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:preview?4:14}}>
+            <input type="number" min="0" step="any" autoFocus value={pendingDownpipeLength}
+              onChange={e=>setPendingDownpipeLength(e.target.value)}
+              onKeyDown={e=>{ if(e.key==="Enter" && lengthM>0) confirmLength() }}
+              placeholder="e.g. 5.2"
+              style={{...s.input,flex:1}}/>
+            <span style={{fontSize:13,color:"#64748b",fontWeight:600}}>m</span>
+          </div>
+          {preview && (
+            <div style={{fontSize:12,color:"#475569",background:"#f8fafc",borderRadius:8,padding:10,marginBottom:14,lineHeight:1.7}}>
+              → <strong>{preview.quantity} × {preview.preferredLength}m</strong> piece{preview.quantity===1?"":"s"} (waste {preview.waste}m)
+            </div>
+          )}
+          <div style={{display:"flex",justifyContent:"flex-end",gap:10}}>
+            <Btn onClick={closeModal}>Cancel</Btn>
+            <Btn primary onClick={confirmLength} style={{opacity:lengthM>0?1:.5}}>Continue</Btn>
+          </div>
+        </Modal>
+        )
+      })()}
+
       {accessoryModal && (() => {
         const cfg = ACCESSORY_MODAL_CONFIG[accessoryModal.kind]
         const subLabel = accessoryModal.kind==="flashing" ? flashingLabel(accessoryModal.subtype) : ""
@@ -3308,7 +3581,7 @@ function MaterialPicker({ value, onSelect, unit="m2", group="", catalogUnit="" }
   )
 }
 
-function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstimateChange }) {
+function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstimateChange, company }) {
   const { formatMoney: fmt, currency } = useCurrency()   // ← currency-aware fmt
   const cs = currency?.symbol || "$"   // ← for labels/inline strings fmt() can't be used on (not a full money value)
   // ← Live org setting, recalculated on every render — same as currency
@@ -3374,12 +3647,22 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
       days: initialEstimate?.days ?? 2,
       margin: initialEstimate?.margin ?? 20,
       complexity: initialEstimate?.complexity ?? "medium",
+      // ← "Saved wins over global default" — same pattern as per-section
+      //   materialLabel/rate above: a project's own discount choice sticks
+      //   once set, otherwise a brand-new estimate picks up the org-wide
+      //   default configured in Settings.
+      discountEnabled: initialEstimate?.discountEnabled ?? company?.discountEnabled ?? false,
+      discountType:    initialEstimate?.discountType    ?? company?.discountType    ?? "percent",
+      discountValue:   initialEstimate?.discountValue   ?? company?.discountValue   ?? 0,
+      downpipeBendRate: initialEstimate?.downpipeBendRate ?? company?.downpipeBendRate ?? 15,
+      spreaderRate:     initialEstimate?.spreaderRate     ?? company?.spreaderRate     ?? 45,
       flashingRuns: Object.entries(initialGeometry?.flashingBySubtype||{}).map(([subtype,length_m])=>{
         const prev = savedRuns.get(subtype)
         const traced = initialGeometry?.flashingMaterialBySubtype?.[subtype]
         return { subtype, label:flashingLabel(subtype), length_m,
           materialLabel: prev?.materialLabel ?? traced?.materialLabel ?? "",
-          rate: prev?.rate ?? traced?.rate ?? 0 }
+          rate: prev?.rate ?? traced?.rate ?? 0,
+          angleDeg: prev?.angleDeg ?? null }
       }),
       gutterRuns: (initialGeometry?.accessories?.gutters||[]).map(g=>{
         const prev = savedGutterRuns.get(g.id)
@@ -3387,7 +3670,13 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
       }),
       downpipeItems: (initialGeometry?.accessories?.downpipes||[]).map(d=>{
         const prev = savedDownpipeItems.get(d.id)
-        return { id:d.id, materialLabel:prev?.materialLabel ?? d.materialLabel ?? "", rate:prev?.rate ?? d.rate ?? 0 }
+        return { id:d.id, materialLabel:prev?.materialLabel ?? d.materialLabel ?? "", rate:prev?.rate ?? d.rate ?? 0,
+          // ← length/quantity/preferredLength/waste always come fresh from
+          //   the trace (same as a section's surface_m2) — only bends/
+          //   spreader are genuine Estimate-step-only edits, so those alone
+          //   follow the saved-wins-over-retrace pattern.
+          length_m: d.length_m ?? 0, quantity: d.quantity ?? 1, preferredLength: d.preferredLength ?? null, waste: d.waste ?? 0,
+          bends: prev?.bends ?? d.bends ?? 0, spreader: prev?.spreader ?? d.spreader ?? false }
       }),
       drainItems: (initialGeometry?.accessories?.drains||[]).map(d=>{
         const prev = savedDrainItems.get(d.id)
@@ -3515,15 +3804,27 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
                 <div key={run.subtype} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:10,marginBottom:8}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
                     <span style={{fontSize:13,fontWeight:600}}>{run.label}</span>
-                    <span style={{fontSize:12,color:"#64748b"}}>{run.length_m} m</span>
+                    <span style={{fontSize:12,color:"#64748b"}}>{run.length_m} m traced</span>
                   </div>
+                  {FLASHING_ANGLE_SUBTYPES.includes(run.subtype) && (
+                    <div style={{marginBottom:8}}>
+                      <label style={s.label}>Roof Angle (°) <span style={{color:"#94a3b8",fontWeight:400}}>— adjusts traced length to true sloped length</span></label>
+                      <input type="number" min="0" max="85" step="any" value={run.angleDeg ?? ""}
+                        onChange={ev=>{
+                          const v = ev.target.value
+                          setE(prev=>({...prev,flashingRuns:prev.flashingRuns.map((r,ri)=>ri===i?{...r,angleDeg:v===""?null:parseFloat(v)}:r)}))
+                        }}
+                        style={{...s.input,width:120}}/>
+                      {run.angleDeg>0 && <span style={{fontSize:11,color:"#94a3b8",marginLeft:8}}>→ {flashingQtyM(run).toFixed(2)}m adjusted</span>}
+                    </div>
+                  )}
                   <MaterialPicker
                     unit="lm"
                     group="flashing"
                     value={run.materialLabel}
                     onSelect={({label,rate})=>setE(prev=>({...prev,flashingRuns:prev.flashingRuns.map((r,ri)=>ri===i?{...r,materialLabel:label,rate}:r)}))}
                   />
-                  {run.rate>0 && <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>{(run.length_m*wasteFactor).toFixed(2)}m (incl. {e.waste||0}% waste) × {cs}{run.rate}/m = {cs}{(run.length_m*wasteFactor*run.rate).toFixed(2)}</div>}
+                  {run.rate>0 && <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>{(flashingQtyM(run)*wasteFactor).toFixed(2)}m (incl. {e.waste||0}% waste) × {cs}{run.rate}/m = {cs}{(flashingQtyM(run)*wasteFactor*run.rate).toFixed(2)}</div>}
                 </div>
               ))}
             </div>
@@ -3551,8 +3852,45 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
           ) : hasGuttering ? (
             <FG label={`Guttering (m) @ ${cs}${RATES.guttering}/m`}><input style={s.input} type="number" value={e.guttering} onChange={ev=>upd("guttering")(ev.target.value)}/></FG>
           ) : null}
+          {hasDownpipes && e.downpipeItems.length>0 && (
+            <div style={{marginBottom:14}}>
+              <label style={s.label}>Downpipes (traced on photo)</label>
+              {e.downpipeItems.map((d,i)=>(
+                <div key={d.id} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:10,marginBottom:8}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                    <span style={{fontSize:13,fontWeight:600}}>Downpipe #{i+1}</span>
+                    <span style={{fontSize:12,color:"#64748b"}}>
+                      {d.length_m>0 ? `${d.length_m}m → ${d.quantity} × ${d.preferredLength}m (waste ${d.waste}m)` : "no length set"}
+                    </span>
+                  </div>
+                  <div style={{display:"flex",gap:10,marginBottom:8,alignItems:"flex-end"}}>
+                    <FG label="Bends/Elbows">
+                      <input style={{...s.input,width:90}} type="number" min="0" value={d.bends}
+                        onChange={ev=>setE(prev=>({...prev,downpipeItems:prev.downpipeItems.map((r,ri)=>ri===i?{...r,bends:parseInt(ev.target.value)||0}:r)}))}/>
+                    </FG>
+                    <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"#475569",paddingBottom:9,cursor:"pointer"}}>
+                      <div onClick={()=>setE(prev=>({...prev,downpipeItems:prev.downpipeItems.map((r,ri)=>ri===i?{...r,spreader:!r.spreader}:r)}))}
+                        style={{width:34,height:19,borderRadius:10,background:d.spreader?"#10b981":"#cbd5e1",cursor:"pointer",position:"relative",flexShrink:0}}>
+                        <div style={{position:"absolute",top:2,left:d.spreader?16:2,width:15,height:15,borderRadius:"50%",background:"#fff",transition:"all .15s"}}/>
+                      </div>
+                      Spreader included
+                    </label>
+                  </div>
+                  <MaterialPicker
+                    unit="each" group="downpipe" catalogUnit="ea"
+                    value={d.materialLabel}
+                    onSelect={({label,rate})=>setE(prev=>({...prev,downpipeItems:prev.downpipeItems.map((r,ri)=>ri===i?{...r,materialLabel:label,rate}:r)}))}
+                  />
+                  {d.rate>0 && (
+                    <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>
+                      {d.quantity} × {cs}{d.rate}{d.bends>0?` + ${d.bends} bend${d.bends===1?"":"s"} × ${cs}${e.downpipeBendRate}`:""}{d.spreader?` + spreader ${cs}${e.spreaderRate}`:""} = {cs}{downpipeItemTotal(d, e.downpipeBendRate, e.spreaderRate).toFixed(2)}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
           {[
-            { key:"downpipeItems", has:hasDownpipes,    label:"Downpipes", group:"downpipe" },
             { key:"drainItems",    has:hasDrains,       label:"Drains",    group:"drain" },
             { key:"penetrationItems", has:hasPenetrations, label:"Penetrations", group:"penetration" },
           ].filter(sec=>sec.has && e[sec.key].length>0).map(sec=>(
@@ -3606,13 +3944,13 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
             ? e.sections.map(sec=>sec.rate>0 && sec.surface_m2!=null && row(`${sec.name} (${(sec.surface_m2*wasteFactor).toFixed(2)}m² incl. ${e.waste||0}% waste × ${cs}${sec.rate})`, fmt(sec.surface_m2*wasteFactor*sec.rate)))
             : row(`Material (${result.adjArea.toFixed(1)} m² × ${cs}${e.materialRate})`, fmt(result.matCost))}
           {e.flashingRuns.length>0
-            ? e.flashingRuns.map(r=>row(`${r.label} (${(r.length_m*wasteFactor).toFixed(2)}m incl. ${e.waste||0}% waste × ${cs}${r.rate||0})`, fmt(r.length_m*wasteFactor*(r.rate||0))))
+            ? e.flashingRuns.map(r=>row(`${r.label} (${(flashingQtyM(r)*wasteFactor).toFixed(2)}m incl. ${e.waste||0}% waste × ${cs}${r.rate||0})`, fmt(flashingQtyM(r)*wasteFactor*(r.rate||0))))
             : e.flashings>0 && row(`Flashings (${(e.flashings*wasteFactor).toFixed(1)}m incl. ${e.waste||0}% waste × ${cs}${RATES.flashings})`, fmt(result.flashCost))}
           {e.gutterRuns.length>0
             ? e.gutterRuns.map(g=>row(`Gutter run (${(g.length_m*wasteFactor).toFixed(2)}m incl. ${e.waste||0}% waste × ${cs}${g.rate||0})`, fmt(g.length_m*wasteFactor*(g.rate||0))))
             : e.guttering>0 && row(`Guttering (${(e.guttering*wasteFactor).toFixed(1)}m incl. ${e.waste||0}% waste × ${cs}${RATES.guttering})`, fmt(result.gutCost))}
           {e.downpipeItems.length>0
-            ? e.downpipeItems.map((d,i)=>row(`Downpipe #${i+1} (× ${cs}${d.rate||0})`, fmt(d.rate||0)))
+            ? e.downpipeItems.map((d,i)=>row(`Downpipe #${i+1} (${d.quantity||1} × ${cs}${d.rate||0}${d.bends>0?` + ${d.bends} bend${d.bends===1?"":"s"}`:""}${d.spreader?" + spreader":""})`, fmt(downpipeItemTotal(d, e.downpipeBendRate, e.spreaderRate))))
             : e.downpipes>0 && row(`Downpipes (${e.downpipes} × ${cs}${RATES.downpipe})`, fmt(result.downpipeCost))}
           {e.drainItems.length>0
             ? e.drainItems.map((d,i)=>row(`Drain #${i+1} (× ${cs}${d.rate||0})`, fmt(d.rate||0)))
@@ -3622,6 +3960,30 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
             : e.penetrations>0 && row(`Penetrations (${e.penetrations} × ${cs}${RATES.penetration})`, fmt(result.penetrationCost))}
           {row(`Labour (${e.days} days × ${cs}${e.dayRate} × ${complexityFactorValue} ${complexityLevels.find(c=>c.key===e.complexity)?.label||""})`, fmt(result.labCost))}
           {row(`Margin (${e.margin}%)`, fmt(result.marginAmt))}
+
+          <div style={{padding:"10px 0",borderTop:"1px solid rgba(255,255,255,0.07)"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:e.discountEnabled?10:0}}>
+              <span style={{fontSize:13,color:"#94a3b8"}}>General Customer Discount</span>
+              <div onClick={()=>setE(prev=>({...prev,discountEnabled:!prev.discountEnabled}))}
+                style={{width:34,height:19,borderRadius:10,background:e.discountEnabled?"#10b981":"#475569",cursor:"pointer",position:"relative",flexShrink:0}}>
+                <div style={{position:"absolute",top:2,left:e.discountEnabled?16:2,width:15,height:15,borderRadius:"50%",background:"#fff",transition:"all .15s"}}/>
+              </div>
+            </div>
+            {e.discountEnabled && (
+              <div style={{display:"flex",gap:8}}>
+                <select value={e.discountType} onChange={ev=>setE(prev=>({...prev,discountType:ev.target.value}))}
+                  style={{...s.input,background:"#1e293b",color:"#fff",borderColor:"#334155",width:110}}>
+                  <option value="percent">%</option>
+                  <option value="fixed">{cs} fixed</option>
+                </select>
+                <input type="number" value={e.discountValue} onChange={ev=>upd("discountValue")(ev.target.value)}
+                  style={{...s.input,background:"#1e293b",color:"#fff",borderColor:"#334155",flex:1}}/>
+              </div>
+            )}
+          </div>
+
+          {result.discountAmt>0 && row("Subtotal before discount", fmt(result.preDiscountSell))}
+          {result.discountAmt>0 && row(`Discount (${e.discountType==="fixed" ? cs+e.discountValue : e.discountValue+"%"})`, `− ${fmt(result.discountAmt)}`)}
           <div style={{borderTop:"1px solid rgba(255,255,255,0.15)",paddingTop:12,marginTop:4}}>
             {row("Sell Price (excl. GST)", fmt(result.sellPrice), true, true)}
             {row(`GST (${(result.gstRate*100).toFixed(0)}%)`, fmt(result.gst))}
@@ -3639,7 +4001,7 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
               ? e.sections.map(sec=><div key={sec.id}>{sec.name}: <strong style={{color:"#0f172a"}}>{sec.surface_m2!=null ? `${sec.surface_m2}m²` : "no pitch set"}{sec.rate?` @ ${cs}${sec.rate}/m²`:" — no material chosen yet"}</strong></div>)
               : <div>Material: <strong style={{color:"#0f172a"}}>{e.materialLabel} @ {cs}{e.materialRate}/m²</strong></div>}
             {e.flashingRuns.length>0
-              ? e.flashingRuns.map(r=><div key={r.subtype}>{r.label}: <strong style={{color:"#0f172a"}}>{r.length_m}m{r.rate?` @ ${cs}${r.rate}/m`:""}</strong></div>)
+              ? e.flashingRuns.map(r=><div key={r.subtype}>{r.label}: <strong style={{color:"#0f172a"}}>{flashingQtyM(r).toFixed(2)}m{r.angleDeg?` (${r.length_m}m traced @ ${r.angleDeg}°)`:""}{r.rate?` @ ${cs}${r.rate}/m`:""}</strong></div>)
               : e.flashings>0 && <div>Flashings: <strong style={{color:"#0f172a"}}>{e.flashings}m @ {cs}{RATES.flashings}/m</strong></div>}
             {e.gutterRuns.length>0
               ? e.gutterRuns.map(g=><div key={g.id}>Guttering: <strong style={{color:"#0f172a"}}>{g.length_m}m{g.rate?` @ ${cs}${g.rate}/m`:" — no material chosen yet"}</strong></div>)
@@ -3759,7 +4121,7 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
   const wasteFactor = 1 + (e.waste||0)/100
 
   const flashingLines = e.flashingRuns?.length
-    ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel}`:`${r.label} flashing`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0), brand:extractBrand(r.materialLabel) }))
+    ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel}`:`${r.label} flashing`, qty:`${(flashingQtyM(r)*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:flashingQtyM(r)*wasteFactor*(r.rate||0), brand:extractBrand(r.materialLabel) }))
     : [{ desc:"Flashings — ridge/hip/valley", qty:`${(e.flashings*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.flashings}/m`, total:e.flashCost }]
 
   // ← Each traced roof section gets its own line (brand/name + its own
@@ -3777,7 +4139,7 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
     ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel}`:"Guttering", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0), brand:extractBrand(g.materialLabel) }))
     : [{ desc:"Guttering", qty:`${(e.guttering*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.guttering}/m`, total:e.gutCost }]
   const downpipeLines = e.downpipeItems?.length
-    ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel}`:`Downpipe #${i+1}`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
+    ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel}${d.bends>0?` (+${d.bends} bend${d.bends===1?"":"s"})`:""}${d.spreader?" (+spreader)":""}`:`Downpipe #${i+1}`, qty:`${d.quantity||1} × ${d.preferredLength||"—"}m`, unit:`${cs}${d.rate||0}`, total:downpipeItemTotal(d, e.downpipeBendRate, e.spreaderRate), brand:extractBrand(d.materialLabel) }))
     : [{ desc:"Downpipes", qty:`${e.downpipes||0} each`, unit:`${cs}${RATES.downpipe}/each`, total:e.downpipeCost||0 }]
   const drainLines = e.drainItems?.length
     ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel}`:`Drain #${i+1}`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
@@ -3858,7 +4220,12 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
 
       <div style={{display:"flex",justifyContent:"flex-end"}}>
         <div style={{minWidth:240,width:"100%",maxWidth:280}}>
-          {[["Subtotal (excl. GST)", fmt(e.sellPrice)],[`GST (${((e.gstRate ?? GST_RATE)*100).toFixed(0)}%)`, fmt(e.gst)]].map(([l,v])=>(
+          {[
+            ...(e.discountAmt>0 ? [["Subtotal before discount", fmt(e.sellPrice+e.discountAmt)]] : []),
+            ...(e.discountAmt>0 ? [[`Discount (${e.discountType==="fixed" ? cs+e.discountValue : (e.discountValue||0)+"%"})`, `− ${fmt(e.discountAmt)}`]] : []),
+            ["Subtotal (excl. GST)", fmt(e.sellPrice)],
+            [`GST (${((e.gstRate ?? GST_RATE)*100).toFixed(0)}%)`, fmt(e.gst)],
+          ].map(([l,v])=>(
             <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid #f1f5f9",fontSize:13}}>
               <span style={{color:"#64748b"}}>{l}</span><span style={{fontWeight:500}}>{v}</span>
             </div>
@@ -4108,7 +4475,11 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
           const edited = new Map(edits.map(it=>[it.id,it]))
           next = { ...next, accessories: { ...next.accessories, [geomKey]: next.accessories[geomKey].map(it=>{
             const m = edited.get(it.id)
-            return m ? { ...it, materialLabel:m.materialLabel, rate:m.rate } : it
+            // ← Full-field merge (not just materialLabel/rate) so per-item
+            //   edits with no equivalent on the point marker itself — e.g. a
+            //   downpipe's bends/spreader — survive a round trip through the
+            //   Estimate step instead of reverting on the next re-render.
+            return m ? { ...it, ...m } : it
           })}}
         }
       })
@@ -4298,7 +4669,8 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
                 photoUrl={activeMeasurePhotoUrl
                   || (geometryFull?.original_photo_url ? `${API_ORIGIN}${geometryFull.original_photo_url}` : null)}
                 onPhotoChange={setActiveMeasurePhotoUrl}
-                initialGeometry={geometryFull}/>
+                initialGeometry={geometryFull}
+                company={company}/>
             ) : (
               <div style={{padding:"48px 20px",textAlign:"center",color:"#64748b",fontSize:13}}>Loading previous measurement…</div>
             )
@@ -4316,7 +4688,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
         </div>
       )}
 
-      {step===2 && <EstimateEngine initialArea={area||0} initialGeometry={geometryFull} initialEstimate={existingProject?.estimate} onEstimateChange={handleEstimateChange}/>}
+      {step===2 && <EstimateEngine initialArea={area||0} initialGeometry={geometryFull} initialEstimate={existingProject?.estimate} onEstimateChange={handleEstimateChange} company={company}/>}
 
       {step===3 && (
         <div className="wizard-review-grid">
@@ -4489,6 +4861,7 @@ function ProjectsList({ projects, customers, setProjects, setView, setSelectedPr
 
   const [search,       setSearch]       = useState("")
   const [filterStatus, setFilterStatus] = useState("All")
+  const [selected,     setSelected]     = useState([]) // selected project ids, for bulk delete
   const getCustomer = id => customers.find(c=>c.id===id)
 
   async function del(id) {
@@ -4496,7 +4869,19 @@ function ProjectsList({ projects, customers, setProjects, setView, setSelectedPr
     try {
       await projectsApi.delete(id)
       setProjects(prev=>prev.filter(p=>p.id!==id))
+      setSelected(prev=>prev.filter(pid=>pid!==id))
     } catch(err) { console.error("Failed to delete project:", err) }
+  }
+
+  async function delSelected() {
+    if(!selected.length) return
+    if(!window.confirm(`Delete ${selected.length} selected project${selected.length===1?"":"s"}? They can be restored from the database if needed.`)) return
+    const ids = selected
+    const results = await Promise.allSettled(ids.map(id=>projectsApi.delete(id)))
+    const failedIds = ids.filter((id,i)=>results[i].status==="rejected")
+    setProjects(prev=>prev.filter(p=>!ids.includes(p.id) || failedIds.includes(p.id)))
+    setSelected(failedIds)
+    if(failedIds.length) console.error("Failed to delete some projects:", failedIds)
   }
 
   const filtered = projects
@@ -4507,6 +4892,13 @@ function ProjectsList({ projects, customers, setProjects, setView, setSelectedPr
       return !q || (cust?.name||"").toLowerCase().includes(q) || p.address.toLowerCase().includes(q)
     })
     .sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)))
+
+  const allFilteredSelected = filtered.length>0 && filtered.every(p=>selected.includes(p.id))
+  const toggleSelectAll = () => {
+    if(allFilteredSelected) setSelected(prev=>prev.filter(id=>!filtered.some(p=>p.id===id)))
+    else setSelected(prev=>[...new Set([...prev, ...filtered.map(p=>p.id)])])
+  }
+  const toggleOne = id => setSelected(prev=>prev.includes(id) ? prev.filter(x=>x!==id) : [...prev,id])
 
   return (
     <div>
@@ -4522,19 +4914,35 @@ function ProjectsList({ projects, customers, setProjects, setView, setSelectedPr
             </button>
           ))}
         </div>
+        {selected.length>0 && (
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            <span style={{fontSize:12,color:"#64748b"}}>{selected.length} selected</span>
+            <Btn sm onClick={()=>setSelected([])}>Unselect All</Btn>
+            <Btn sm danger onClick={delSelected}>🗑 Delete Selected ({selected.length})</Btn>
+          </div>
+        )}
         <span style={{marginLeft:"auto",fontSize:13,color:"#64748b"}}>{filtered.length} projects</span>
       </div>
       <div style={{...s.card,padding:0,overflow:"hidden"}}>
         <div style={{overflowX:"auto"}}>
           <table style={{width:"100%",borderCollapse:"collapse",minWidth:640}}>
             <thead>
-              <tr>{["Customer","Address","Roof Area","Value","Status","Date","",""].map((h,i)=><th key={i} style={s.th}>{h}</th>)}</tr>
+              <tr>
+                <th style={{...s.th,width:36}}>
+                  <input type="checkbox" checked={allFilteredSelected} onChange={toggleSelectAll}
+                    title={allFilteredSelected ? "Unselect all" : "Select all"} style={{cursor:"pointer"}}/>
+                </th>
+                {["Customer","Address","Roof Area","Value","Status","Date","",""].map((h,i)=><th key={i} style={s.th}>{h}</th>)}
+              </tr>
             </thead>
             <tbody>
               {filtered.map(p=>{
                 const cust=getCustomer(p.customerId)
                 return (
                   <tr key={p.id} style={{cursor:"pointer"}} onClick={()=>{ setSelectedProject(p); setView("project") }}>
+                    <td style={s.td} onClick={e=>e.stopPropagation()}>
+                      <input type="checkbox" checked={selected.includes(p.id)} onChange={()=>toggleOne(p.id)} style={{cursor:"pointer"}}/>
+                    </td>
                     <td style={s.td}><div style={{fontWeight:500}}>{cust?.name||"—"}</div><div style={{fontSize:11,color:"#64748b"}}>{cust?.phone}</div></td>
                     <td style={{...s.td,maxWidth:200}}><div style={{fontSize:12,color:"#64748b",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{p.address}</div></td>
                     <td style={s.td}>{p.area>0 ? p.area+" m²" : <span style={{color:"#94a3b8"}}>—</span>}</td>
@@ -4548,7 +4956,7 @@ function ProjectsList({ projects, customers, setProjects, setView, setSelectedPr
                   </tr>
                 )
               })}
-              {filtered.length===0&&<tr><td colSpan={8} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No projects found</td></tr>}
+              {filtered.length===0&&<tr><td colSpan={9} style={{...s.td,textAlign:"center",color:"#94a3b8",padding:32}}>No projects found</td></tr>}
             </tbody>
           </table>
         </div>
@@ -4799,7 +5207,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
     const wasteFactor = 1 + (e?.waste||0)/100
 
     const flashingLines = e?.flashingRuns?.length
-      ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel}`:`${r.label} flashing`, qty:`${(r.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:r.length_m*wasteFactor*(r.rate||0), brand:extractBrand(r.materialLabel) }))
+      ? e.flashingRuns.map(r=>({ desc:r.materialLabel?`${r.label} — ${r.materialLabel}`:`${r.label} flashing`, qty:`${(flashingQtyM(r)*wasteFactor).toFixed(2)}m`, unit:`${cs}${r.rate||0}/m`, total:flashingQtyM(r)*wasteFactor*(r.rate||0), brand:extractBrand(r.materialLabel) }))
       : [{ desc:"Flashings — ridge/hip/valley", qty:`${((e?.flashings||0)*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.flashings}/m`, total:e?.flashCost||0 }]
 
     const materialLines = e?.sections?.length
@@ -4810,7 +5218,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
       ? e.gutterRuns.map(g=>({ desc:g.materialLabel?`Guttering — ${g.materialLabel}`:"Guttering", qty:`${(g.length_m*wasteFactor).toFixed(2)}m`, unit:`${cs}${g.rate||0}/m`, total:g.length_m*wasteFactor*(g.rate||0), brand:extractBrand(g.materialLabel) }))
       : [{ desc:"Guttering", qty:`${((e?.guttering||0)*wasteFactor).toFixed(1)}m`, unit:`${cs}${RATES.guttering}/m`, total:e?.gutCost||0 }]
     const downpipeLines = e?.downpipeItems?.length
-      ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel}`:`Downpipe #${i+1}`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
+      ? e.downpipeItems.map((d,i)=>({ desc:d.materialLabel?`Downpipe #${i+1} — ${d.materialLabel}${d.bends>0?` (+${d.bends} bend${d.bends===1?"":"s"})`:""}${d.spreader?" (+spreader)":""}`:`Downpipe #${i+1}`, qty:`${d.quantity||1} × ${d.preferredLength||"—"}m`, unit:`${cs}${d.rate||0}`, total:downpipeItemTotal(d, e.downpipeBendRate, e.spreaderRate), brand:extractBrand(d.materialLabel) }))
       : [{ desc:"Downpipes", qty:`${e?.downpipes||0} each`, unit:`${cs}${RATES.downpipe}/each`, total:e?.downpipeCost||0 }]
     const drainLines = e?.drainItems?.length
       ? e.drainItems.map((d,i)=>({ desc:d.materialLabel?`Drain #${i+1} — ${d.materialLabel}`:`Drain #${i+1}`, qty:"1 each", unit:`${cs}${d.rate||0}`, total:d.rate||0, brand:extractBrand(d.materialLabel) }))
@@ -4904,6 +5312,8 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
     </div>
     <div style="display:flex;justify-content:flex-end;margin-bottom:24px;">
       <div style="min-width:260px;">
+        ${e.discountAmt>0 ? `<div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;"><span style="color:#64748b;">Subtotal before discount</span><span style="font-weight:500;">${fmt_local(e.sellPrice+e.discountAmt)}</span></div>
+        <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;"><span style="color:#64748b;">Discount (${e.discountType==="fixed" ? cs+e.discountValue : (e.discountValue||0)+"%"})</span><span style="font-weight:500;">− ${fmt_local(e.discountAmt)}</span></div>` : ``}
         <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;"><span style="color:#64748b;">Subtotal (excl. GST)</span><span style="font-weight:500;">${fmt_local(e.sellPrice)}</span></div>
         <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;"><span style="color:#64748b;">GST (${((e.gstRate ?? GST_RATE)*100).toFixed(0)}%)</span><span style="font-weight:500;">${fmt_local(e.gst)}</span></div>
         <div style="background:#0f172a;border-radius:8px;padding:14px 16px;margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
@@ -4984,6 +5394,10 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
                 ["Guttering",                    formatMoney(e.gutCost)],
                 ["Labour",                       formatMoney(e.labCost)],
                 [`Margin (${e.margin}%)`,         formatMoney(e.marginAmt)],
+                ...(e.discountAmt>0 ? [["Subtotal before discount", formatMoney(e.sellPrice+e.discountAmt)]] : []),
+                ...(e.discountAmt>0 ? [[`Discount (${e.discountType==="fixed" ? cs+e.discountValue : (e.discountValue||0)+"%"})`, `− ${formatMoney(e.discountAmt)}`]] : []),
+                ["Subtotal (excl. GST)",         formatMoney(e.sellPrice)],
+                [`GST (${((e.gstRate ?? GST_RATE)*100).toFixed(0)}%)`, formatMoney(e.gst)],
               ].map(([l,v])=>(
                 <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid #f1f5f9",fontSize:13}}>
                   <span style={{color:"#64748b"}}>{l}</span>
@@ -5823,6 +6237,36 @@ function Settings({ settings, onSave }) {
             </select>
           </FG>
           <FG label="Default Wastage %">  <input style={s.input} type="number" value={form.wastage}  onChange={updNum("wastage")}/></FG>
+          <FG label="Downpipe Stock Lengths (m, comma-separated)">
+            <input style={s.input} value={form.downpipeStockLengths} onChange={upd("downpipeStockLengths")} placeholder="1.8,2.4"/>
+          </FG>
+          <FG label={`Downpipe Bend/Elbow Rate (${cs} each)`}>
+            <input style={s.input} type="number" value={form.downpipeBendRate} onChange={updNum("downpipeBendRate")}/>
+          </FG>
+          <FG label={`Downpipe Spreader Rate (${cs})`}>
+            <input style={s.input} type="number" value={form.spreaderRate} onChange={updNum("spreaderRate")}/>
+          </FG>
+        </div>
+      </div>
+      <div style={{...s.card,marginBottom:16}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
+          <div style={{fontWeight:700}}>General Customer Discount</div>
+          <div onClick={()=>setForm(prev=>({...prev,discountEnabled:!prev.discountEnabled}))}
+            style={{width:38,height:21,borderRadius:10,background:form.discountEnabled?"#10b981":"#cbd5e1",cursor:"pointer",position:"relative",transition:"all .2s",flexShrink:0}}>
+            <div style={{position:"absolute",top:2.5,left:form.discountEnabled?17:2.5,width:16,height:16,borderRadius:"50%",background:"#fff",transition:"all .2s",boxShadow:"0 1px 3px rgba(0,0,0,0.2)"}}/>
+          </div>
+        </div>
+        <div style={{fontSize:12,color:"#94a3b8",marginBottom:16}}>Applied automatically to every new quote's subtotal, like a running promo — turn it on/off anytime. Each project can still change or turn off its own amount individually.</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}} className="grid2-responsive">
+          <FG label="Discount Type">
+            <select style={s.input} value={form.discountType} onChange={upd("discountType")}>
+              <option value="percent">Percentage (%)</option>
+              <option value="fixed">Fixed amount ({cs})</option>
+            </select>
+          </FG>
+          <FG label={form.discountType==="fixed" ? `Discount Amount (${cs})` : "Discount Percentage (%)"}>
+            <input style={s.input} type="number" value={form.discountValue} onChange={updNum("discountValue")}/>
+          </FG>
         </div>
       </div>
       <div style={{...s.card,marginBottom:16}}>

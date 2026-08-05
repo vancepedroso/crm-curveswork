@@ -39,6 +39,18 @@ function serializeProject(row) {
       margin:        parseFloat(row.margin)        || 20,
       complexity:    row.complexity                || "medium",
       flashingRuns:  row.flashing_runs             || [],
+      // ← Per-section roof sheet brand/rate and per-item accessory
+      //   brand/rate, mirroring flashingRuns above — these columns exist
+      //   since migration 15 but were never wired into this serializer, so
+      //   the itemized quote breakdown (one line per traced section/gutter
+      //   run/downpipe/drain/penetration) only ever showed in the wizard's
+      //   own in-memory preview and silently collapsed to the old generic
+      //   single-line fallback everywhere else once reloaded from the DB.
+      sections:         row.sections           || [],
+      gutterRuns:       row.gutter_runs        || [],
+      downpipeItems:    row.downpipe_items     || [],
+      drainItems:       row.drain_items        || [],
+      penetrationItems: row.penetration_items  || [],
       adjArea:       parseFloat(row.adj_area)      || 0,
       matCost:       parseFloat(row.mat_cost)      || 0,
       flashCost:     parseFloat(row.flash_cost)    || 0,
@@ -48,6 +60,15 @@ function serializeProject(row) {
       penetrationCost: parseFloat(row.penetration_cost) || 0,
       labCost:       parseFloat(row.lab_cost)      || 0,
       marginAmt:     parseFloat(row.margin_amt)    || 0,
+      // ← Per-quote frozen discount, same rationale as gstRate below — a
+      //   past quote must not silently reprice itself if the org's default
+      //   discount changes later.
+      discountEnabled: !!row.discount_enabled,
+      discountType:    row.discount_type || "percent",
+      discountValue:   parseFloat(row.discount_value) || 0,
+      discountAmt:     parseFloat(row.discount_amt)   || 0,
+      downpipeBendRate: parseFloat(row.downpipe_bend_rate) || 15,
+      spreaderRate:     parseFloat(row.spreader_rate)      || 45,
       sellPrice:     parseFloat(row.sell_price)    || 0,
       gst:           parseFloat(row.gst)           || 0,
       // ← The rate actually applied when this quote was saved, not the
@@ -77,9 +98,12 @@ const PROJECT_SELECT = `
          e.material_rate, e.material_label,
          e.flashings, e.guttering, e.downpipes, e.drains, e.penetrations,
          e.day_rate, e.days, e.margin, e.complexity, e.flashing_runs,
+         e.sections, e.gutter_runs, e.downpipe_items, e.drain_items, e.penetration_items,
          e.adj_area, e.mat_cost, e.flash_cost, e.gut_cost,
          e.downpipe_cost, e.drain_cost, e.penetration_cost, e.lab_cost,
          e.margin_amt, e.sell_price, e.gst, e.gst_rate, e.total,
+         e.discount_enabled, e.discount_type, e.discount_value, e.discount_amt,
+         e.downpipe_bend_rate, e.spreader_rate,
          c.name    AS customer_name,
          c.email   AS customer_email,
          c.phone   AS customer_phone,
@@ -173,9 +197,12 @@ router.post("/", async (req, res) => {
            (project_id, area, pitch, waste, material_rate, material_label,
             flashings, guttering, downpipes, drains, penetrations,
             day_rate, days, margin, complexity, flashing_runs,
+            sections, gutter_runs, downpipe_items, drain_items, penetration_items,
             adj_area, mat_cost, flash_cost, gut_cost, downpipe_cost, drain_cost, penetration_cost, lab_cost,
-            margin_amt, sell_price, gst, gst_rate, total, organization_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)`,
+            margin_amt, sell_price, gst, gst_rate, total,
+            discount_enabled, discount_type, discount_value, discount_amt,
+            downpipe_bend_rate, spreader_rate, organization_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41)`,
         [
           project.id, estimate.area, estimate.pitch, estimate.waste,
           estimate.materialRate, estimate.materialLabel,
@@ -183,9 +210,16 @@ router.post("/", async (req, res) => {
           estimate.downpipes || 0, estimate.drains || 0, estimate.penetrations || 0,
           estimate.dayRate, estimate.days, estimate.margin, estimate.complexity || "medium",
           JSON.stringify(estimate.flashingRuns || []),
+          JSON.stringify(estimate.sections || []),
+          JSON.stringify(estimate.gutterRuns || []),
+          JSON.stringify(estimate.downpipeItems || []),
+          JSON.stringify(estimate.drainItems || []),
+          JSON.stringify(estimate.penetrationItems || []),
           estimate.adjArea, estimate.matCost, estimate.flashCost,
           estimate.gutCost, estimate.downpipeCost || 0, estimate.drainCost || 0, estimate.penetrationCost || 0, estimate.labCost,
           estimate.marginAmt, estimate.sellPrice, estimate.gst, estimate.gstRate || 0.15, estimate.total,
+          estimate.discountEnabled || false, estimate.discountType || "percent", estimate.discountValue || 0, estimate.discountAmt || 0,
+          estimate.downpipeBendRate || 15, estimate.spreaderRate || 45,
           req.user.organizationId,
         ]
       );
@@ -255,9 +289,12 @@ router.put("/:id", async (req, res) => {
            (project_id, area, pitch, waste, material_rate, material_label,
             flashings, guttering, downpipes, drains, penetrations,
             day_rate, days, margin, complexity, flashing_runs,
+            sections, gutter_runs, downpipe_items, drain_items, penetration_items,
             adj_area, mat_cost, flash_cost, gut_cost, downpipe_cost, drain_cost, penetration_cost, lab_cost,
-            margin_amt, sell_price, gst, gst_rate, total, organization_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+            margin_amt, sell_price, gst, gst_rate, total,
+            discount_enabled, discount_type, discount_value, discount_amt,
+            downpipe_bend_rate, spreader_rate, organization_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41)
          ON CONFLICT (project_id) DO UPDATE SET
            area=EXCLUDED.area, pitch=EXCLUDED.pitch, waste=EXCLUDED.waste,
            material_rate=EXCLUDED.material_rate, material_label=EXCLUDED.material_label,
@@ -265,12 +302,18 @@ router.put("/:id", async (req, res) => {
            downpipes=EXCLUDED.downpipes, drains=EXCLUDED.drains, penetrations=EXCLUDED.penetrations,
            day_rate=EXCLUDED.day_rate, days=EXCLUDED.days, margin=EXCLUDED.margin,
            complexity=EXCLUDED.complexity, flashing_runs=EXCLUDED.flashing_runs,
+           sections=EXCLUDED.sections, gutter_runs=EXCLUDED.gutter_runs,
+           downpipe_items=EXCLUDED.downpipe_items, drain_items=EXCLUDED.drain_items,
+           penetration_items=EXCLUDED.penetration_items,
            adj_area=EXCLUDED.adj_area, mat_cost=EXCLUDED.mat_cost,
            flash_cost=EXCLUDED.flash_cost, gut_cost=EXCLUDED.gut_cost,
            downpipe_cost=EXCLUDED.downpipe_cost, drain_cost=EXCLUDED.drain_cost,
            penetration_cost=EXCLUDED.penetration_cost,
            lab_cost=EXCLUDED.lab_cost, margin_amt=EXCLUDED.margin_amt,
-           sell_price=EXCLUDED.sell_price, gst=EXCLUDED.gst, gst_rate=EXCLUDED.gst_rate, total=EXCLUDED.total`,
+           sell_price=EXCLUDED.sell_price, gst=EXCLUDED.gst, gst_rate=EXCLUDED.gst_rate, total=EXCLUDED.total,
+           discount_enabled=EXCLUDED.discount_enabled, discount_type=EXCLUDED.discount_type,
+           discount_value=EXCLUDED.discount_value, discount_amt=EXCLUDED.discount_amt,
+           downpipe_bend_rate=EXCLUDED.downpipe_bend_rate, spreader_rate=EXCLUDED.spreader_rate`,
         [
           req.params.id, estimate.area, estimate.pitch, estimate.waste,
           estimate.materialRate, estimate.materialLabel,
@@ -278,9 +321,16 @@ router.put("/:id", async (req, res) => {
           estimate.downpipes || 0, estimate.drains || 0, estimate.penetrations || 0,
           estimate.dayRate, estimate.days, estimate.margin, estimate.complexity || "medium",
           JSON.stringify(estimate.flashingRuns || []),
+          JSON.stringify(estimate.sections || []),
+          JSON.stringify(estimate.gutterRuns || []),
+          JSON.stringify(estimate.downpipeItems || []),
+          JSON.stringify(estimate.drainItems || []),
+          JSON.stringify(estimate.penetrationItems || []),
           estimate.adjArea, estimate.matCost, estimate.flashCost,
           estimate.gutCost, estimate.downpipeCost || 0, estimate.drainCost || 0, estimate.penetrationCost || 0, estimate.labCost,
           estimate.marginAmt, estimate.sellPrice, estimate.gst, estimate.gstRate || 0.15, estimate.total,
+          estimate.discountEnabled || false, estimate.discountType || "percent", estimate.discountValue || 0, estimate.discountAmt || 0,
+          estimate.downpipeBendRate || 15, estimate.spreaderRate || 45,
           req.user.organizationId,
         ]
       );
