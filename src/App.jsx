@@ -906,6 +906,305 @@ function initialDimensionLinesFrom(g) {
   return (g?.dimension_lines||[]).map(l => ({ ...l, id: l.id || uid() }))
 }
 
+// ─────────────────────────── PHOTO PROTRACTOR ───────────────────────────
+// Measures a roof's slope angle by dragging a line along the roof edge in a
+// photo — the "measure it instead of typing it" counterpart to the Roof
+// Pitch modal's Degrees field.
+//
+// Two things this deliberately does NOT do, both worth knowing:
+//
+//  1. It never measures on the main tracing canvas. That canvas draws the
+//     photo with `drawImage(img,0,0,MT_CANVAS_W,MT_CANVAS_H)` — stretched to
+//     a fixed 490x330 regardless of the image's real shape — so an angle
+//     read off it is skewed by the stretch. Here the photo is drawn with a
+//     single uniform scale (letterboxed to fit), which is what makes a
+//     measured screen angle equal the true angle in the photo.
+//
+//  2. It can't turn an oblique photo into a true pitch. What's measured is
+//     the *apparent* angle, which equals the real slope only when the camera
+//     is roughly square-on to the gable end. Nothing in this app carries
+//     camera pose/horizon data to correct for that, so the reading is
+//     presented as an estimate rather than implying survey accuracy. The
+//     optional horizontal reference line does fix the one error that IS
+//     correctable without pose data: a tilted/rotated photo.
+function fitContain(iw, ih, bw, bh) {
+  if(!iw || !ih || !bw || !bh) return { x:0, y:0, w:0, h:0 }
+  const scale = Math.min(bw/iw, bh/ih)   // ← uniform: preserves angles
+  const w = iw*scale, h = ih*scale
+  return { x:(bw-w)/2, y:(bh-h)/2, w, h }
+}
+
+// Normalises any measured line direction into the 0–90° range a roof slope
+// actually lives in — a line drawn up-left and one drawn down-right describe
+// the same steepness, and 158° is just 22° mirrored.
+function toSlopeDeg(deg) {
+  const a = ((deg % 180) + 180) % 180
+  return a > 90 ? 180 - a : a
+}
+
+function ProtractorOverlay({ initialImage, onClose, onConfirm, confirmLabel = "Use this angle" }) {
+  const wrapRef   = useRef(null)
+  const canvasRef = useRef(null)
+  const fileRef   = useRef(null)
+  const dragRef   = useRef(null)
+
+  const [img,     setImg]     = useState(initialImage || null)
+  const [box,     setBox]     = useState({ w:0, h:0 })
+  const [angle,   setAngle]   = useState(0)      // ruler rotation, degrees
+  const [pos,     setPos]     = useState(null)   // ruler centre, CSS px
+  const [baseDeg, setBaseDeg] = useState(0)      // "level" tare, see setLevel()
+
+  // Track the drawing surface so the backing store stays sharp and the
+  // letterbox fit recomputes on resize/rotate.
+  useLayoutEffect(()=>{
+    const el = wrapRef.current
+    if(!el) return
+    const sync = () => setBox({ w: el.clientWidth, h: el.clientHeight })
+    sync()
+    const ro = new ResizeObserver(sync)
+    ro.observe(el)
+    return ()=>ro.disconnect()
+  },[])
+
+  // Park the ruler in the middle until the user first drags it.
+  useEffect(()=>{
+    if(!pos && box.w && box.h) setPos({ x: box.w/2, y: box.h/2 })
+  },[box, pos])
+
+  // Wheel rotates the ruler. Registered natively with passive:false because
+  // preventDefault() is required to stop the page scrolling underneath, and
+  // React's synthetic wheel handler can't guarantee that.
+  useEffect(()=>{
+    const cv = canvasRef.current
+    if(!cv) return
+    const onWheel = e => {
+      e.preventDefault()
+      const step = e.shiftKey ? 0.1 : 1
+      setAngle(a => a + (e.deltaY > 0 ? step : -step))
+    }
+    cv.addEventListener("wheel", onWheel, { passive:false })
+    return ()=>cv.removeEventListener("wheel", onWheel)
+  },[])
+
+  useEffect(()=>{
+    function onKey(e){
+      if(e.key==="Escape"){ onClose(); return }
+      const step = e.shiftKey ? 0.1 : 1
+      if(e.key==="ArrowLeft"||e.key==="ArrowDown"){ e.preventDefault(); setAngle(a=>a-step) }
+      if(e.key==="ArrowRight"||e.key==="ArrowUp"){ e.preventDefault(); setAngle(a=>a+step) }
+    }
+    window.addEventListener("keydown", onKey)
+    return ()=>window.removeEventListener("keydown", onKey)
+  },[onClose])
+
+  const displayDeg = toSlopeDeg(angle - baseDeg)
+  // Same rise:run rendering the Roof Pitch modal shows, so both readouts agree.
+  const ratioDisplay = `${Math.round(12*Math.tan(displayDeg*Math.PI/180)*100)/100} : 12`
+  const tooSteep = displayDeg >= 85
+  // A reading taken against a blank canvas isn't a measurement of anything.
+  const canConfirm = !!img && !tooSteep
+
+  useEffect(()=>{
+    const cv = canvasRef.current
+    if(!cv || !box.w || !box.h || !pos) return
+    const dpr = Math.min(window.devicePixelRatio||1, 2)
+    cv.width  = Math.round(box.w*dpr)
+    cv.height = Math.round(box.h*dpr)
+    const ctx = cv.getContext("2d")
+    ctx.setTransform(dpr,0,0,dpr,0,0)
+    ctx.fillStyle = "#0b1220"
+    ctx.fillRect(0,0,box.w,box.h)
+
+    // Nothing to measure against yet — leave the canvas empty so the DOM
+    // "choose a photo" prompt over the top reads clearly, instead of
+    // rendering a ruler across a blank backdrop and burying the instruction
+    // underneath it.
+    if(!img) return
+
+    const r = fitContain(img.naturalWidth||img.width, img.naturalHeight||img.height, box.w, box.h)
+    ctx.drawImage(img, r.x, r.y, r.w, r.h)
+
+    const rad = angle*Math.PI/180
+
+    // ── The ruler itself: a physical straightedge you lay over the roof
+    //    line, rather than a line you draw. Long enough to always run off
+    //    both sides of the canvas at any rotation.
+    const H = 132
+    const L = Math.hypot(box.w, box.h)*2 + 400
+    ctx.save()
+    ctx.translate(pos.x, pos.y)
+    ctx.rotate(rad)
+
+    ctx.fillStyle = "rgba(226,232,240,0.80)"
+    ctx.fillRect(-L/2, -H/2, L, H)
+    ctx.strokeStyle = "rgba(15,23,42,0.45)"
+    ctx.lineWidth = 1.5
+    ctx.strokeRect(-L/2, -H/2, L, H)
+
+    // Graduations on both long edges, pointing inward.
+    ctx.lineCap = "butt"
+    for(let x = -Math.floor(L/2/10)*10; x <= L/2; x += 10){
+      const i = Math.round(x/10)
+      const major = i%10===0, mid = i%5===0
+      const len = major ? 19 : mid ? 12 : 7
+      ctx.strokeStyle = major ? "rgba(15,23,42,0.75)" : "rgba(15,23,42,0.45)"
+      ctx.lineWidth   = major ? 1.5 : 1
+      ctx.beginPath(); ctx.moveTo(x, -H/2); ctx.lineTo(x, -H/2+len); ctx.stroke()
+      ctx.beginPath(); ctx.moveTo(x,  H/2); ctx.lineTo(x,  H/2-len); ctx.stroke()
+    }
+    ctx.restore()
+
+    // ── Centre dial. Drawn unrotated so the number stays upright however far
+    //    the ruler is turned, with a red pointer tracking the rotation.
+    const R = 34
+    ctx.save()
+    ctx.translate(pos.x, pos.y)
+    ctx.fillStyle = "rgba(255,255,255,0.94)"
+    ctx.beginPath(); ctx.arc(0,0,R+9,0,Math.PI*2); ctx.fill()
+    ctx.strokeStyle = "rgba(15,23,42,0.18)"; ctx.lineWidth = 1
+    ctx.beginPath(); ctx.arc(0,0,R+9,0,Math.PI*2); ctx.stroke()
+    for(let d=0; d<360; d+=6){
+      const a = d*Math.PI/180
+      const major = d%30===0
+      ctx.strokeStyle = "rgba(15,23,42,0.7)"
+      ctx.lineWidth   = major ? 1.6 : 1
+      const r0 = R - (major ? 10 : 5)
+      ctx.beginPath()
+      ctx.moveTo(Math.cos(a)*r0, Math.sin(a)*r0)
+      ctx.lineTo(Math.cos(a)*R,  Math.sin(a)*R)
+      ctx.stroke()
+    }
+    ctx.strokeStyle = "#ef4444"; ctx.lineWidth = 2.5
+    ;[rad, rad+Math.PI].forEach(a=>{
+      ctx.beginPath()
+      ctx.moveTo(Math.cos(a)*(R-3), Math.sin(a)*(R-3))
+      ctx.lineTo(Math.cos(a)*(R+8), Math.sin(a)*(R+8))
+      ctx.stroke()
+    })
+    ctx.fillStyle = "#0f172a"
+    ctx.font = "bold 15px DM Sans"
+    ctx.textAlign = "center"; ctx.textBaseline = "middle"
+    ctx.fillText(`${displayDeg.toFixed(1)}°`, 0, 0)
+    ctx.textBaseline = "alphabetic"
+    ctx.restore()
+  },[img, box, pos, angle, displayDeg])
+
+  const ptFrom = e => {
+    const r = canvasRef.current.getBoundingClientRect()
+    return { x: e.clientX - r.left, y: e.clientY - r.top }
+  }
+  const onDown = e => {
+    e.currentTarget.setPointerCapture?.(e.pointerId)
+    const p = ptFrom(e)
+    dragRef.current = { from:p, origin:pos }
+  }
+  const onMove = e => {
+    const d = dragRef.current
+    if(!d || !d.origin) return
+    const p = ptFrom(e)
+    setPos({ x: d.origin.x + (p.x-d.from.x), y: d.origin.y + (p.y-d.from.y) })
+  }
+  const onUp = () => { dragRef.current = null }
+
+  function pickPhoto(file){
+    if(!file) return
+    const r = new FileReader()
+    r.onload = ev => {
+      const im = new Image()
+      im.onload = () => setImg(im)
+      im.src = ev.target.result
+    }
+    r.readAsDataURL(file)
+  }
+
+  const btn = "px-2.5 py-1.5 rounded-md border border-white/15 text-slate-300 text-[11px] hover:bg-white/5"
+
+  return (
+    <div className="fixed inset-0 z-[2000] bg-slate-900/90 flex flex-col" onClick={e=>e.stopPropagation()}>
+      <div className="shrink-0 flex items-center justify-between gap-3 px-4 py-3 border-b border-white/10 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-white font-display font-extrabold text-[15px]">📐 Protractor</span>
+          <span className="text-slate-400 text-[11px]">
+            Scroll to rotate · drag to move · hold Shift for 0.1° steps
+          </span>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <input ref={fileRef} type="file" accept="image/*" className="hidden"
+            onChange={e=>{ pickPhoto(e.target.files[0]); e.target.value="" }}/>
+          <button onClick={()=>fileRef.current?.click()}
+            title="Pitch isn't visible in a top-down aerial — load a side/elevation photo to measure it"
+            className={btn}>🖼 Use a different photo</button>
+          <button onClick={()=>setBaseDeg(angle)} disabled={!img}
+            title="Lay the ruler on something you know is level (gutter, eave, window sill) and click this — the reading then counts from there, cancelling out a tilted photo"
+            className={btn} style={{opacity:img?1:.4}}>⇔ Set level here</button>
+          {baseDeg!==0 && (
+            <button onClick={()=>setBaseDeg(0)} className="px-2.5 py-1.5 rounded-md border border-sky-400 text-sky-300 bg-sky-400/10 text-[11px]">
+              level {baseDeg>0?"+":""}{baseDeg.toFixed(1)}° · reset
+            </button>
+          )}
+          <button onClick={()=>{ setAngle(0); setBaseDeg(0); setPos({x:box.w/2,y:box.h/2}) }} className={btn}>Reset</button>
+          {/* ← Duplicated up here because the footer's copy can sit below the
+              fold on a short window, leaving no visible way to commit the
+              measurement. The header is always on screen at any size. */}
+          <span className="text-amber-400 font-bold text-[15px] tabular-nums pl-1">
+            {img ? `${displayDeg.toFixed(2)}°` : "—"}
+          </span>
+          <Btn primary style={{opacity:canConfirm?1:.5}} onClick={()=>{ if(canConfirm) onConfirm(displayDeg) }}>
+            {confirmLabel}
+          </Btn>
+          <button onClick={onClose} className={btn}>✕ Close</button>
+        </div>
+      </div>
+
+      <div ref={wrapRef} className="flex-1 min-h-0 relative">
+        <canvas
+          ref={canvasRef}
+          onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
+          className={`absolute inset-0 w-full h-full block ${img?"cursor-move":"cursor-default"}`}
+          style={{ touchAction:"none" }}/>
+        {!img && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none">
+            <div className="text-slate-300 text-sm text-center max-w-sm leading-relaxed px-4">
+              Load a photo that shows the roof <strong className="text-white">from the side</strong> — a street-view
+              screenshot or site photo. A top-down aerial can't show pitch.
+            </div>
+            <button onClick={()=>fileRef.current?.click()}
+              className="pointer-events-auto px-4 py-2 rounded-lg bg-accent hover:bg-accent-dark text-slate-900 font-medium text-[13px]">
+              🖼 Choose a photo
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="shrink-0 px-4 py-3 border-t border-white/10 flex items-center justify-between gap-4 flex-wrap">
+        <div className="flex items-center gap-5 flex-wrap">
+          <div>
+            <div className="text-slate-400 text-[10px] uppercase tracking-wide">Measured</div>
+            <div className="text-amber-400 font-bold text-2xl leading-tight">{img ? `${displayDeg.toFixed(2)}°` : "—"}</div>
+          </div>
+          <div>
+            <div className="text-slate-400 text-[10px] uppercase tracking-wide">Equivalent Ratio</div>
+            <div className="text-white font-semibold text-[15px] leading-tight">{img ? ratioDisplay : "—"}</div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <button onClick={()=>setAngle(a=>a-0.1)} className="w-7 h-7 rounded-md border border-white/15 text-slate-300 hover:bg-white/5">−</button>
+            <button onClick={()=>setAngle(a=>a+0.1)} className="w-7 h-7 rounded-md border border-white/15 text-slate-300 hover:bg-white/5">+</button>
+          </div>
+          <div className="text-slate-400 text-[11px] max-w-[360px] leading-relaxed">
+            Estimated from the photo — most accurate when the shot is square-on to the gable end. Worth confirming on site.
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {tooSteep && <span className="text-red-400 text-[11px]">Over 85° — too steep to be a roof plane.</span>}
+          <Btn primary style={{opacity:canConfirm?1:.5}} onClick={()=>{ if(canConfirm) onConfirm(displayDeg) }}>
+            {confirmLabel}
+          </Btn>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, photoUrl, onPhotoChange, initialGeometry, company }, ref) {
   const canvasRef   = useRef(null)
   const imgRef      = useRef(null)
@@ -949,6 +1248,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   //   same commit-on-Save pattern as pendingSectionMaterial.
   const [sectionPitchModalId, setSectionPitchModalId] = useState(null)
   const [pendingSectionPitch, setPendingSectionPitch] = useState(null)
+  // ← Photo protractor. `null` = closed; otherwise {target} where target is
+  //   "pitchModal" (fill the Roof Pitch modal's Degrees field) or a section
+  //   id (apply straight to that section from the toolbar button).
+  const [protractor, setProtractor] = useState(null)
   // ← Same "pick a brand right after drawing it" popup as roof sections,
   //   generalized to the other traced items that also carry their own
   //   materialLabel/rate: gutters, downpipes, roof drains, penetrations.
@@ -2724,6 +3027,22 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
                 display:"flex",alignItems:"center",gap:4,fontFamily:"inherit"}}>
               <span>✛</span>Align
             </button>
+            {/* ← Opens the protractor overlay rather than being a canvas draw
+                mode: the tracing canvas stretches the photo to a fixed
+                490x330, so an angle measured on it would be skewed. */}
+            <button
+              onClick={()=>setProtractor({ target: selection.sections.length===1 ? selection.sections[0] : null })}
+              title={selection.sections.length===1
+                ? "Protractor: measure a roof angle from a photo and apply it to the selected section"
+                : "Protractor: measure a roof angle from a photo (select one section first to apply it directly)"}
+              style={{padding:"5px 9px",borderRadius:6,
+                border:"1px solid rgba(255,255,255,0.14)",
+                background:"transparent",
+                color:"#94a3b8",
+                fontSize:11,fontWeight:400,cursor:"pointer",
+                display:"flex",alignItems:"center",gap:4,fontFamily:"inherit"}}>
+              <span>📐</span>Protractor
+            </button>
             <div style={{marginLeft:"auto",display:"flex",gap:5,alignItems:"center"}}>
               {(activeTool==="flashing"||activeTool==="gutter")&&drawPts.length>=2&&(
                 <button onClick={finishLine} style={{padding:"5px 10px",borderRadius:6,border:"1px solid #10b981",background:"#10b981",color:"#fff",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
@@ -3079,6 +3398,29 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         </div>
       </div>
 
+      {protractor && (
+        <ProtractorOverlay
+          initialImage={imgRef.current}
+          onClose={()=>setProtractor(null)}
+          confirmLabel={
+            protractor.target==="pitchModal" ? "Use this angle"
+            : protractor.target ? `Apply to ${sections.find(x=>x.id===protractor.target)?.name || "section"}`
+            : "Done"
+          }
+          onConfirm={deg=>{
+            if(protractor.target==="pitchModal"){
+              // Both fields matter: confirmPitch() builds the saved value
+              // from rawInput, so setting angleDeg alone would display the
+              // measured number but store the old one.
+              setPendingSectionPitch({ rawInput: deg.toFixed(2), angleDeg: deg })
+            } else if(protractor.target){
+              pushHistory()
+              setSections(prev=>prev.map(x=>x.id===protractor.target?{...x,pitch:`${deg.toFixed(2)}°`}:x))
+            }
+            setProtractor(null)
+          }}/>
+      )}
+
       {calibModalOpen && (
         <Modal title="Calibrate Image" onClose={cancelCalibration} width={360}>
           <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
@@ -3168,6 +3510,15 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
               placeholder="e.g. 22.62"
               style={{...s.input,flex:1,...(pitchError?{borderColor:"#ef4444"}:{})}}/>
             <span style={{fontSize:13,color:"#64748b",fontWeight:600}}>°</span>
+            {/* ← Measure it off a photo instead of typing it. Fills the field
+                rather than saving outright, so the number can still be
+                eyeballed and nudged before Save. */}
+            <button type="button" onClick={()=>setProtractor({ target:"pitchModal" })}
+              title="Measure the pitch from a photo with the protractor"
+              style={{padding:"7px 9px",borderRadius:8,border:"1px solid #e2e8f0",background:"#f8fafc",
+                cursor:"pointer",fontSize:14,lineHeight:1,flexShrink:0,fontFamily:"inherit"}}>
+              📐
+            </button>
           </div>
           {pitchError && (
             <div style={{fontSize:11,color:"#ef4444",marginBottom:12}}>{pitchError}</div>
