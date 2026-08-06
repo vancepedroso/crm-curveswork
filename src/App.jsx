@@ -1024,7 +1024,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   // ← "Align": purely visual crosshair guide lines + X/Y coordinate readout
   //   through the cursor, independent of Ortho's snap behavior — helps
   //   trace straight lines by eye without changing where points land.
-  const [alignMode, setAlignMode] = useState(false)
+  const [alignMode, setAlignMode] = useState(true)
   // ── Undo / Redo (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z or Ctrl+Y) ──────────────
   // A snapshot is pushed before every mutating action (adding a point to
   // a line, finishing a shape, deleting, dragging, calibrating scale), so
