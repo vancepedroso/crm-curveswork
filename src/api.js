@@ -11,6 +11,14 @@ const BASE_URL =
   import.meta.env.VITE_API_URL ||
   `${window.location.protocol}//${window.location.hostname}:3001/api`;
 
+// ← The same server, minus the /api path — uploaded files are served from
+//   its /uploads route, not through the API. Derived from BASE_URL rather
+//   than rebuilt from window.location so there's exactly one place the
+//   backend's address is decided; App.jsx previously re-declared this in
+//   seven separate components, all hardcoded to :3001, which is why every
+//   photo and logo 404'd once the app was deployed.
+export const API_ORIGIN = BASE_URL.replace(/\/api\/?$/, "");
+
 // ---------------------------------------------------------------------------
 // Core request helper
 // ---------------------------------------------------------------------------

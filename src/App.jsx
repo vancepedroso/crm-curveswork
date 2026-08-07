@@ -3,7 +3,7 @@ import { createPortal } from "react-dom"
 import { loadStripe } from "@stripe/stripe-js"
 import { Elements, CardNumberElement, CardExpiryElement, CardCvcElement, useStripe, useElements } from "@stripe/react-stripe-js"
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts"
-import { customersApi, projectsApi, usersApi, photosApi, quotesApi, jobsApi, jobPhotosApi, materialsApi, companyProfileApi, estimatesApi, complexityLevelsApi, organizationApi, billingApi, platformAdminApi } from "./api"
+import { customersApi, projectsApi, usersApi, photosApi, quotesApi, jobsApi, jobPhotosApi, materialsApi, companyProfileApi, estimatesApi, complexityLevelsApi, organizationApi, billingApi, platformAdminApi, API_ORIGIN } from "./api"
 import { useAuth } from "./AuthContext"
 import LoginPage   from "./LoginPage"
 import SignupPage  from "./SignupPage"
@@ -4549,7 +4549,6 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
   const cs = currency?.symbol || "$"
   const [snapshotUrl, setSnapshotUrl] = useState(null)
   const [hasAsbestosRisk, setHasAsbestosRisk] = useState(false)
-  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
 
   // ← asbestosOverride is passed by the New Project wizard's live "Quote &
   //   Save" preview (step 3), since that project hasn't been saved to the
@@ -4806,7 +4805,6 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
     prev.includes(id) ? prev.filter(p=>p!==id) : [...prev, id]
   )
 
-  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
   function pickMeasurePhoto(ph) {
     togglePhoto(ph.id)
     setActiveMeasurePhotoUrl(`${API_ORIGIN}${ph.url}`)
@@ -5451,7 +5449,6 @@ function LinkedJobPhotos({ jobId }) {
 
   if (loading || photos.length===0) return null
 
-  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
 
   return (
     <div style={{...s.card, marginTop:14}}>
@@ -5517,7 +5514,6 @@ function ProjectPhotos({ projectId }) {
     catch (err) { setError(err.message); setPhotos(prev) }
   }
 
-  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
 
   return (
     <div style={{...s.card, marginTop:14}}>
@@ -5714,7 +5710,6 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
 
     // Email HTML gets pasted into external mail clients, so image src must
     // be absolute (relative /uploads/... paths won't resolve there).
-    const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
     const logoHTML   = co.logoUrl   ? `<img src="${API_ORIGIN}${co.logoUrl}" alt="" style="width:48px;height:48px;object-fit:contain;margin-right:14px;"/>` : ""
     const badgesHTML = co.badgesUrl ? `<div style="margin-top:16px;"><img src="${API_ORIGIN}${co.badgesUrl}" alt="" style="width:100%;height:auto;display:block;"/></div>` : ""
     const signOffHTML = (co.estimatorName || co.estimatorTitle) ? `
@@ -5843,7 +5838,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
           {geometrySnapshotUrl && (
             <div style={{...s.card,marginTop:14}}>
               <div style={{fontWeight:700,marginBottom:14}}>Measurement Plan</div>
-              <img src={`${window.location.protocol}//${window.location.hostname}:3001${geometrySnapshotUrl}`}
+              <img src={`${API_ORIGIN}${geometrySnapshotUrl}`}
                 alt="Roof measurement plan" style={{maxWidth:"100%",border:"1px solid #e2e8f0",borderRadius:8}}/>
             </div>
           )}
@@ -6169,7 +6164,6 @@ function JobPhotos({ jobId }) {
     catch (err) { setError(err.message); setPhotos(prev) }
   }
 
-  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
 
   return (
     <div style={{...s.card, marginTop:14}}>
@@ -6634,7 +6628,6 @@ function Settings({ settings, onSave }) {
     }
   }
 
-  const API_ORIGIN = `${window.location.protocol}//${window.location.hostname}:3001`
 
   return (
     <div style={{maxWidth:600}}>
