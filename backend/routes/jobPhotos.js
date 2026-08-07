@@ -1,26 +1,15 @@
 const { Router } = require("express");
 const multer = require("multer");
-const path   = require("path");
-const fs     = require("fs");
 const pool   = require("../db");
+const { CLOUDINARY_CONFIGURED, FOLDERS, uploadBuffer, destroyByUrl } = require("../lib/cloudinaryStorage");
 
 const router = Router();
 
-const UPLOAD_DIR = path.join(__dirname, "..", "uploads", "job-photos");
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${req.params.jobId}-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
-  },
-});
-
 const ALLOWED_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/heic"]);
 
+// ← memoryStorage, not diskStorage — see lib/cloudinaryStorage.js for why.
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024, files: 10 },
   fileFilter: (req, file, cb) => {
     if (!ALLOWED_TYPES.has(file.mimetype)) return cb(new Error("Unsupported image type"));
@@ -64,6 +53,10 @@ router.post("/:jobId", (req, res) => {
   upload.array("photos", 10)(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message });
     try {
+      if (!CLOUDINARY_CONFIGURED)
+        return res.status(500).json({ error: "Image storage is not configured on the server" });
+      if (!CLOUDINARY_CONFIGURED)
+        return res.status(500).json({ error: "Image storage is not configured on the server" });
       if (!(await assertOwnJob(req.params.jobId, req.user.organizationId)))
         return res.status(404).json({ error: "Job not found" });
       const files = req.files || [];
@@ -71,10 +64,11 @@ router.post("/:jobId", (req, res) => {
 
       const inserted = [];
       for (const file of files) {
-        const url = `/uploads/job-photos/${file.filename}`;
+        const publicId = `${req.params.jobId}-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+        const url = await uploadBuffer(file.buffer, FOLDERS.jobPhotos, publicId);
         const { rows } = await pool.query(
           `INSERT INTO job_photos (job_id, filename, url, organization_id) VALUES ($1,$2,$3,$4) RETURNING *`,
-          [req.params.jobId, file.filename, url, req.user.organizationId]
+          [req.params.jobId, publicId, url, req.user.organizationId]
         );
         inserted.push(serializePhoto(rows[0]));
       }
@@ -89,13 +83,12 @@ router.post("/:jobId", (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     const { rows } = await pool.query(
-      "DELETE FROM job_photos WHERE id = $1 AND organization_id = $2 RETURNING filename",
+      "DELETE FROM job_photos WHERE id = $1 AND organization_id = $2 RETURNING url",
       [req.params.id, req.user.organizationId]
     );
     if (!rows.length) return res.status(404).json({ error: "Not found" });
 
-    const filePath = path.join(UPLOAD_DIR, rows[0].filename);
-    fs.unlink(filePath, () => {}); // best-effort cleanup, ignore missing file
+    destroyByUrl(rows[0].url); // best-effort remote cleanup, never fails the delete
 
     res.json({ success: true });
   } catch (err) {

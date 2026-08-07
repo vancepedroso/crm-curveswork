@@ -1,31 +1,16 @@
 const { Router } = require("express");
 const multer = require("multer");
-const path   = require("path");
-const fs     = require("fs");
 const pool   = require("../db");
+const { CLOUDINARY_CONFIGURED, FOLDERS, uploadBuffer } = require("../lib/cloudinaryStorage");
 
 const router = Router();
 // requireAuth is applied once, in server.js — no per-router copy needed here.
 
-const UPLOAD_DIR = path.join(__dirname, "..", "uploads", "branding");
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    // ← Keyed by organizationId, not user id — the profile itself is now
-    //   shared by the whole org, so that's the collision to avoid (two
-    //   users in the same org uploading a logo in the same millisecond),
-    //   not two different users who'd never collide on this filename anyway.
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${req.params.kind}-${req.user.organizationId}-${Date.now()}${ext}`);
-  },
-});
-
 const ALLOWED_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/svg+xml"]);
 
+// ← memoryStorage, not diskStorage — see lib/cloudinaryStorage.js for why.
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1 },
   fileFilter: (req, file, cb) => {
     if (!ALLOWED_TYPES.has(file.mimetype)) return cb(new Error("Unsupported image type"));
@@ -120,9 +105,15 @@ router.post("/:kind(logo|badges)", (req, res) => {
   upload.single("image")(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message });
     try {
+      if (!CLOUDINARY_CONFIGURED)
+        return res.status(500).json({ error: "Image storage is not configured on the server" });
       if (!req.file) return res.status(400).json({ error: "No file uploaded" });
       await getOrCreateProfile(req.user.organizationId);
-      const url = `/uploads/branding/${req.file.filename}`;
+      // ← Keyed by organizationId, not user id — the profile is shared by
+      //   the whole org, so that's the collision to avoid (two users in the
+      //   same org uploading a logo in the same millisecond).
+      const publicId = `${req.params.kind}-${req.user.organizationId}-${Date.now()}`;
+      const url = await uploadBuffer(req.file.buffer, FOLDERS.branding, publicId);
       const column = req.params.kind === "logo" ? "logo_url" : "badges_url";
       const { rows } = await pool.query(
         `UPDATE company_profiles SET ${column} = $1, updated_at = NOW() WHERE organization_id = $2 RETURNING *`,

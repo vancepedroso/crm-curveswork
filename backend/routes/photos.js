@@ -1,26 +1,18 @@
 const { Router } = require("express");
 const multer = require("multer");
-const path   = require("path");
-const fs     = require("fs");
 const pool   = require("../db");
+const { CLOUDINARY_CONFIGURED, FOLDERS, uploadBuffer, destroyByUrl } = require("../lib/cloudinaryStorage");
 
 const router = Router();
 
-const UPLOAD_DIR = path.join(__dirname, "..", "uploads", "photos");
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${req.params.projectId}-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
-  },
-});
-
 const ALLOWED_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/heic"]);
 
+// ← memoryStorage, not diskStorage: the bytes go straight to Cloudinary
+//   rather than to a local folder that a managed host wipes on restart.
+//   Side benefit — a file rejected by the ownership check below no longer
+//   leaves an orphan on disk, which the old disk-first flow always did.
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024, files: 10 },
   fileFilter: (req, file, cb) => {
     if (!ALLOWED_TYPES.has(file.mimetype)) return cb(new Error("Unsupported image type"));
@@ -64,6 +56,8 @@ router.post("/:projectId", (req, res) => {
   upload.array("photos", 10)(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message });
     try {
+      if (!CLOUDINARY_CONFIGURED)
+        return res.status(500).json({ error: "Image storage is not configured on the server" });
       if (!(await assertOwnProject(req.params.projectId, req.user.organizationId)))
         return res.status(404).json({ error: "Project not found" });
       const files = req.files || [];
@@ -71,10 +65,13 @@ router.post("/:projectId", (req, res) => {
 
       const inserted = [];
       for (const file of files) {
-        const url = `/uploads/photos/${file.filename}`;
+        // Same shape as the old on-disk filename, minus the extension —
+        // Cloudinary derives that itself and appends it to the URL.
+        const publicId = `${req.params.projectId}-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+        const url = await uploadBuffer(file.buffer, FOLDERS.photos, publicId);
         const { rows } = await pool.query(
           `INSERT INTO project_photos (project_id, filename, url, organization_id) VALUES ($1,$2,$3,$4) RETURNING *`,
-          [req.params.projectId, file.filename, url, req.user.organizationId]
+          [req.params.projectId, publicId, url, req.user.organizationId]
         );
         inserted.push(serializePhoto(rows[0]));
       }
@@ -89,13 +86,14 @@ router.post("/:projectId", (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     const { rows } = await pool.query(
-      "DELETE FROM project_photos WHERE id = $1 AND organization_id = $2 RETURNING filename",
+      "DELETE FROM project_photos WHERE id = $1 AND organization_id = $2 RETURNING url",
       [req.params.id, req.user.organizationId]
     );
     if (!rows.length) return res.status(404).json({ error: "Not found" });
 
-    const filePath = path.join(UPLOAD_DIR, rows[0].filename);
-    fs.unlink(filePath, () => {}); // best-effort cleanup, ignore missing file
+    // Best-effort remote cleanup, same intent as the old fs.unlink callback:
+    // a failure here must not fail the delete, the DB row is already gone.
+    destroyByUrl(rows[0].url);
 
     res.json({ success: true });
   } catch (err) {

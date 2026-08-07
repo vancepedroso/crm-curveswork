@@ -1,33 +1,21 @@
 const { Router } = require("express");
-const fs     = require("fs");
-const path   = require("path");
 const pool   = require("../db");
+const { FOLDERS, uploadDataUrl } = require("../lib/cloudinaryStorage");
 const router = Router();
 
-const SNAPSHOT_DIR = path.join(__dirname, "..", "uploads", "geometry-snapshots");
-fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
-// ← Separate from SNAPSHOT_DIR on purpose: the snapshot is the flattened
-//   photo+drawing composite (for embedding in quotes); this is the clean,
-//   undrawn-on original photo, kept so re-editing a project has something
-//   real to trace over instead of the previous session's drawing baked in.
-const ORIGINAL_PHOTO_DIR = path.join(__dirname, "..", "uploads", "original-photos");
-fs.mkdirSync(ORIGINAL_PHOTO_DIR, { recursive: true });
-
-// Decodes a "data:image/png;base64,...." string and writes it to disk under
-// `dir`, returning the public URL under `publicPath`. Returns null if no
-// data URL was provided. Shared by both the geometry snapshot and the
-// original-photo save paths below.
-function saveDataUrlImage(dir, publicPath, projectId, dataUrl) {
-  if (!dataUrl || !dataUrl.startsWith("data:image/")) return null;
-  const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
-  if (!match) return null;
-  const [, ext, base64] = match;
-  const filename = `${projectId}-${Date.now()}.${ext}`;
-  fs.writeFileSync(path.join(dir, filename), Buffer.from(base64, "base64"));
-  return `${publicPath}/${filename}`;
-}
-const saveSnapshot      = (projectId, dataUrl) => saveDataUrlImage(SNAPSHOT_DIR, "/uploads/geometry-snapshots", projectId, dataUrl);
-const saveOriginalPhoto = (projectId, dataUrl) => saveDataUrlImage(ORIGINAL_PHOTO_DIR, "/uploads/original-photos", projectId, dataUrl);
+// The measurement tool posts these as base64 data URLs inside the JSON body
+// rather than as multipart, so they don't go through multer — they're
+// decoded and pushed to Cloudinary directly. Two distinct images:
+//   · snapshot      — the flattened photo+drawing composite, embedded in quotes
+//   · originalPhoto — the clean, undrawn-on photo, kept so re-editing a
+//                     project has something real to trace over instead of
+//                     the previous session's drawing baked into the pixels
+// Both were previously written to backend/uploads/, which a managed host
+// wipes on every restart — see lib/cloudinaryStorage.js.
+const saveSnapshot      = (projectId, dataUrl) =>
+  uploadDataUrl(dataUrl, FOLDERS.geometrySnapshots, `${projectId}-${Date.now()}`);
+const saveOriginalPhoto = (projectId, dataUrl) =>
+  uploadDataUrl(dataUrl, FOLDERS.originalPhotos, `${projectId}-${Date.now()}`);
 
 // Every route below hangs off :projectId — confirm it's actually a project
 // in the caller's own organization before touching its estimate/geometry,
@@ -122,13 +110,17 @@ router.post("/:projectId/geometry", async (req, res) => {
     if (!(await assertOwnProject(req.params.projectId, req.user.organizationId)))
       return res.status(404).json({ error: "Project not found" });
     const g = req.body;
-    const newSnapshotUrl = saveSnapshot(req.params.projectId, g.snapshotDataUrl);
-    // A locally-picked file arrives as a data URL and needs writing to disk;
-    // a photo chosen from the job library is already a hosted asset, so its
+    const newSnapshotUrl = await saveSnapshot(req.params.projectId, g.snapshotDataUrl);
+    // A locally-picked file arrives as a data URL and needs uploading; a
+    // photo chosen from the job library is already a hosted asset, so its
     // URL is taken as-is (originalPhotoUrl) with nothing to re-upload.
+    // That pass-through now accepts absolute Cloudinary URLs as well as the
+    // legacy relative "/uploads/..." form, since job photos live remotely.
     const newOriginalPhotoUrl =
-      saveOriginalPhoto(req.params.projectId, g.originalPhotoDataUrl) ||
-      (typeof g.originalPhotoUrl === "string" && g.originalPhotoUrl.startsWith("/") ? g.originalPhotoUrl : null);
+      (await saveOriginalPhoto(req.params.projectId, g.originalPhotoDataUrl)) ||
+      (typeof g.originalPhotoUrl === "string" &&
+        (g.originalPhotoUrl.startsWith("/") || g.originalPhotoUrl.startsWith("https://"))
+        ? g.originalPhotoUrl : null);
 
     // Preserve the existing snapshot/original photo if this save didn't
     // include a new one (e.g. geometry re-saved without re-capturing the
