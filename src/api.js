@@ -19,6 +19,15 @@ const BASE_URL =
 //   photo and logo 404'd once the app was deployed.
 export const API_ORIGIN = BASE_URL.replace(/\/api\/?$/, "");
 
+// ← Image URLs come from the database in two shapes now: legacy relative
+//   paths ("/uploads/photos/x.png", served by the backend) and absolute
+//   ones ("https://res.cloudinary.com/..."). Only the relative form needs
+//   the origin bolted on — prefixing an absolute URL produces the nonsense
+//   "https://api-host.comhttps://res.cloudinary.com/...", which is exactly
+//   what broke every image after the Cloudinary switch.
+export const mediaUrl = (u) =>
+  !u ? "" : /^https?:\/\//i.test(u) ? u : `${API_ORIGIN}${u}`;
+
 // ---------------------------------------------------------------------------
 // Core request helper
 // ---------------------------------------------------------------------------

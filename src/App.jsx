@@ -3,7 +3,7 @@ import { createPortal } from "react-dom"
 import { loadStripe } from "@stripe/stripe-js"
 import { Elements, CardNumberElement, CardExpiryElement, CardCvcElement, useStripe, useElements } from "@stripe/react-stripe-js"
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts"
-import { customersApi, projectsApi, usersApi, photosApi, quotesApi, jobsApi, jobPhotosApi, materialsApi, companyProfileApi, estimatesApi, complexityLevelsApi, organizationApi, billingApi, platformAdminApi, API_ORIGIN } from "./api"
+import { customersApi, projectsApi, usersApi, photosApi, quotesApi, jobsApi, jobPhotosApi, materialsApi, companyProfileApi, estimatesApi, complexityLevelsApi, organizationApi, billingApi, platformAdminApi, mediaUrl } from "./api"
 import { useAuth } from "./AuthContext"
 import LoginPage   from "./LoginPage"
 import SignupPage  from "./SignupPage"
@@ -2609,7 +2609,8 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         const startMove = (secIds, lineIds, ptIds) => {
           moveSelectionRef.current = {
             startPt: pt,
-            origSections: sections.filter(s=>secIds.includes(s.id)).map(s=>({id:s.id,pts:s.pts,cutAngleAnchor:s.cutAngleAnchor||null})),
+            origSections: sections.filte
+            (s=>secIds.includes(s.id)).map(s=>({id:s.id,pts:s.pts,cutAngleAnchor:s.cutAngleAnchor||null})),
             origLines: lineItems.filter(l=>lineIds.includes(l.id)).map(l=>({id:l.id,pts:l.pts})),
             origPoints: ptItems.filter(p=>ptIds.includes(p.id)).map(p=>({id:p.id,x:p.x,y:p.y})),
             pushed: false,
@@ -4625,7 +4626,7 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
     <div style={{maxWidth:660,width:"100%",background:"#fff",border:"1px solid #e2e8f0",borderRadius:14,padding:32}} className="quote-view-responsive">
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:28,paddingBottom:22,borderBottom:"2px solid #e2e8f0",flexWrap:"wrap",gap:12}}>
         <div style={{display:"flex",alignItems:"flex-start",gap:14}}>
-          {company.logoUrl && <img src={`${API_ORIGIN}${company.logoUrl}`} alt="" style={{width:56,height:56,objectFit:"contain",flexShrink:0}}/>}
+          {company.logoUrl && <img src={mediaUrl(company.logoUrl)} alt="" style={{width:56,height:56,objectFit:"contain",flexShrink:0}}/>}
           <div>
             <div style={{fontFamily:"'Syne',sans-serif",fontSize:24,fontWeight:800}}>{company.companyName}</div>
             <div style={{fontSize:12,color:"#64748b",marginTop:5,lineHeight:1.9}}>
@@ -4731,14 +4732,14 @@ function QuoteView({ project, customer, company, asbestosOverride }) {
 
       {company.badgesUrl && (
         <div style={{marginTop:16}}>
-          <img src={`${API_ORIGIN}${company.badgesUrl}`} alt="" style={{width:"100%",height:"auto",display:"block"}}/>
+          <img src={mediaUrl(company.badgesUrl)} alt="" style={{width:"100%",height:"auto",display:"block"}}/>
         </div>
       )}
 
       {snapshotUrl && (
         <div style={{marginTop:20,paddingTop:18,borderTop:"1px solid #e2e8f0"}}>
           <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:.5,color:"#64748b",marginBottom:10}}>Roof Measurement Plan</div>
-          <img src={`${API_ORIGIN}${snapshotUrl}`} alt="Roof measurement plan" style={{maxWidth:"100%",border:"1px solid #e2e8f0",borderRadius:8}}/>
+          <img src={mediaUrl(snapshotUrl)} alt="Roof measurement plan" style={{maxWidth:"100%",border:"1px solid #e2e8f0",borderRadius:8}}/>
         </div>
       )}
     </div>
@@ -4807,7 +4808,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
 
   function pickMeasurePhoto(ph) {
     togglePhoto(ph.id)
-    setActiveMeasurePhotoUrl(`${API_ORIGIN}${ph.url}`)
+    setActiveMeasurePhotoUrl(mediaUrl(ph.url))
   }
 
   // ← Which measurement method is active on the Measure step: 'upload' (draw
@@ -5060,7 +5061,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
                         <div key={ph.id} onClick={()=>pickMeasurePhoto(ph)}
                           style={{position:"relative",aspectRatio:"1",borderRadius:8,overflow:"hidden",cursor:"pointer",
                             border: picked ? "3px solid #f59e0b" : "1px solid #e2e8f0"}}>
-                          <img src={`${API_ORIGIN}${ph.url}`} alt="Job" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
+                          <img src={mediaUrl(ph.url)} alt="Job" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
                           {picked && <div style={{position:"absolute",top:4,right:4,width:18,height:18,borderRadius:"50%",background:"#f59e0b",color:"#000",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center"}}>✓</div>}
                         </div>
                       )
@@ -5129,7 +5130,7 @@ function NewProjectWizard({ customers, projects, jobs, onSave, onCancel, existin
                 //   No photo (older projects, saved before originals were kept)
                 //   correctly means a blank canvas + the notice below.
                 photoUrl={activeMeasurePhotoUrl
-                  || (geometryFull?.original_photo_url ? `${API_ORIGIN}${geometryFull.original_photo_url}` : null)}
+                  || (geometryFull?.original_photo_url ? mediaUrl(geometryFull.original_photo_url) : null)}
                 onPhotoChange={setActiveMeasurePhotoUrl}
                 initialGeometry={geometryFull}
                 company={company}/>
@@ -5455,9 +5456,9 @@ function LinkedJobPhotos({ jobId }) {
       <div style={{fontWeight:700,marginBottom:14}}>Photos <span style={{color:"#94a3b8",fontWeight:400}}>({photos.length})</span></div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(90px,1fr))",gap:8}}>
         {photos.map(ph=>(
-          <div key={ph.id} onClick={()=>setLightbox(`${API_ORIGIN}${ph.url}`)}
+          <div key={ph.id} onClick={()=>setLightbox(mediaUrl(ph.url))}
             style={{aspectRatio:"1",borderRadius:8,overflow:"hidden",border:"1px solid #e2e8f0",cursor:"pointer"}}>
-            <img src={`${API_ORIGIN}${ph.url}`} alt="Job" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
+            <img src={mediaUrl(ph.url)} alt="Job" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
           </div>
         ))}
       </div>
@@ -5550,8 +5551,8 @@ function ProjectPhotos({ projectId }) {
           {photos.map(ph=>(
             <div key={ph.id} style={{position:"relative",aspectRatio:"1",borderRadius:8,overflow:"hidden",border:"1px solid #e2e8f0"}}>
               <img
-                src={`${API_ORIGIN}${ph.url}`} alt="Roof"
-                onClick={()=>setLightbox(`${API_ORIGIN}${ph.url}`)}
+                src={mediaUrl(ph.url)} alt="Roof"
+                onClick={()=>setLightbox(mediaUrl(ph.url))}
                 style={{width:"100%",height:"100%",objectFit:"cover",cursor:"pointer"}}
               />
               <button
@@ -5710,8 +5711,8 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
 
     // Email HTML gets pasted into external mail clients, so image src must
     // be absolute (relative /uploads/... paths won't resolve there).
-    const logoHTML   = co.logoUrl   ? `<img src="${API_ORIGIN}${co.logoUrl}" alt="" style="width:48px;height:48px;object-fit:contain;margin-right:14px;"/>` : ""
-    const badgesHTML = co.badgesUrl ? `<div style="margin-top:16px;"><img src="${API_ORIGIN}${co.badgesUrl}" alt="" style="width:100%;height:auto;display:block;"/></div>` : ""
+    const logoHTML   = co.logoUrl   ? `<img src="${mediaUrl(co.logoUrl)}" alt="" style="width:48px;height:48px;object-fit:contain;margin-right:14px;"/>` : ""
+    const badgesHTML = co.badgesUrl ? `<div style="margin-top:16px;"><img src="${mediaUrl(co.badgesUrl)}" alt="" style="width:100%;height:auto;display:block;"/></div>` : ""
     const signOffHTML = (co.estimatorName || co.estimatorTitle) ? `
       <div style="margin-top:24px;font-size:13px;color:#0f172a;line-height:1.8;">
         Ngā mihi,<br/>
@@ -5722,7 +5723,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
     const snapshotHTML = geometrySnapshotUrl ? `
       <div style="margin-top:20px;padding-top:18px;border-top:1px solid #e2e8f0;">
         <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:#94a3b8;margin-bottom:10px;">Roof Measurement Plan</div>
-        <img src="${API_ORIGIN}${geometrySnapshotUrl}" alt="Roof measurement plan" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px;"/>
+        <img src="${mediaUrl(geometrySnapshotUrl)}" alt="Roof measurement plan" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px;"/>
       </div>` : ""
 
     return `<!DOCTYPE html>
@@ -5838,7 +5839,7 @@ function ProjectDetail({ project, customers, setProjects, setView, onEdit, compa
           {geometrySnapshotUrl && (
             <div style={{...s.card,marginTop:14}}>
               <div style={{fontWeight:700,marginBottom:14}}>Measurement Plan</div>
-              <img src={`${API_ORIGIN}${geometrySnapshotUrl}`}
+              <img src={mediaUrl(geometrySnapshotUrl)}
                 alt="Roof measurement plan" style={{maxWidth:"100%",border:"1px solid #e2e8f0",borderRadius:8}}/>
             </div>
           )}
@@ -6200,8 +6201,8 @@ function JobPhotos({ jobId }) {
           {photos.map(ph=>(
             <div key={ph.id} style={{position:"relative",aspectRatio:"1",borderRadius:8,overflow:"hidden",border:"1px solid #e2e8f0"}}>
               <img
-                src={`${API_ORIGIN}${ph.url}`} alt="Job"
-                onClick={()=>setLightbox(`${API_ORIGIN}${ph.url}`)}
+                src={mediaUrl(ph.url)} alt="Job"
+                onClick={()=>setLightbox(mediaUrl(ph.url))}
                 style={{width:"100%",height:"100%",objectFit:"cover",cursor:"pointer"}}
               />
               <button
@@ -6639,7 +6640,7 @@ function Settings({ settings, onSave }) {
             <label style={s.label}>Company Logo</label>
             <div style={{border:"1px dashed #e2e8f0",borderRadius:8,padding:12,textAlign:"center",background:"#f8fafc"}}>
               {form.logoUrl
-                ? <img src={`${API_ORIGIN}${form.logoUrl}`} alt="Logo" style={{maxHeight:60,maxWidth:"100%",objectFit:"contain",marginBottom:8}}/>
+                ? <img src={mediaUrl(form.logoUrl)} alt="Logo" style={{maxHeight:60,maxWidth:"100%",objectFit:"contain",marginBottom:8}}/>
                 : <div style={{fontSize:11,color:"#94a3b8",marginBottom:8}}>No logo uploaded</div>}
               <input type="file" accept="image/*" id="logo-upload" style={{display:"none"}}
                 onChange={e=>{ uploadImage("logo", e.target.files[0]); e.target.value="" }}/>
@@ -6652,7 +6653,7 @@ function Settings({ settings, onSave }) {
             <label style={s.label}>Accreditation / Badges Strip</label>
             <div style={{border:"1px dashed #e2e8f0",borderRadius:8,padding:12,textAlign:"center",background:"#f8fafc"}}>
               {form.badgesUrl
-                ? <img src={`${API_ORIGIN}${form.badgesUrl}`} alt="Badges" style={{maxHeight:60,maxWidth:"100%",objectFit:"contain",marginBottom:8}}/>
+                ? <img src={mediaUrl(form.badgesUrl)} alt="Badges" style={{maxHeight:60,maxWidth:"100%",objectFit:"contain",marginBottom:8}}/>
                 : <div style={{fontSize:11,color:"#94a3b8",marginBottom:8}}>Optional — e.g. LBP, industry association, awards</div>}
               <input type="file" accept="image/*" id="badges-upload" style={{display:"none"}}
                 onChange={e=>{ uploadImage("badges", e.target.files[0]); e.target.value="" }}/>
