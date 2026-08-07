@@ -539,6 +539,15 @@ const FLASHING_TYPES = [
   { key:"eaves",      label:"Eaves"       },
   { key:"backtray",   label:"Backtray"    },
 ]
+// Barge and Side Apron run straight up the slope, so 1/cos(θ) — the same
+// factor roof area uses — is exactly right. Hip Cap and Valley run
+// diagonally, whose strictly correct factor is √(1 + tan²θ/2); 1/cos(θ) is
+// used for them too by deliberate choice (simpler, consistent with area),
+// which over-measures a hip/valley by ~3.9% at 22.62°.
+// The list of which subtypes get an angle lives in FLASHING_ANGLE_SUBTYPES
+// below, next to flashingQtyM which actually applies the correction.
+const flashingSlopeMult = pitchDeg =>
+  pitchDeg > 0 ? 1/Math.cos(Math.min(pitchDeg, 85)*Math.PI/180) : 1
 const flashingLabel = key => FLASHING_TYPES.find(f=>f.key===key)?.label || "Flashing"
 
 // Hip/Valley/Apron/Barge/Eaves flashing physically follows the roof's
@@ -549,7 +558,12 @@ function flashingQtyM(r) {
   const a = parseFloat(r.angleDeg)
   return (a>0 && a<90) ? (r.length_m||0)/Math.cos(a*Math.PI/180) : (r.length_m||0)
 }
-const FLASHING_ANGLE_SUBTYPES = ["hip_cap","valley","side_apron","barge","eaves"]
+// ← Only runs that actually follow the slope. "eaves" used to be in here
+//   but an eave runs horizontally along the gutter line, so its traced plan
+//   length already IS its true length — applying 1/cos(θ) to it inflated the
+//   order rather than correcting it. Ridge Cap / Head Apron / Backtray are
+//   horizontal for the same reason and were never included.
+const FLASHING_ANGLE_SUBTYPES = ["hip_cap","valley","side_apron","barge"]
 
 // Units offered when calibrating the scale line — covers both metric and
 // imperial so the tool reads like a proper survey/civil measurement app,
@@ -1264,6 +1278,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
   //   same pattern.
   const [downpipeLengthModalId, setDownpipeLengthModalId] = useState(null)
   const [pendingDownpipeLength, setPendingDownpipeLength] = useState("")
+  // ← Asked before the brand picker for flashings that follow the slope, so
+  //   their ordered length can be corrected up from the traced plan length.
+  const [flashingPitchModal, setFlashingPitchModal] = useState(null) // {id, subtype}
+  const [pendingFlashingPitch, setPendingFlashingPitch] = useState("")
   const [lineItems, setLineItems] = useState(() => initialLineItemsFrom(initialGeometry))
   const [ptItems,   setPtItems]   = useState(() => initialPtItemsFrom(initialGeometry))
   // ← No on-canvas scale line is fabricated when restoring a saved project —
@@ -1582,6 +1600,10 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
         edges:[]
       }
     })
+    // ← length_m stays the traced PLAN length. The slope correction for
+    //   runs that follow the roof (1/cos θ) is applied downstream by
+    //   flashingQtyM in the Estimate step — doing it here as well would
+    //   multiply it in twice.
     const flashings = lineItems.filter(l=>l.type==="flashing").map(l=>({...l,length_m:parseFloat((linelenPx(squash(l.pts))*sfY).toFixed(2))}))
     const gutters   = lineItems.filter(l=>l.type==="gutter").map(l=>({...l,length_m:parseFloat((linelenPx(squash(l.pts))*sfY).toFixed(2))}))
     const downpipes = ptItems.filter(p=>p.type==="downpipe")
@@ -1591,10 +1613,16 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
     //   subtype can get its own length + supplier rate in the Estimate
     //   step, instead of one flat "flashings" total.
     const flashingBySubtype = {}
+    const flashingPitchBySubtype = {}
     const flashingMaterialBySubtype = {}
     flashings.forEach(f=>{
       const key = f.subtype || "other"
       flashingBySubtype[key] = parseFloat(((flashingBySubtype[key]||0) + f.length_m).toFixed(2))
+      // ← Same "first non-empty wins" rule as the brand below: pitch is set
+      //   per subtype via the popup, so every run of a subtype should agree.
+      //   Seeds the Estimate step's Roof Angle field, which is what actually
+      //   applies the slope correction (via flashingQtyM).
+      if(f.pitchDeg > 0 && flashingPitchBySubtype[key] == null) flashingPitchBySubtype[key] = f.pitchDeg
       // ← First non-empty pick for this subtype wins as the "traced"
       //   default — all segments of the same subtype get the same brand
       //   applied via the popup anyway, so they should already agree.
@@ -1604,6 +1632,7 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       sections: processedSections,
       accessories:{ flashings, gutters, downpipes, drains, penetrations:pens },
       flashingBySubtype,
+      flashingPitchBySubtype,
       flashingMaterialBySubtype,
       asbestos,
       // ← Raw reference lines (not just the averaged scale_m_per_px below) —
@@ -2878,7 +2907,13 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
       //   all Ridge Cap segments together, not one per traced line), so the
       //   popup asks once per subtype and its pick applies to every segment
       //   of that subtype — not just the one just drawn.
-      else if(activeTool==="flashing") setAccessoryModal({kind:"flashing", id, subtype:flashSub})
+      // ← Slope-following subtypes ask for a pitch first, then chain into
+      //   the brand picker (same two-step shape as Roof Pitch → Roof Sheet
+      //   Brand). Horizontal ones go straight to the brand picker as before.
+      else if(activeTool==="flashing"){
+        if(FLASHING_ANGLE_SUBTYPES.includes(flashSub)) setFlashingPitchModal({ id, subtype:flashSub })
+        else setAccessoryModal({kind:"flashing", id, subtype:flashSub})
+      }
     }
     setDrawPts([])
   }
@@ -3403,12 +3438,14 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           initialImage={imgRef.current}
           onClose={()=>setProtractor(null)}
           confirmLabel={
-            protractor.target==="pitchModal" ? "Use this angle"
+            protractor.target==="pitchModal" || protractor.target==="flashingPitch" ? "Use this angle"
             : protractor.target ? `Apply to ${sections.find(x=>x.id===protractor.target)?.name || "section"}`
             : "Done"
           }
           onConfirm={deg=>{
-            if(protractor.target==="pitchModal"){
+            if(protractor.target==="flashingPitch"){
+              setPendingFlashingPitch(deg.toFixed(2))
+            } else if(protractor.target==="pitchModal"){
               // Both fields matter: confirmPitch() builds the saved value
               // from rawInput, so setting angleDeg alone would display the
               // measured number but store the old one.
@@ -3582,6 +3619,78 @@ const MeasurementTool = forwardRef(function MeasurementTool({ onGeometryChange, 
           </div>
         </Modal>
       )}
+
+      {flashingPitchModal && (() => {
+        const { id, subtype } = flashingPitchModal
+        const label = flashingLabel(subtype)
+        const MAX = 85
+        // Prefill, best first: a pitch already set for this subtype, else the
+        // roof's own pitch when every traced section agrees on one — a valley
+        // almost always sits on the plane you just pitched.
+        const existing = lineItems.find(l=>l.type==="flashing" && l.subtype===subtype && l.pitchDeg>0)?.pitchDeg
+        const secAngles = sections.map(s=>deriveSectionPitchInput(s.pitch)?.angleDeg).filter(a=>a!=null)
+        const uniformSec = secAngles.length && secAngles.every(a=>Math.abs(a-secAngles[0])<0.01) ? secAngles[0] : null
+        const seed = existing ?? uniformSec
+        const raw = pendingFlashingPitch !== "" ? pendingFlashingPitch : (seed!=null ? String(Math.round(seed*100)/100) : "")
+        const deg = parseFloat(raw)
+        const valid = raw!=="" && !isNaN(deg) && deg>=0 && deg<MAX
+        const err = raw!=="" && !valid ? `Enter an angle between 0° and ${MAX}°.` : null
+        // Every run of this subtype, since the pitch applies to all of them.
+        const planLen = geometry.accessories.flashings
+          .filter(f=>f.subtype===subtype)
+          .reduce((a,f)=>a+(f.length_m||0),0)
+        const mult = valid ? flashingSlopeMult(deg) : null
+        const close = () => { setFlashingPitchModal(null); setPendingFlashingPitch("") }
+        const save = () => {
+          if(!valid) return
+          // Applied to every run of this subtype, matching how the brand /
+          // rate popup already behaves — a roof's valleys shouldn't disagree.
+          setLineItems(prev=>prev.map(l=> l.type==="flashing"&&l.subtype===subtype ? {...l, pitchDeg:deg} : l))
+          close()
+          setAccessoryModal({ kind:"flashing", id, subtype })
+        }
+        return (
+        <Modal title={`${label} Pitch`} onClose={close} width={380}>
+          <div style={{fontSize:12,color:"#64748b",marginBottom:12,lineHeight:1.6}}>
+            What pitch does this <strong>{label.toLowerCase()}</strong> run at? It was traced on a flat photo,
+            so its ordered length is corrected up by the slope. Applies to every {label.toLowerCase()} run.
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:err?4:14}}>
+            <span style={{fontSize:11,color:"#64748b",width:56,flexShrink:0}}>Degrees</span>
+            <input type="number" min="0" max={MAX} step="any" autoFocus value={raw}
+              onChange={e=>setPendingFlashingPitch(e.target.value)}
+              onKeyDown={e=>{ if(e.key==="Enter" && valid) save() }}
+              placeholder="e.g. 22.62"
+              style={{...s.input,flex:1,...(err?{borderColor:"#ef4444"}:{})}}/>
+            <span style={{fontSize:13,color:"#64748b",fontWeight:600}}>°</span>
+            <button type="button" onClick={()=>setProtractor({ target:"flashingPitch" })}
+              title="Measure the pitch from a photo with the protractor"
+              style={{padding:"7px 9px",borderRadius:8,border:"1px solid #e2e8f0",background:"#f8fafc",
+                cursor:"pointer",fontSize:14,lineHeight:1,flexShrink:0,fontFamily:"inherit"}}>
+              📐
+            </button>
+          </div>
+          {err && <div style={{fontSize:11,color:"#ef4444",marginBottom:12}}>{err}</div>}
+          <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:8,padding:"10px 12px",marginBottom:16,display:"flex",flexDirection:"column",gap:6}}>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
+              <span style={{color:"#64748b"}}>Traced (plan) length</span>
+              <span style={{fontWeight:600}}>{planLen.toFixed(2)} m</span>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
+              <span style={{color:"#64748b"}}>Slope Multiplier</span>
+              <span style={{fontWeight:600}}>{mult!=null ? `×${mult.toFixed(3)}` : "—"}</span>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
+              <span style={{color:"#64748b"}}>Length to order</span>
+              <span style={{fontWeight:700,color:"#f59e0b"}}>{mult!=null ? `${(planLen*mult).toFixed(2)} m` : "—"}</span>
+            </div>
+          </div>
+          <div style={{display:"flex",justifyContent:"flex-end",gap:10}}>
+            <Btn primary style={{opacity:valid?1:.5}} onClick={save}>Save</Btn>
+          </div>
+        </Modal>
+        )
+      })()}
 
       {downpipeLengthModalId && (() => {
         const stockLengths = (company?.downpipeStockLengths || "1.8,2.4").split(",").map(Number).filter(n=>n>0)
@@ -4013,7 +4122,11 @@ function EstimateEngine({ initialArea, initialGeometry, initialEstimate, onEstim
         return { subtype, label:flashingLabel(subtype), length_m,
           materialLabel: prev?.materialLabel ?? traced?.materialLabel ?? "",
           rate: prev?.rate ?? traced?.rate ?? 0,
-          angleDeg: prev?.angleDeg ?? null }
+          // ← Seeded from the pitch entered when the run was traced, so the
+          //   slope correction is already in place by the time you get here;
+          //   an edit made on this screen still wins, same as every other
+          //   saved-vs-retraced field.
+          angleDeg: prev?.angleDeg ?? initialGeometry?.flashingPitchBySubtype?.[subtype] ?? null }
       }),
       gutterRuns: (initialGeometry?.accessories?.gutters||[]).map(g=>{
         const prev = savedGutterRuns.get(g.id)
