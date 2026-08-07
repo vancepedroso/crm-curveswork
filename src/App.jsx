@@ -7720,18 +7720,24 @@ export default function App() {
       // "Project updated!" even when this specific save failed, making
       // measurement edits (e.g. a deleted section) silently never persist
       // while looking successful.
-      let geometrySaveFailed = false
+      // ← The reason is carried, not just the fact of failure. "Please try
+      //   saving again" is useless advice when the cause is a server that
+      //   will reject every retry identically (missing image-storage
+      //   credentials, a payload over the body limit), and it sent people
+      //   to the browser console to find out which — so the server's own
+      //   message rides along in the toast.
+      let geometrySaveError = null
       if (project.geometry) {
         try {
           await estimatesApi.saveGeometry(savedProject.id, project.geometry)
         } catch(err) {
           console.error("Geometry save failed:", err)
-          geometrySaveFailed = true
+          geometrySaveError = err?.message || "Unknown error"
         }
       }
 
-      const toastMsg = geometrySaveFailed
-        ? "Project saved, but the measurement/roof plan failed to save — please reopen and try saving again."
+      const toastMsg = geometrySaveError
+        ? `Project saved, but the measurement/roof plan failed to save — ${geometrySaveError}`
         : (isEdit?"Project updated!":"Project created!")
 
       if(isEdit) {
