@@ -110,15 +110,34 @@ app.get("/api/pipeline", requireAuth, async (req, res) => {
   }
 });
 
-// Shared self-signed cert (../certs/) also used by the Vite dev server —
-// HTTPS is required here too, since a page served over HTTPS can't call an
-// HTTP API without the browser blocking it as mixed content.
+// ── Listener ──────────────────────────────────────────────────────────
+// Locally this serves HTTPS from the shared self-signed cert in ../certs/
+// (also used by the Vite dev server): a page served over HTTPS can't call
+// an HTTP API without the browser blocking it as mixed content, and the
+// LiveCamera tool needs a secure context for getUserMedia when opened on a
+// phone over the LAN — which is what the SANs in certs/san.cnf are for.
+//
+// A managed host (Render, Railway, Fly…) terminates TLS at its edge and
+// speaks plain HTTP to the process, so binding HTTPS there fails the health
+// check and the service never goes live. Render sets RENDER=true; the cert
+// check is a second guard so any environment without the .pem files still
+// boots instead of throwing at startup.
 const certDir = path.join(__dirname, "..", "certs");
-const httpsOptions = {
-  key:  fs.readFileSync(path.join(certDir, "key.pem")),
-  cert: fs.readFileSync(path.join(certDir, "cert.pem")),
-};
+const useHttps =
+  !process.env.RENDER &&
+  fs.existsSync(path.join(certDir, "key.pem")) &&
+  fs.existsSync(path.join(certDir, "cert.pem"));
 
-https.createServer(httpsOptions, app).listen(PORT, () => {
-  console.log(`✅ Backend running on https://localhost:${PORT}`);
-});
+if (!useHttps) {
+  app.listen(PORT, () => {
+    console.log(`✅ Backend running on http://localhost:${PORT} (TLS terminated upstream)`);
+  });
+} else {
+  const httpsOptions = {
+    key:  fs.readFileSync(path.join(certDir, "key.pem")),
+    cert: fs.readFileSync(path.join(certDir, "cert.pem")),
+  };
+  https.createServer(httpsOptions, app).listen(PORT, () => {
+    console.log(`✅ Backend running on https://localhost:${PORT}`);
+  });
+}

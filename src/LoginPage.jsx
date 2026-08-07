@@ -1,6 +1,11 @@
 import { useState } from "react"
 
-const BASE_URL = `${window.location.protocol}//${window.location.hostname}:3001/api`
+// ← Same resolution as src/api.js. This page calls fetch directly rather
+//   than going through the shared client, so it needs its own copy — miss
+//   it and login alone stays pointed at localhost on the deployed site.
+const BASE_URL =
+  import.meta.env.VITE_API_URL ||
+  `${window.location.protocol}//${window.location.hostname}:3001/api`
 
 export default function LoginPage({ onLogin, onShowSignup }) {
   const [email,    setEmail]    = useState("")

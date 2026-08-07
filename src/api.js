@@ -1,13 +1,25 @@
 // ---------------------------------------------------------------------------
 // Base URL resolution
 // ---------------------------------------------------------------------------
+// ← Set VITE_API_URL in the hosting env (e.g. Vercel) to point at the
+//   deployed backend. Vite inlines it at BUILD time, so changing it means
+//   redeploying, not just restarting. The fallback keeps local dev working
+//   exactly as before: same host as the page, on the backend's port.
+//   Without this the deployed site asks for `<vercel-domain>:3001`, which
+//   doesn't exist — every request fails.
 const BASE_URL =
+  import.meta.env.VITE_API_URL ||
   `${window.location.protocol}//${window.location.hostname}:3001/api`;
 
 // ---------------------------------------------------------------------------
 // Core request helper
 // ---------------------------------------------------------------------------
-const DEFAULT_TIMEOUT_MS = 15_000;
+// ← 15s was fine when the API was always a local process. Hosts that sleep
+//   idle services (Render's free tier spins down after ~15 min and takes
+//   about a minute to wake) would blow straight through that on the first
+//   request after any quiet period — so the whole app looked broken every
+//   time someone came back to it, rather than just being slow once.
+const DEFAULT_TIMEOUT_MS = 60_000;
 
 async function request(endpoint, options = {}) {
   const { timeout = DEFAULT_TIMEOUT_MS, ...fetchOptions } = options;
