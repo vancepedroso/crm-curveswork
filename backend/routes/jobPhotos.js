@@ -55,8 +55,6 @@ router.post("/:jobId", (req, res) => {
     try {
       if (!CLOUDINARY_CONFIGURED)
         return res.status(500).json({ error: "Image storage is not configured on the server" });
-      if (!CLOUDINARY_CONFIGURED)
-        return res.status(500).json({ error: "Image storage is not configured on the server" });
       if (!(await assertOwnJob(req.params.jobId, req.user.organizationId)))
         return res.status(404).json({ error: "Job not found" });
       const files = req.files || [];

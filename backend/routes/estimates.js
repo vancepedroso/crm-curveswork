@@ -1,6 +1,6 @@
 const { Router } = require("express");
 const pool   = require("../db");
-const { FOLDERS, uploadDataUrl } = require("../lib/cloudinaryStorage");
+const { CLOUDINARY_CONFIGURED, FOLDERS, uploadDataUrl } = require("../lib/cloudinaryStorage");
 const router = Router();
 
 // The measurement tool posts these as base64 data URLs inside the JSON body
@@ -110,6 +110,19 @@ router.post("/:projectId/geometry", async (req, res) => {
     if (!(await assertOwnProject(req.params.projectId, req.user.organizationId)))
       return res.status(404).json({ error: "Project not found" });
     const g = req.body;
+
+    // ← Only a save that actually carries new image bytes needs Cloudinary:
+    //   geometry re-saved without re-capturing the canvas (or without picking
+    //   a new photo) has nothing to upload and must still succeed on a server
+    //   with no credentials. Checking up front means a misconfigured server
+    //   says so in the same words as every other upload route, instead of
+    //   surfacing an opaque 500 from inside the Cloudinary SDK — which is
+    //   what made a missing CLOUDINARY_* env var read as "the measurement
+    //   plan failed to save" with no hint as to why.
+    const hasImage = (v) => typeof v === "string" && v.startsWith("data:image/");
+    if (!CLOUDINARY_CONFIGURED && (hasImage(g.snapshotDataUrl) || hasImage(g.originalPhotoDataUrl)))
+      return res.status(500).json({ error: "Image storage is not configured on the server" });
+
     const newSnapshotUrl = await saveSnapshot(req.params.projectId, g.snapshotDataUrl);
     // A locally-picked file arrives as a data URL and needs uploading; a
     // photo chosen from the job library is already a hosted asset, so its
